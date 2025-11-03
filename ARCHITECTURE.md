@@ -7,23 +7,24 @@
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Design Philosophy](#design-philosophy)
-3. [System Architecture](#system-architecture)
-4. [Threading Model](#threading-model)
-5. [Pipeline Flow](#pipeline-flow)
-6. [Memory Management](#memory-management)
-7. [Request Scheduling](#request-scheduling)
-8. [GPU Execution](#gpu-execution)
-9. [Component Details](#component-details)
-10. [Performance Characteristics](#performance-characteristics)
-11. [Configuration](#configuration)
-12. [Development Roadmap](#development-roadmap)
+2. [Why Rust?](#why-rust)
+3. [Design Philosophy](#design-philosophy)
+4. [System Architecture](#system-architecture)
+5. [Threading Model](#threading-model)
+6. [Pipeline Flow](#pipeline-flow)
+7. [Memory Management](#memory-management)
+8. [Request Scheduling](#request-scheduling)
+9. [GPU Execution](#gpu-execution)
+10. [Component Details](#component-details)
+11. [Performance Characteristics](#performance-characteristics)
+12. [Configuration](#configuration)
+13. [Development Roadmap](#development-roadmap)
 
 ---
 
 ## Overview
 
-Atoma Infer is a production-grade LLM inference engine that achieves state-of-the-art performance through aggressive CPU-GPU pipelining, advanced memory management, and lock-free concurrency. The architecture is inspired by leading frameworks (vLLM, SGLang, TensorRT-LLM) while leveraging Rust's unique strengths for safe, zero-cost abstractions.
+Atoma Infer is a production-grade LLM inference engine that achieves state-of-the-art performance through aggressive CPU-GPU pipelining, advanced memory management, and lock-free concurrency. The architecture is inspired by leading frameworks (such as vLLM, SGLang, TensorRT-LLM) while leveraging Rust's unique strengths for safe, zero-cost abstractions.
 
 ### Key Features
 
@@ -34,16 +35,142 @@ Atoma Infer is a production-grade LLM inference engine that achieves state-of-th
 - **Hardware Agnostic**: Candle backend supports CUDA, ROCm, Metal, and CPU
 - **Type-Safe**: Rust's ownership prevents entire classes of runtime errors
 
-### Performance Targets
+---
 
-| Metric | Target | Notes |
-|--------|--------|-------|
-| **Throughput** | 10,000+ tokens/sec | Per A100 GPU, 7B model |
-| **Time to First Token** | <30ms | For prompts <1024 tokens |
-| **Inter-Token Latency** | 8-12ms | 7B model decode phase |
-| **GPU Utilization** | >95% | During steady-state operation |
-| **Memory Efficiency** | >90% | KV cache utilization |
-| **Concurrent Requests** | 1,000+ | Per GPU instance |
+## Why Rust?
+
+Atoma Infer is built in Rust because **distributed AI inference demands system-level control, predictable performance, and safety guarantees that Python fundamentally cannot provide**. Our goal is to make Atoma the de facto inference framework for distributed systems, and Rust is essential to achieving this.
+
+### The Distributed AI Challenge
+
+Building distributed AI inference systems introduces unique challenges that go beyond single-node serving:
+
+**Multi-Node Coordination**
+- Requests must be routed across GPU nodes with minimal coordination overhead
+- KV cache state may be replicated or sharded across nodes
+- Failure handling and retry logic must be deterministic and fast
+- Network communication becomes a critical path that cannot be abstracted away
+
+**Resource Orchestration at Scale**
+- Memory pressure management across heterogeneous GPU pools
+- Dynamic load balancing as model popularity shifts
+- Gang scheduling for multi-GPU model parallelism (tensor/pipeline parallel)
+- Preemption and migration of partially completed requests
+
+**Consistency and Fault Tolerance**
+- Distributed state (KV cache, request queues) must remain consistent during failures
+- Graceful degradation when nodes fail or become slow
+- Exactly-once semantics for billing and audit trails
+- Rolling upgrades without request loss
+
+**Performance Isolation**
+- Noisy neighbor prevention in multi-tenant environments
+- QoS guarantees for different request classes
+- Predictable tail latencies under load, essential for SLA compliance
+
+### Why Python Frameworks Fall Short for Distribution
+
+Python-based inference engines like vLLM and SGLang excel at single-node optimization but face fundamental barriers when scaling to distributed systems:
+
+**Global Interpreter Lock (GIL)**
+- Prevents true parallelism for coordination logic (request routing, state management)
+- Forces reliance on multiprocessing, which is heavyweight and prevents shared memory
+- Makes lock-free algorithms and fine-grained synchronization impossible
+
+**Unpredictable Garbage Collection**
+- GC pauses create tail latency variance, which cascades in distributed systems
+- A 100ms GC pause on one node can stall an entire request chain
+- Deterministic latency is critical for distributed consensus and coordination protocols
+
+**Runtime Overhead**
+- Dynamic typing and reference counting add overhead to every coordination operation
+- Serialization/deserialization for inter-node communication is slower
+- Python's async runtime (asyncio) has higher overhead than native async/await
+
+**Memory Unsafety at Language Boundaries**
+- Heavy reliance on C/C++ extensions (CUDA kernels, networking) creates unsafe boundaries
+- Debugging distributed memory corruption across Python/C boundaries is extremely difficult
+- No compile-time guarantees about thread safety in distributed state management
+
+**Limited Control Over System Resources**
+- Cannot fine-tune TCP behavior, RDMA parameters, or GPU stream scheduling
+- Network protocol implementations (gRPC, custom protocols) require dropping to C
+- Difficulty implementing zero-copy networking for large tensor transfers
+
+### Rust Enables True Distributed AI Systems
+
+**Fearless Concurrency for Distributed Coordination**
+- Rust's ownership system prevents data races at compile time across distributed state
+- Lock-free data structures and message passing enable high-throughput coordination
+- True parallelism (no GIL) means coordination logic doesn't bottleneck inference
+- Async/await with Tokio provides efficient, scalable networking primitives
+
+**Predictable Performance for SLA Guarantees**
+- No garbage collection means consistent tail latencies across all nodes
+- Deterministic memory management enables predictable resource utilization
+- Performance characteristics remain stable under load, critical for autoscaling
+- Easier to reason about and debug performance in distributed traces
+
+**Zero-Copy Networking for Tensor Transfer**
+- Ownership system enables safe zero-copy serialization of tensors
+- Direct integration with RDMA and kernel bypass networking (io_uring)
+- Fine-grained control over memory pinning for efficient GPU-to-GPU transfers
+- Custom protocols optimized for AI workloads without foreign function overhead
+
+**Type Safety Across Network Boundaries**
+- Compile-time guarantees about message formats between nodes
+- Serde ecosystem provides safe, efficient serialization
+- No runtime deserialization errors that could crash nodes
+- Easier to evolve distributed protocols with type-safe versioning
+
+**System-Level Resource Control**
+- Direct control over thread affinity, CPU scheduling, and NUMA topology
+- Fine-tuned GPU stream management for overlapping compute and communication
+- Custom memory allocators for specific workload patterns
+- Integration with Linux kernel features (cgroups, eBPF) for observability
+
+**Robust Fault Tolerance**
+- Rust's Result/Option types force explicit error handling in distributed code paths
+- No null pointer exceptions or unexpected panics in coordination logic
+- Graceful degradation is encoded in types, not runtime behavior
+- Easier to build correct consensus protocols and state machines
+
+### Building the De Facto Distributed AI Framework
+
+Atoma's architecture leverages Rust to deliver capabilities that define next-generation distributed inference:
+
+**Transparent Multi-Node Scheduling**
+- Requests are routed across GPU pools based on model cache locality, load, and affinity
+- Distributed KV cache with automatic replication and eviction
+- No single coordinator bottleneck: fully decentralized scheduling
+
+**Elastic Model Serving**
+- Models can scale from single GPU to multi-node tensor/pipeline parallel seamlessly
+- Hot model loading across nodes without request drops
+- Preemptive migration of long requests during scale-down events
+
+**Cross-Node Prefix Caching**
+- RadixAttention prefix cache is distributed across nodes with automatic replication
+- Cache hits leverage RDMA for low-latency prefix fetching
+- Intelligent cache placement based on access patterns
+
+**Multi-Tenancy and Isolation**
+- Hard resource limits per tenant enforced at the Rust type level
+- Performance isolation using CPU pinning and GPU MPS
+- Fair scheduling with weighted queues and preemption
+
+**Observability and Debuggability**
+- Distributed tracing with nanosecond precision timing
+- Memory-safe eBPF integration for kernel-level visibility
+- Zero-overhead metrics collection using atomic operations
+
+### When Python Frameworks Make Sense
+
+Python-based frameworks like vLLM and SGLang are excellent for:
+- Single-node deployments where coordination overhead is minimal
+- Rapid experimentation and research workflows
+- Teams prioritizing ecosystem compatibility over absolute performance
+- Workloads where Python-based tooling integration is essential
 
 ---
 
@@ -195,7 +322,7 @@ pub struct ThreadTopology {
 ### Why Single-Threaded GPU Executor?
 
 1. **CUDA Context**: CUDA contexts are thread-local; multi-threading requires complex context management
-2. **Memory-Bound**: LLM inference is memory-bandwidth bound, not compute-bound
+2. **Memory-Bound**: LLM inference decode phase is memory-bandwidth bound, not compute-bound
 3. **Stream Parallelism**: We achieve parallelism via multiple CUDA streams, not threads
 4. **Simplicity**: Single-threaded executor eliminates synchronization overhead
 
@@ -331,7 +458,7 @@ GPU:     ───────────────────────�
 │     • Creates ExecutionResult with event handle                 │
 │     • Pushes to execution_results queue (capacity: 3)           │
 │     • Notifies sampler_thread                                   │
-│     • GPU time: 8-15ms (async, not blocking CPU)                │
+│     • GPU time: async, not blocking CPU            │
 └──────────────────────┬──────────────────────────────────────────┘
                        │
                        ▼
@@ -379,34 +506,6 @@ GPU:     ───────────────────────�
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### End-to-End Request Latency
-
-```
-┌────────────────────────────────────────────────────────────┐
-│ Latency Breakdown (7B Model, Single Token Generation)      │
-├────────────────────────────────────────────────────────────┤
-│ Stage                    │ Time (ms) │ Parallelized?      │
-├──────────────────────────┼───────────┼────────────────────┤
-│ HTTP Parsing             │    0.1    │ Yes (thread pool)  │
-│ Tokenization             │    1.5    │ Yes (work-steal)   │
-│ Scheduling               │    0.4    │ No (sequential)    │
-│ Batch Preparation        │    1.0    │ No (sequential)    │
-│ H2D Transfer             │    0.3    │ Overlapped w/ GPU  │
-│ GPU Compute (Prefill)    │   12.0    │ No (memory-bound)  │
-│ GPU Compute (Decode)     │    8.0    │ No (memory-bound)  │
-│ Sampling                 │    0.3    │ Overlapped w/ GPU  │
-│ D2H Transfer             │    0.2    │ Overlapped w/ GPU  │
-│ Detokenization           │    0.4    │ Yes (work-steal)   │
-│ Response Formatting      │    0.2    │ Yes (thread pool)  │
-├──────────────────────────┼───────────┼────────────────────┤
-│ Total (Sequential)       │   24.4    │                    │
-│ Total (With Pipeline)    │   12-15   │ GPU dominates      │
-├──────────────────────────┴───────────┴────────────────────┤
-│ Time to First Token (TTFT):  ~15ms (prefill)              │
-│ Inter-Token Latency (ITL):   ~8ms (decode)                │
-│ GPU Utilization:             96-98%                        │
-└────────────────────────────────────────────────────────────┘
-```
 
 ---
 
