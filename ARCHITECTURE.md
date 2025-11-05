@@ -93,7 +93,7 @@ Python-based inference engines like vLLM and SGLang excel at single-node optimiz
 - No compile-time guarantees about thread safety in distributed state management
 
 **Limited Control Over System Resources**
-- Cannot fine-tune TCP behavior, RDMA parameters, or GPU stream scheduling
+- Cannot fine-tune TCP behavior, RDMA parameters, or CUDA stream orchestration
 - Network protocol implementations (gRPC, custom protocols) require dropping to C
 - Difficulty implementing zero-copy networking for large tensor transfers
 
@@ -125,7 +125,7 @@ Python-based inference engines like vLLM and SGLang excel at single-node optimiz
 
 **System-Level Resource Control**
 - Direct control over thread affinity, CPU scheduling, and NUMA topology
-- Fine-tuned GPU stream management for overlapping compute and communication
+- Fine-grained CUDA stream orchestration for pipelining PCIe transfers with compute
 - Custom memory allocators for specific workload patterns
 - Integration with Linux kernel features (cgroups, eBPF) for observability
 
@@ -253,24 +253,28 @@ Modern LLM inference is GPU memory-bandwidth bound. Our architecture ensures:
 │  └────────────────┬───────────────────────────────────────────┘  │
 │                   │ Bounded Queue (Triple Buffer)                 │
 │  ┌────────────────┴───────────────────────────────────────────┐  │
-│  │  Stage 5: GPU Execution (Single Thread + Multi-Stream)     │  │
-│  │  ┌────────────────────────────────────────────────────┐    │  │
-│  │  │  Stream 0: Compute Kernels                         │    │  │
-│  │  │  Stream 1: H2D/D2H Transfers                       │    │  │
-│  │  │  Stream 2: Sampling Operations                     │    │  │
-│  │  │  Stream 3: KV Cache Management                     │    │  │
-│  │  └────────────────────────────────────────────────────┘    │  │
+│  │  Stage 5: GPU Execution (Single Thread + 3 Streams)        │  │
+│  │  • Stream 0: H2D transfer (input tokens)                   │  │
+│  │  • Stream 1: GPU compute (model forward pass)              │  │
+│  │  • Stream 2: D2H transfer (logits → CPU)                   │  │
+│  │  • Pipelined for maximum throughput                        │  │
 │  └────────────────┬───────────────────────────────────────────┘  │
 │                   │ Lock-Free Queue                               │
 │  ┌────────────────┴───────────────────────────────────────────┐  │
-│  │  Stage 6: Detokenization (Work-Stealing Pool)              │  │
+│  │  Stage 6: Sampling (Work-Stealing Pool)                    │  │
+│  │  • CPU-based token sampling from logits                    │  │
+│  │  • Temperature, top-k, top-p, repetition penalty           │  │
+│  └────────────────┬───────────────────────────────────────────┘  │
+│                   │ Lock-Free Queue                               │
+│  ┌────────────────┴───────────────────────────────────────────┐  │
+│  │  Stage 7: Detokenization (Work-Stealing Pool)              │  │
 │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │  │
 │  │  │ Worker 1 │  │ Worker 2 │  │ Worker 3 │  │ Worker N │  │  │
 │  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │  │
 │  └────────────────┬───────────────────────────────────────────┘  │
 │                   │ Lock-Free Queue                               │
 │  ┌────────────────┴───────────────────────────────────────────┐  │
-│  │  Stage 7: Response (Thread Pool)                           │  │
+│  │  Stage 8: Response (Thread Pool)                           │  │
 │  │  • Format HTTP/gRPC responses                              │  │
 │  │  • Stream server-sent events                               │  │
 │  │  • Update metrics and logging                              │  │
@@ -323,8 +327,8 @@ pub struct ThreadTopology {
 
 1. **CUDA Context**: CUDA contexts are thread-local; multi-threading requires complex context management
 2. **Memory-Bound**: LLM inference decode phase is memory-bandwidth bound, not compute-bound
-3. **Stream Parallelism**: We achieve parallelism via multiple CUDA streams, not threads
-4. **Simplicity**: Single-threaded executor eliminates synchronization overhead
+3. **Stream Parallelism**: We use 3 CUDA streams (H2D, compute, D2H) for pipelining, not multiple threads
+4. **Simplicity**: Single-threaded executor with multi-stream avoids thread synchronization overhead
 
 ### Thread Affinity & NUMA
 
@@ -416,7 +420,6 @@ GPU:     ───────────────────────�
 │     • Pushes to scheduled_batches queue (capacity: 3)           │
 │     • Notifies batch_prep_thread                                │
 │     • Sets gpu_ready = false                                    │
-│     • Typical time: 0.3-0.5ms                                   │
 └──────────────────────┬──────────────────────────────────────────┘
                        │
                        ▼
@@ -430,58 +433,64 @@ GPU:     ───────────────────────�
 │       - Constructs sequence start locations                     │
 │       - Creates attention masks (causal for prefill)            │
 │     • Prepares KV cache block tables                            │
-│     • Initiates async H2D transfer on transfer_stream           │
+│     • Initiates async H2D transfer on Stream 0 (pinned memory)  │
 │       (non-blocking! CPU continues immediately)                 │
 │     • Creates PreparedBatch descriptor                          │
 │     • Pushes to prepared_batches queue (capacity: 3)            │
 │     • Notifies gpu_executor_thread                              │
-│     • Typical time: 0.8-1.2ms                                   │
 └──────────────────────┬──────────────────────────────────────────┘
                        │
                        ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  5. GPU Execution (Single Thread, Multi-Stream)                 │
+│  5. GPU Execution (Single Thread, 3 CUDA Streams)               │
 │     • Waits for batch_prepared notification                     │
-│     • Waits for H2D transfer to complete (event sync)           │
-│     • Sets current CUDA stream to compute_stream                │
+│                                                                 │
+│     Stream 0 (H2D Transfer):                                    │
+│     • Transfer input tensors from pinned memory to GPU          │
+│     • Records h2d_complete event                                │
+│                                                                 │
+│     Stream 1 (Compute):                                         │
+│     • Waits for h2d_complete event                              │
 │     • Launches model forward pass (async):                      │
-│       Stream 0 (Compute):                                       │
 │       - Embedding lookup                                        │
 │       - Layer 0: Attention + FFN                                │
 │       - Layer 1: Attention + FFN                                │
 │       - ...                                                     │
 │       - Layer N: Attention + FFN                                │
 │       - Final layer norm                                        │
-│       - LM head projection                                      │
-│     • Records compute_complete event on compute_stream          │
+│       - LM head projection (produces logits)                    │
+│     • Records compute_complete event                            │
+│                                                                 │
+│     Stream 2 (D2H Transfer):                                    │
+│     • Waits for compute_complete event                          │
+│     • Transfers logits from GPU to CPU pinned memory            │
+│     • Records d2h_complete event                                │
+│                                                                 │
 │     • IMMEDIATELY sets gpu_ready = true (async execution!)      │
-│     • Creates ExecutionResult with event handle                 │
+│     • Creates ExecutionResult with event handles                │
 │     • Pushes to execution_results queue (capacity: 3)           │
 │     • Notifies sampler_thread                                   │
-│     • GPU time: async, not blocking CPU            │
 └──────────────────────┬──────────────────────────────────────────┘
                        │
                        ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  6. Sampling (Single Thread, GPU Stream)                        │
+│  6. Sampling (Work-Stealing Thread Pool, CPU)                   │
 │     • Waits for batch_executed notification                     │
-│     • Waits for compute_complete event (GPU sync)               │
-│     • Sets current CUDA stream to sampling_stream               │
-│     • Applies sampling strategies:                              │
+│     • Waits for d2h_complete event (logits now in CPU memory)   │
+│     • Applies sampling strategies (CPU-based):                  │
 │       - Greedy: argmax(logits)                                  │
 │       - Temperature: logits / T, then softmax + sample          │
 │       - Top-p: nucleus sampling                                 │
 │       - Top-k: filter then sample                               │
+│       - Repetition penalty, frequency penalty                   │
 │     • Updates sequence states:                                  │
-│       - Appends token to sequence.tokens                        │
+│       - Appends sampled token to sequence.tokens                │
 │       - Checks stop conditions (EOS, max_tokens)                │
 │       - Marks finished sequences                                │
-│     • Initiates async D2H transfer for sampled tokens           │
 │     • Returns pinned buffer to pool                             │
 │     • Creates SampledBatch descriptor                           │
 │     • Pushes to sampled_batches queue                           │
 │     • Notifies detokenizer_pool                                 │
-│     • Typical time: 0.2-0.4ms                                   │
 └──────────────────────┬──────────────────────────────────────────┘
                        │
                        ▼
@@ -520,49 +529,49 @@ Atoma Infer implements a **two-tier caching system**:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Memory Layout                                 │
+│                    Memory Layout                                │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
+│                                                                 │
 │  GPU Memory (e.g., 80GB on A100)                                │
-│  ┌────────────────────────────────────────────────────────┐    │
-│  │  Model Weights (Frozen)                                │    │
-│  │  • Embedding: 4GB                                      │    │
-│  │  • Layers: 20GB                                        │    │
-│  │  • Total: ~24GB                                        │    │
-│  └────────────────────────────────────────────────────────┘    │
-│  ┌────────────────────────────────────────────────────────┐    │
-│  │  KV Cache Blocks (Paged)                               │    │
-│  │  • Block size: 16 tokens                               │    │
-│  │  • Per block: 2 * num_layers * hidden_size * 2 bytes  │    │
-│  │  • Example: 2 * 32 * 4096 * 2 = 512 KB per block      │    │
-│  │  • ~100,000 blocks = 50GB                              │    │
-│  │                                                         │    │
-│  │  Block Table:                                          │    │
-│  │  ┌──────────────────────────────────────────────┐     │    │
-│  │  │ Seq 0: [Block 0, Block 1, Block 2]           │     │    │
-│  │  │ Seq 1: [Block 0, Block 3]  (sharing Block 0) │     │    │
-│  │  │ Seq 2: [Block 4, Block 5, Block 6, Block 7]  │     │    │
-│  │  └──────────────────────────────────────────────┘     │    │
-│  └────────────────────────────────────────────────────────┘    │
-│  ┌────────────────────────────────────────────────────────┐    │
-│  │  Activation Memory (Temporary)                         │    │
-│  │  • Reused across iterations                            │    │
-│  │  • ~4GB                                                │    │
-│  └────────────────────────────────────────────────────────┘    │
-│                                                                  │
+│  ┌────────────────────────────────────────────────────────┐     │
+│  │  Model Weights (Frozen)                                │     │
+│  │  • Embedding: 4GB                                      │     │
+│  │  • Layers: 20GB                                        │     │
+│  │  • Total: ~24GB                                        │     │
+│  └────────────────────────────────────────────────────────┘     │
+│  ┌────────────────────────────────────────────────────────┐     │
+│  │  KV Cache Blocks (Paged)                               │     │
+│  │  • Block size: 16 tokens                               │     │
+│  │  • Per block: 2 * num_layers * hidden_size * 2 bytes   │     │
+│  │  • Example: 2 * 32 * 4096 * 2 = 512 KB per block       │     │
+│  │  • ~100,000 blocks = 50GB                              │     │
+│  │                                                        │     │
+│  │  Block Table:                                          │     │
+│  │  ┌──────────────────────────────────────────────┐      │     │
+│  │  │ Seq 0: [Block 0, Block 1, Block 2]           │      │     │
+│  │  │ Seq 1: [Block 0, Block 3]  (sharing Block 0) │      │     │
+│  │  │ Seq 2: [Block 4, Block 5, Block 6, Block 7]  │      │     │
+│  │  └──────────────────────────────────────────────┘      │     │
+│  └────────────────────────────────────────────────────────┘     │
+│  ┌────────────────────────────────────────────────────────┐     │
+│  │  Activation Memory (Temporary)                         │     │
+│  │  • Reused across iterations                            │     │ 
+│  │  • ~4GB                                                │     │
+│  └────────────────────────────────────────────────────────┘     │
+│                                                                 │
 │  CPU Memory (Pinned)                                            │
-│  ┌────────────────────────────────────────────────────────┐    │
-│  │  Pinned Buffer Pool (4 buffers × 128MB)                │    │
-│  │  • Used for zero-copy H2D/D2H transfers               │    │
-│  │  • Circular buffer reuse                               │    │
-│  └────────────────────────────────────────────────────────┘    │
-│                                                                  │
-│  CPU Memory (Swapped KV Cache)                                 │
-│  ┌────────────────────────────────────────────────────────┐    │
-│  │  Preempted Sequences (Swapped Out)                     │    │
-│  │  • Low-priority sequences moved to CPU                 │    │
-│  │  • Swapped back when GPU memory available              │    │
-│  └────────────────────────────────────────────────────────┘    │
+│  ┌────────────────────────────────────────────────────────┐     │
+│  │  Pinned Buffer Pool (4 buffers × 128MB)                │     │
+│  │  • Used for zero-copy H2D/D2H transfers                │     │
+│  │  • Circular buffer reuse                               │     │
+│  └────────────────────────────────────────────────────────┘     │
+│                                                                 │
+│  CPU Memory (Swapped KV Cache)                                  │
+│  ┌────────────────────────────────────────────────────────┐     │
+│  │  Preempted Sequences (Swapped Out)                     │     │
+│  │  • Low-priority sequences moved to CPU                 │     │
+│  │  • Swapped back when GPU memory available              │     │
+│  └────────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -632,45 +641,102 @@ Savings: Avoided recomputing 1024 + len(Q1) + len(A1) tokens
 
 ### Memory Allocation Strategy
 
+All GPU memory is **pre-allocated at initialization** into fixed-size blocks. During serving, we only perform reads/writes to these blocks—no allocations or deallocations occur.
+
 ```rust
 pub struct MemoryManager {
-    // Pre-allocated pools
-    pinned_pool: PinnedMemoryPool,      // 4 × 128MB buffers
-    device_pool: DeviceMemoryPool,      // Buddy allocator
+    // Pre-allocated at initialization (NEVER modified during serving)
+    kv_cache_blocks: Vec<KVCacheBlock>,     // All blocks allocated upfront
+    pinned_buffers: Vec<PinnedBuffer>,      // Fixed pool of pinned memory
     
-    // Tracking
-    allocated_bytes: AtomicUsize,
+    // Block tracking (lock-free during serving)
+    free_blocks: ArrayQueue<BlockId>,       // Available block IDs
+    block_ref_counts: Vec<AtomicU32>,       // Reference counts per block
+    
+    // Metrics (atomic, no locks)
+    blocks_in_use: AtomicUsize,
     peak_usage: AtomicUsize,
-    fragmentation: AtomicF32,
+}
+
+pub struct KVCacheBlock {
+    device_ptr: DevicePtr,       // Fixed GPU memory location
+    block_id: BlockId,
+    block_size: usize,           // e.g., 16 tokens
 }
 
 impl MemoryManager {
-    /// Allocate pinned memory for H2D transfer
-    pub async fn acquire_pinned_buffer(&self) -> PinnedBuffer {
-        loop {
-            if let Some(id) = self.pinned_pool.available.pop() {
-                return self.pinned_pool.buffers[id].clone();
-            }
-            // Wait for buffer to become available
-            tokio::time::sleep(Duration::from_micros(50)).await;
+    /// Initialize all GPU memory at startup
+    pub fn new(config: &Config) -> Result<Self> {
+        let num_blocks = config.gpu_memory_reserved / config.block_size;
+        let mut kv_cache_blocks = Vec::with_capacity(num_blocks);
+        
+        // Allocate ALL GPU memory upfront as contiguous blocks
+        let total_kv_memory = num_blocks * config.block_size;
+        let base_ptr = unsafe { cuda_malloc(total_kv_memory)? };
+        
+        // Partition into fixed-size blocks
+        for i in 0..num_blocks {
+            kv_cache_blocks.push(KVCacheBlock {
+                device_ptr: base_ptr.offset(i * config.block_size),
+                block_id: BlockId(i),
+                block_size: config.block_size,
+            });
+        }
+        
+        // All blocks start as free
+        let free_blocks = ArrayQueue::new(num_blocks);
+        for i in 0..num_blocks {
+            free_blocks.push(BlockId(i)).unwrap();
+        }
+        
+        Ok(Self {
+            kv_cache_blocks,
+            free_blocks,
+            block_ref_counts: (0..num_blocks).map(|_| AtomicU32::new(0)).collect(),
+            blocks_in_use: AtomicUsize::new(0),
+            peak_usage: AtomicUsize::new(0),
+        })
+    }
+    
+    /// Acquire a pre-allocated block (no GPU allocation, just bookkeeping)
+    pub fn acquire_block(&self) -> Option<BlockId> {
+        if let Some(block_id) = self.free_blocks.pop() {
+            self.block_ref_counts[block_id.0].store(1, Ordering::Release);
+            self.blocks_in_use.fetch_add(1, Ordering::Relaxed);
+            Some(block_id)
+        } else {
+            None  // Out of memory, trigger eviction
         }
     }
     
-    /// Allocate device memory with caching
-    pub fn allocate_device(&mut self, size: usize) -> DevicePtr {
-        // Try to find cached block
-        let block_size = size.next_power_of_two();
-        if let Some(ptr) = self.device_pool.free_blocks.get_mut(&block_size) {
-            if let Some(block) = ptr.pop() {
-                return block.ptr;
-            }
+    /// Release a block back to free pool (no GPU deallocation)
+    pub fn release_block(&self, block_id: BlockId) {
+        let prev = self.block_ref_counts[block_id.0].fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            // Block is now free
+            self.free_blocks.push(block_id).expect("free list full");
+            self.blocks_in_use.fetch_sub(1, Ordering::Relaxed);
         }
-        
-        // Allocate new block
-        unsafe { cuda_malloc(block_size).unwrap() }
+    }
+    
+    /// Get device pointer for reading/writing (zero-cost)
+    pub fn get_block_ptr(&self, block_id: BlockId) -> DevicePtr {
+        self.kv_cache_blocks[block_id.0].device_ptr
+    }
+    
+    /// Increment ref count for shared blocks (prefix caching)
+    pub fn share_block(&self, block_id: BlockId) {
+        self.block_ref_counts[block_id.0].fetch_add(1, Ordering::Relaxed);
     }
 }
 ```
+
+**Key Properties:**
+- **Zero Allocation During Serving**: All GPU memory allocated once at startup
+- **Lock-Free Block Management**: Atomic operations for block tracking
+- **Copy-on-Write Support**: Reference counting enables prefix sharing
+- **Predictable Performance**: No allocation overhead or fragmentation
+- **Simple Eviction**: When `acquire_block()` returns `None`, trigger eviction policy
 
 ---
 
@@ -841,26 +907,70 @@ pub async fn preempt(&mut self, seq_id: SequenceId) -> Result<()> {
 
 ## GPU Execution
 
-### Multi-Stream Execution
+### GPU Execution Model
 
-Atoma Infer uses **4 concurrent CUDA streams** for maximum overlap:
+Atoma uses **3 CUDA streams** to pipeline PCIe transfers with GPU compute:
 
 ```
-Stream 0 (Compute):     ████████████████████████████
-                        Main model execution
+Triple-Buffered Pipeline with 3 Streams:
+
+Timeline:          Batch N-1          Batch N            Batch N+1
+                   
+Stream 0 (H2D):    ▓▓▓▓                               ▓▓▓▓
+                   Transfer inputs                    Transfer inputs
+                   
+Stream 1 (Compute):     ████████████████████████           ████████████████████
+                        Model forward pass                 Model forward pass
                         
-Stream 1 (H2D):         ▓▓▓▓        ▓▓▓▓        ▓▓▓▓
-                        Host → Device transfers
-                        
-Stream 2 (D2H):                 ▓▓▓▓        ▓▓▓▓        ▓▓▓▓
-                                Device → Host transfers
-                        
-Stream 3 (Sampling):                ▓▓▓▓        ▓▓▓▓
-                                    Token sampling
-                                    
-Events:                 E0      E1      E2      E3
-                        ↓ Record ↓ Wait ↓ Sync  ↓
+Stream 2 (D2H):              ▓▓▓▓                                ▓▓▓▓
+                             Transfer logits                     Transfer logits
+                             
+CPU (Sampling):                  ⚡                                   ⚡
+                                 Sample tokens                       Sample tokens
+
+CPU (Batch Prep):   ████                    ████
+                    Prepare N               Prepare N+1
+
+
+Key: PCIe transfers (H2D/D2H) overlap with GPU compute because they use
+     different physical buses: PCIe vs GPU VRAM bandwidth
 ```
+
+**Why 3 Streams?**
+
+1. **Different Physical Resources**:
+   - H2D/D2H use **PCIe bus** (CPU ↔ GPU)
+   - GPU compute uses **VRAM bandwidth** (within GPU)
+   - These don't compete, so they CAN overlap effectively
+
+2. **Triple-Buffering Benefits**:
+   - While GPU computes batch N, we transfer inputs for N+1 (H2D stream)
+   - Simultaneously, transfer results from N-1 to CPU (D2H stream)
+   - Maximizes GPU utilization by hiding PCIe latency
+
+3. **Typical Timings** (for reference, not benchmarks):
+   - H2D transfer: ~0.5ms for input tokens
+   - GPU compute: ~10-20ms (dominates, memory-bandwidth bound)
+   - D2H transfer: ~0.3ms for logits
+   - Without streams: 0.5 + 15 + 0.3 = ~15.8ms per iteration
+   - With streams: ~15ms per iteration (transfers hidden)
+
+**Stream Synchronization**:
+- Use CUDA events to coordinate stream dependencies
+- Stream 1 (compute) waits for Stream 0 (H2D) to complete
+- Stream 2 (D2H) waits for Stream 1 (compute) to complete
+- CPU sampling waits for Stream 2 (D2H) to complete
+
+**Why NOT More Streams?**
+- Sampling should be on CPU (where we have flexibility for complex algorithms)
+- No benefit to separate streams for different model layers (they're sequential)
+- More streams = more complexity without performance gain
+
+**Key Mechanisms:**
+- **Pinned Memory**: DMA transfers without CPU involvement
+- **CUDA Events**: Low-overhead stream synchronization
+- **CPU-GPU Pipeline**: Batch prep overlaps with GPU work on previous batch
+- **Sampling on CPU**: More flexibility for temperature, top-p, top-k, repetition penalties
 
 ### Model Forward Pass
 
@@ -1234,7 +1344,7 @@ pub struct EngineConfig {
     pub pin_threads: bool,            // NUMA-aware pinning
     
     // GPU
-    pub num_cuda_streams: usize,      // Default: 4
+    pub num_cuda_streams: usize,      // Default: 3 (H2D, Compute, D2H)
     pub enable_cuda_graphs: bool,     // Graph capture for fixed shapes
     pub enable_flash_attention: bool,
     
@@ -1275,7 +1385,7 @@ num_detokenizer_threads = 8
 pin_threads = true
 
 [gpu]
-num_cuda_streams = 4
+num_cuda_streams = 3          # H2D, Compute, D2H
 enable_cuda_graphs = true
 enable_flash_attention = true
 
@@ -1300,25 +1410,26 @@ max_concurrent_requests = 10000
 - [x] HTTP API server
 
 ### Phase 2: Memory Management (Current)
-- [ ] PagedAttention block manager
-- [ ] KV cache allocation/deallocation
+- [x] PagedAttention block manager
+- [] KV cache allocation/deallocation
 - [ ] Copy-on-write for beam search
-- [ ] CPU/GPU swapping
+- [x] CPU/GPU swapping
 
 ### Phase 3: Scheduling
-- [ ] Continuous batching scheduler
+- [x] Continuous batching scheduler
 - [ ] Priority queue
-- [ ] Preemption policies
+- [x] Preemption policies
 - [ ] Chunked prefill
 
 ### Phase 4: Performance
+- [x] Multi-stream execution (H2D, Compute, D2H)
 - [ ] RadixAttention prefix caching
-- [ ] Multi-stream execution
-- [ ] Flash Attention integration
+- [ ] Flash Attention v3 integration
 - [ ] Fused kernels (RMSNorm, SiLU, RoPE)
+- [ ] CUDA Graphs for fixed-shape optimization
 
 ### Phase 5: Distributed
-- [ ] Tensor parallelism (multi-GPU)
+- [x] Tensor parallelism (multi-GPU)
 - [ ] Pipeline parallelism
 - [ ] Disaggregated prefill/decode
 - [ ] Multi-node support
@@ -1354,7 +1465,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-[Your License Here]
+Apache 2.0
 
 ---
 
