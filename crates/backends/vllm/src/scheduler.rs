@@ -798,7 +798,7 @@ impl<P: Policy> Scheduler<P> {
             } else if allocation_status == AllocationStatus::Never {
                 warn!("Failing the request {} because there is not enough KV cache blocks to run the entire sequence..", 
                         sequence_group.request_id);
-                for (_, sequence) in sequence_group.sequences.iter_mut() {
+                for sequence in sequence_group.sequences.values_mut() {
                     sequence
                         .write_lock()?
                         .set_sequence_status(SequenceStatus::FinishedIgnored);
@@ -923,14 +923,8 @@ impl<P: Policy> Scheduler<P> {
 
             let mut waiting_sequences = sequence_group
                 .sequences
-                .iter()
-                .filter_map(|(_, s)| {
-                    if s.read().unwrap().get_sequence_status() == SequenceStatus::Waiting {
-                        Some(s)
-                    } else {
-                        None
-                    }
-                })
+                .values()
+                .filter(|s| s.read().unwrap().get_sequence_status() == SequenceStatus::Waiting)
                 .collect::<Vec<_>>();
 
             if waiting_sequences.len() != 1 {
@@ -960,7 +954,7 @@ impl<P: Policy> Scheduler<P> {
                     "Input prompt ({} tokens) is too long and exceeds limits of {}",
                     num_new_tokens, prompt_limit
                 );
-                for (_, sequence) in sequence_group.sequences.iter_mut() {
+                for sequence in sequence_group.sequences.values_mut() {
                     sequence
                         .write_lock()?
                         .set_sequence_status(SequenceStatus::FinishedIgnored)
@@ -1457,6 +1451,7 @@ impl<P: Policy> Scheduler<P> {
     ) -> Result<(Vec<Arc<SequenceGroupMetadata>>, SchedulerOutputs), SchedulerError> {
         trace!("Scheduling..");
         let scheduler_outputs = self.schedule_()?;
+        scheduler_outputs.validate()?;
         let now = Instant::now();
 
         // Create input data structures
@@ -1472,13 +1467,11 @@ impl<P: Policy> Scheduler<P> {
             // Mapping from sequence id to `PhysicalBlock` number
             let mut block_tables = HashMap::<u64, Vec<u32>>::new();
 
-            for sequence in sequence_group.sequences.iter().filter_map(|(_, s)| {
-                if s.read().unwrap().get_sequence_status() == SequenceStatus::Running {
-                    Some(s)
-                } else {
-                    None
-                }
-            }) {
+            for sequence in sequence_group
+                .sequences
+                .values()
+                .filter(|s| s.read().unwrap().get_sequence_status() == SequenceStatus::Running)
+            {
                 let sequence_guard_lock = sequence.read_lock()?;
                 let sequence_id = sequence_guard_lock.sequence_id();
                 sequence_data.insert(sequence_id, sequence_guard_lock.sequence_data.clone());
@@ -1599,7 +1592,7 @@ impl<P: Debug> Scheduler<P> {
         let mut num_new_tokens = 0;
         let mut num_sequences_in_status = 0;
 
-        for (_, seq) in sequence_group.sequences.iter() {
+        for seq in sequence_group.sequences.values() {
             let sequence_guard_lock = seq.read_lock()?;
             if sequence_guard_lock.get_sequence_status() == sequence_status {
                 num_new_tokens += sequence_guard_lock.get_num_new_tokens();
@@ -1689,13 +1682,10 @@ impl<P: Debug> Scheduler<P> {
             "Appending slot to sequence group with id = {}",
             sequence_group.request_id
         );
-        let running_sequences = sequence_group.sequences.iter().filter_map(|(_, s)| {
-            if s.read().unwrap().get_sequence_status() == SequenceStatus::Running {
-                Some(s)
-            } else {
-                None
-            }
-        });
+        let running_sequences = sequence_group
+            .sequences
+            .values()
+            .filter(|s| s.read().unwrap().get_sequence_status() == SequenceStatus::Running);
         for sequence in running_sequences {
             let cows = self.block_manager.append_slots(sequence.read_lock()?)?;
             if let Some(cow) = cows {
@@ -1796,15 +1786,13 @@ impl<P: Debug> Scheduler<P> {
         // over sequence groups with a single sequence.
         // TODO: Support recomputation for sequence groups with multiple
         // sequences. This may require a more sophisticated CUDA kernel.
-        let preemption_mode = if preemption_mode.is_none() {
+        let preemption_mode = preemption_mode.unwrap_or_else(|| {
             if sequence_group.get_max_num_running_seqs() == 1 {
                 PreemptionMode::Recomputation
             } else {
                 PreemptionMode::Swap
             }
-        } else {
-            preemption_mode.unwrap()
-        };
+        });
 
         if self.num_cumulative_preemption.is_multiple_of(50) {
             warn!("Sequence group with id = {} is preempted by {:?} mode because there is not enough KV cache space. 
@@ -2301,7 +2289,7 @@ mod tests {
 
     fn add_new_token(scheduler: &mut Scheduler<FcfsPolicy>, token_id: u32) {
         scheduler.running.iter_mut().for_each(|s| {
-            for (_, sequence) in s.sequences.iter() {
+            for sequence in s.sequences.values() {
                 {
                     sequence
                         .write()
@@ -3744,14 +3732,8 @@ mod tests {
 
                 let mut waiting_sequences = sequence_group
                     .sequences
-                    .iter()
-                    .filter_map(|(_, s)| {
-                        if s.read().unwrap().get_sequence_status() == SequenceStatus::Waiting {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
+                    .values()
+                    .filter(|s| s.read().unwrap().get_sequence_status() == SequenceStatus::Waiting)
                     .collect::<Vec<_>>();
 
                 if waiting_sequences.len() != 1 {
@@ -3782,7 +3764,7 @@ mod tests {
                         "Input prompt ({} tokens) is too long and exceeds limits of {}",
                         num_new_tokens, prompt_limit
                     );
-                    for (_, sequence) in sequence_group.sequences.iter_mut() {
+                    for sequence in sequence_group.sequences.values_mut() {
                         sequence
                             .write()
                             .unwrap()
@@ -3988,13 +3970,10 @@ mod tests {
                 "Appending slot to sequence group with id = {}",
                 sequence_group.request_id
             );
-            let running_sequences = sequence_group.sequences.iter().filter_map(|(_, s)| {
-                if s.read().unwrap().get_sequence_status() == SequenceStatus::Running {
-                    Some(s)
-                } else {
-                    None
-                }
-            });
+            let running_sequences = sequence_group
+                .sequences
+                .values()
+                .filter(|s| s.read().unwrap().get_sequence_status() == SequenceStatus::Running);
             for _ in running_sequences {
                 blocks_to_copy.insert(value.0, value.1);
             }
@@ -4036,7 +4015,7 @@ mod tests {
                 } else if allocation_status == AllocationStatus::Never {
                     warn!("Failing the request {} because there is not enough KV cache blocks to run the entire sequence..", 
                             sequence_group.request_id);
-                    for (_, sequence) in sequence_group.sequences.iter_mut() {
+                    for sequence in sequence_group.sequences.values_mut() {
                         sequence
                             .write()
                             .unwrap()

@@ -918,7 +918,7 @@ impl BlockSpaceManager {
     pub fn reset(&mut self) -> Result<(), BlockSpaceManagerError> {
         trace!("Resetting all block tables..");
         let block_tables = self.block_tables.clone();
-        for (_, bt) in block_tables.iter() {
+        for bt in block_tables.values() {
             self.free_block_table(bt)?;
         }
         self.block_tables.clear();

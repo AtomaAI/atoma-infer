@@ -1,14 +1,15 @@
 use thiserror::Error;
 use tokenizers::Encoding;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info_span, instrument, trace, Span};
+#[cfg(feature = "cuda")]
+use tracing::error;
+use tracing::{info_span, instrument, trace, Span};
 
-use crate::{
-    tokenizer::{EncodeTokenizerRequest, TokenizerError},
-    types::{GenerateParameters, GenerateRequest},
-};
+use crate::tokenizer::{EncodeTokenizerRequest, TokenizerError};
+#[cfg(feature = "cuda")]
+use crate::types::{GenerateParameters, GenerateRequest};
 
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg(feature = "cuda")]
 const DEFAULT_RANDOM_SEED: u64 = 1_283_768_955;
 
 /// `Validation` - Responsible for validating `Request`/`Response` parameters
@@ -111,6 +112,7 @@ impl Validation {
     /// * Tokenization fails
     /// * The total number of tokens (input + new) exceeds the maximum allowed
     /// * The input length exceeds the maximum allowed
+    #[cfg(feature = "cuda")]
     #[instrument(skip_all)]
     async fn validate_input(
         &self,
@@ -185,6 +187,7 @@ impl Validation {
     /// - Invalid token limits (max_new_tokens, truncate)
     /// - Empty input
     /// - Too many stop sequences
+    #[cfg(feature = "cuda")]
     #[instrument(skip_all)]
     pub(crate) async fn validate(
         &self,
