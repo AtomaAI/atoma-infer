@@ -2,10 +2,7 @@ use crate::ffi;
 use crate::ops::{SwapBlockCpuToGpuOp, SwapBlockGpuToCpuOp, SwapBlockOp};
 use candle_core::CpuStorage;
 use candle_core::{
-    backend::BackendStorage,
-    cuda::{cudarc::driver::DeviceSlice, CudaStorageSlice},
-    cuda_backend::cudarc::driver::DevicePtr,
-    DType, Device, IndexOp, Result, Tensor,
+    backend::BackendStorage, cuda::CudaStorageSlice, DType, Device, IndexOp, Result, Tensor,
 };
 use half::{bf16, f16};
 use std::collections::HashMap;
@@ -29,7 +26,8 @@ pub fn swap_blocks(
     let dst_device = dst.device();
     match (src_device, dst_device) {
         (Device::Cuda(src_device), Device::Cuda(dst_device)) => {
-            if src_device.ordinal() != dst_device.ordinal() {
+            if crate::utils::device_ordinal(src_device) != crate::utils::device_ordinal(dst_device)
+            {
                 candle_core::bail!(
                     "swap_blocks: Both src and dst tensors should be on the same device to swap"
                 )
@@ -193,55 +191,45 @@ unsafe fn copy_blocks_t<
 
     let dtype = key_caches[0].dtype();
 
+    let stream = cuda_device.cuda_stream();
+
     let mut key_cache_ptrs = Vec::with_capacity(num_layers);
     let mut value_cache_ptrs = Vec::with_capacity(num_layers);
     for (key_cache, value_cache) in key_caches.iter().zip(value_caches.iter()) {
         let (key_cache_storage, key_cache_layout) = key_cache.storage_and_layout();
         let (value_cache_storage, value_cache_layout) = value_cache.storage_and_layout();
-        let key_cache_ptr = match &*key_cache_storage {
-            candle_core::Storage::Cuda(c) => {
-                let cuda_slice = c.as_cuda_slice::<T>()?;
-                let cuda_slice = cuda_slice.slice(key_cache_layout.start_offset()..);
-                *cuda_slice.device_ptr() as i64
-            }
-            _ => candle_core::bail!("key_caches must be a cuda tensor"),
-        };
-        let value_cache_ptr = match &*value_cache_storage {
-            candle_core::Storage::Cuda(c) => {
-                let cuda_slice = c.as_cuda_slice::<T>()?;
-                let cuda_slice = cuda_slice.slice(value_cache_layout.start_offset()..);
-                *cuda_slice.device_ptr() as i64
-            }
-            _ => candle_core::bail!("value_caches must be a cuda tensor"),
-        };
-        key_cache_ptrs.push(key_cache_ptr);
-        value_cache_ptrs.push(value_cache_ptr);
+        let (key_cache_ptr, _key_guard) = crate::utils::device_ptr::<T>(
+            &key_cache_storage,
+            key_cache_layout,
+            &stream,
+            "key_cache",
+        )?;
+        let (value_cache_ptr, _value_guard) = crate::utils::device_ptr::<T>(
+            &value_cache_storage,
+            value_cache_layout,
+            &stream,
+            "value_cache",
+        )?;
+        key_cache_ptrs.push(key_cache_ptr as i64);
+        value_cache_ptrs.push(value_cache_ptr as i64);
     }
 
     let key_cache_ptrs = Tensor::from_vec(key_cache_ptrs, (num_layers,), device)?;
     let value_cache_ptrs = Tensor::from_vec(value_cache_ptrs, (num_layers,), device)?;
-    let key_cache_ptrs = {
-        let (key_cache_ptrs_s, key_cache_ptrs_l) = key_cache_ptrs.storage_and_layout();
-        match &*key_cache_ptrs_s {
-            candle_core::Storage::Cuda(c) => {
-                let cuda_slice = c.as_cuda_slice::<i64>()?;
-                let cuda_slice = cuda_slice.slice(key_cache_ptrs_l.start_offset()..);
-                *cuda_slice.device_ptr() as *const core::ffi::c_void
-            }
-            _ => candle_core::bail!("key_caches must be a cuda tensor"),
-        }
-    };
-    let value_cache_ptrs = {
-        let (value_cache_ptrs_s, _value_cache_ptrs_l) = value_cache_ptrs.storage_and_layout();
-        match &*value_cache_ptrs_s {
-            candle_core::Storage::Cuda(c) => {
-                let cuda_slice = c.as_cuda_slice::<i64>()?;
-                let cuda_slice = cuda_slice.slice(value_cache_ptrs.layout().start_offset()..);
-                *cuda_slice.device_ptr() as *const core::ffi::c_void
-            }
-            _ => candle_core::bail!("value_caches must be a cuda tensor"),
-        }
-    };
+    let (key_cache_ptrs_storage, key_cache_ptrs_layout) = key_cache_ptrs.storage_and_layout();
+    let (key_cache_ptrs, _key_cache_ptrs_guard) = crate::utils::device_ptr::<i64>(
+        &key_cache_ptrs_storage,
+        key_cache_ptrs_layout,
+        &stream,
+        "key_cache_ptrs",
+    )?;
+    let (value_cache_ptrs_storage, value_cache_ptrs_layout) = value_cache_ptrs.storage_and_layout();
+    let (value_cache_ptrs, _value_cache_ptrs_guard) = crate::utils::device_ptr::<i64>(
+        &value_cache_ptrs_storage,
+        value_cache_ptrs_layout,
+        &stream,
+        "value_cache_ptrs",
+    )?;
     let num_pairs = block_mapping.dims()[0];
 
     if [num_pairs, 2] != block_mapping.shape().dims() {
@@ -249,14 +237,12 @@ unsafe fn copy_blocks_t<
     }
 
     let (block_mapping_storage, block_mapping_layout) = block_mapping.storage_and_layout();
-    let block_mapping_ptr = match &*block_mapping_storage {
-        candle_core::Storage::Cuda(c) => {
-            let cuda_slice = c.as_cuda_slice::<i64>()?;
-            let cuda_slice = cuda_slice.slice(block_mapping_layout.start_offset()..);
-            *cuda_slice.device_ptr() as *const core::ffi::c_void
-        }
-        _ => candle_core::bail!("block_mapping must be a cuda tensor"),
-    };
+    let (block_mapping_ptr, _block_mapping_guard) = crate::utils::device_ptr::<i64>(
+        &block_mapping_storage,
+        block_mapping_layout,
+        &stream,
+        "block_mapping",
+    )?;
 
     let numel_per_block = key_caches[0]
         .i(0)?
@@ -267,41 +253,33 @@ unsafe fn copy_blocks_t<
         .try_into()
         .unwrap();
 
-    let stream = cuda_device
-        .fork_default_stream()
-        .map_err(|e| candle_core::Error::Cuda(e.into()))?;
-
     match dtype {
         DType::F16 => unsafe {
             ffi::copy_blocks_f16(
-                key_cache_ptrs,
-                value_cache_ptrs,
-                block_mapping_ptr,
+                key_cache_ptrs as *const core::ffi::c_void,
+                value_cache_ptrs as *const core::ffi::c_void,
+                block_mapping_ptr as *const core::ffi::c_void,
                 num_layers as i64,
                 num_pairs as i64,
                 numel_per_block,
-                stream.stream as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         },
         DType::BF16 => unsafe {
             ffi::copy_blocks_bf16(
-                key_cache_ptrs,
-                value_cache_ptrs,
-                block_mapping_ptr,
+                key_cache_ptrs as *const core::ffi::c_void,
+                value_cache_ptrs as *const core::ffi::c_void,
+                block_mapping_ptr as *const core::ffi::c_void,
                 num_layers as i64,
                 num_pairs as i64,
                 numel_per_block,
-                stream.stream as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         },
         _ => {
             candle_core::bail!("Only support f16/bf16 dtypes and src and dst must have same dtype")
         }
     }
-
-    cuda_device
-        .wait_for(&stream)
-        .map_err(|e| candle_core::Error::Cuda(e.into()))?;
 
     Ok(())
 }
@@ -374,10 +352,14 @@ fn reshape_and_cache_flash_t<
             Device::Cuda(vc_cuda_device),
             Device::Cuda(sm_cuda_device),
         ) => {
-            if cuda_device.ordinal() != v_cuda_device.ordinal()
-                || cuda_device.ordinal() != kc_cuda_device.ordinal()
-                || cuda_device.ordinal() != vc_cuda_device.ordinal()
-                || cuda_device.ordinal() != sm_cuda_device.ordinal()
+            if crate::utils::device_ordinal(cuda_device)
+                != crate::utils::device_ordinal(v_cuda_device)
+                || crate::utils::device_ordinal(cuda_device)
+                    != crate::utils::device_ordinal(kc_cuda_device)
+                || crate::utils::device_ordinal(cuda_device)
+                    != crate::utils::device_ordinal(vc_cuda_device)
+                || crate::utils::device_ordinal(cuda_device)
+                    != crate::utils::device_ordinal(sm_cuda_device)
             {
                 candle_core::bail!("key, value, key_cache, value_cache and slot_mapping must be on the same device")
             }
@@ -463,58 +445,22 @@ fn reshape_and_cache_flash_t<
     let (vc, vc_l) = value_cache.storage_and_layout();
     let (slot_mapping, slot_mapping_l) = slot_mapping.storage_and_layout();
 
-    let k_ptr = match &*k {
-        candle_core::Storage::Cuda(c) => {
-            let k = c.as_cuda_slice::<T>()?;
-            let k = k.slice(k_l.start_offset()..);
-            *k.device_ptr() as *const core::ffi::c_void
-        }
-        _ => candle_core::bail!("key must be a cuda tensor"),
-    };
-    let v_ptr = match &*v {
-        candle_core::Storage::Cuda(c) => {
-            let v = c.as_cuda_slice::<T>()?;
-            let v = v.slice(v_l.start_offset()..);
-            *v.device_ptr() as *const core::ffi::c_void
-        }
-        _ => candle_core::bail!("value must be a cuda tensor"),
-    };
-    let kc_ptr = match &*kc {
-        candle_core::Storage::Cuda(c) => {
-            let kc = c.as_cuda_slice::<T>()?;
-            let kc = kc.slice(kc_l.start_offset()..);
-            *kc.device_ptr() as *const core::ffi::c_void
-        }
-        _ => candle_core::bail!("key_cache must be a cuda tensor"),
-    };
-    let vc_ptr = match &*vc {
-        candle_core::Storage::Cuda(c) => {
-            let vc = c.as_cuda_slice::<T>()?;
-            let vc = vc.slice(vc_l.start_offset()..);
-            *vc.device_ptr() as *const core::ffi::c_void
-        }
-        _ => candle_core::bail!("value_cache must be a cuda tensor"),
-    };
-    let slot_mapping_ptr = match &*slot_mapping {
-        candle_core::Storage::Cuda(c) => {
-            let slot_mapping = c.as_cuda_slice::<i64>()?;
-            let slot_mapping = slot_mapping.slice(slot_mapping_l.start_offset()..);
-            *slot_mapping.device_ptr() as *const i64
-        }
-        _ => candle_core::bail!("slot_mapping must be a cuda tensor"),
-    };
+    let stream = cuda_device.cuda_stream();
 
-    let stream = cuda_device
-        .fork_default_stream()
-        .map_err(|e| candle_core::Error::Cuda(e.into()))?;
+    let (k_ptr, _k_guard) = crate::utils::device_ptr::<T>(&k, k_l, &stream, "key")?;
+    let (v_ptr, _v_guard) = crate::utils::device_ptr::<T>(&v, v_l, &stream, "value")?;
+    let (kc_ptr, _kc_guard) = crate::utils::device_ptr::<T>(&kc, kc_l, &stream, "key_cache")?;
+    let (vc_ptr, _vc_guard) = crate::utils::device_ptr::<T>(&vc, vc_l, &stream, "value_cache")?;
+    let (slot_mapping_ptr, _slot_mapping_guard) =
+        crate::utils::device_ptr::<i64>(&slot_mapping, slot_mapping_l, &stream, "slot_mapping")?;
 
     unsafe {
         ffi::reshape_and_cache_flash(
-            k_ptr,
-            v_ptr,
-            kc_ptr,
-            vc_ptr,
-            slot_mapping_ptr,
+            k_ptr as *const core::ffi::c_void,
+            v_ptr as *const core::ffi::c_void,
+            kc_ptr as *const core::ffi::c_void,
+            vc_ptr as *const core::ffi::c_void,
+            slot_mapping_ptr as *const i64,
             block_stride as i64,
             num_tokens as i64,
             num_heads as i64,
@@ -523,13 +469,9 @@ fn reshape_and_cache_flash_t<
             key_stride as i64,
             value_stride as i64,
             dtype,
-            stream.stream as *mut std::ffi::c_void,
+            stream.cu_stream() as *mut std::ffi::c_void,
         )
     }
-
-    cuda_device
-        .wait_for(&stream)
-        .map_err(|e| candle_core::Error::Cuda(e.into()))?;
 
     Ok(())
 }

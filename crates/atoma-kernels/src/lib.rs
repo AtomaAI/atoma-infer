@@ -8,7 +8,7 @@ pub use cache_manager::{copy_blocks, reshape_and_cache_flash, swap_blocks};
 use std::mem::MaybeUninit;
 
 use candle_core::backend::BackendStorage;
-use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{CpuStorage, DType, Layout, Result, Shape, Tensor};
 use half::{bf16, f16};
@@ -45,8 +45,9 @@ impl FlashAttention {
     ) -> Result<(candle_core::CudaStorage, Shape)> {
         // https://github.com/Dao-AILab/flash-attention/blob/7551202cb2dd245432bc878447e19015c0af3c22/csrc/flash_attn/flash_api.cpp#L341
         let device = q.device();
+        let stream = device.cuda_stream();
 
-        utils::check_gpu_compatibility(device.ordinal())?;
+        utils::check_gpu_compatibility(utils::device_ordinal(device))?;
 
         if q.dtype() != k.dtype() {
             candle_core::bail!("query and key must have the same dtype");
@@ -148,8 +149,17 @@ impl FlashAttention {
             candle_core::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
         }
 
-        let (alibi_slopes_ptr, alibi_slopes_batch_stride) =
-            if let Some(alibi_slopes) = &self.alibi_slopes {
+        // Bound outside the block below so the read guard produced by `device_ptr` outlives the
+        // kernel launch that consumes the pointer.
+        let alibi_slopes_storage = self
+            .alibi_slopes
+            .as_ref()
+            .map(|alibi_slopes| alibi_slopes.storage_and_layout());
+
+        let (alibi_slopes_ptr, alibi_slopes_batch_stride, _alibi_slopes_guard) =
+            if let (Some(alibi_slopes), Some((alibi_slopes_storage, alibi_slopes_layout))) =
+                (&self.alibi_slopes, &alibi_slopes_storage)
+            {
                 if alibi_slopes.dtype() != DType::F32 {
                     candle_core::bail!(
                         "DType mismatch alibi_slopes {:?}, expected {:?}",
@@ -164,8 +174,6 @@ impl FlashAttention {
                     0
                 };
 
-                let (alibi_slopes, alibi_slopes_layout) = alibi_slopes.storage_and_layout();
-
                 if num_heads != alibi_slopes_layout.shape().dims1()? {
                     candle_core::bail!(
                         "shape mismatch alibi_slopes {:?}, expected {:?}",
@@ -174,17 +182,20 @@ impl FlashAttention {
                     );
                 }
 
-                let alibi_slopes = match &*alibi_slopes {
-                    candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                    _ => candle_core::bail!("alibi_slopes must be a cuda tensor"),
-                };
+                let (alibi_slopes_ptr, alibi_slopes_guard) = utils::device_ptr::<f32>(
+                    alibi_slopes_storage,
+                    alibi_slopes_layout,
+                    &stream,
+                    "alibi_slopes",
+                )?;
 
                 (
-                    *alibi_slopes.device_ptr() as *const core::ffi::c_void,
+                    alibi_slopes_ptr as *const core::ffi::c_void,
                     alibi_slopes_batch_stride,
+                    Some(alibi_slopes_guard),
                 )
             } else {
-                (std::ptr::null(), 0)
+                (std::ptr::null(), 0, None)
             };
 
         // if window_size_left > self.max_seqlen_k or None => -1
@@ -216,8 +227,8 @@ impl FlashAttention {
         let seqlen_k_rounded = utils::round_multiple(seqlen_k, 128);
 
         let elem_count = out_shape.elem_count();
-        let dst = unsafe { device.alloc::<T>(elem_count) }.w()?;
-        let softmax_lse = device
+        let mut dst = unsafe { stream.alloc::<T>(elem_count) }.w()?;
+        let mut softmax_lse = stream
             .alloc_zeros::<f32>(b_sz * 128 * num_heads * seqlen_q)
             .w()?;
 
@@ -236,8 +247,25 @@ impl FlashAttention {
             head_size,
             seqlen_k,
             seqlen_q,
-            device.ordinal(),
+            utils::device_ordinal(device),
         )?;
+
+        // The split-KV accumulators must stay alive until the kernel that writes them has been
+        // enqueued, so they are bound here rather than inside the launch block.
+        let mut split_accumulators = if num_splits > 1 {
+            Some((
+                stream
+                    .alloc_zeros::<f32>(num_splits as usize * b_sz * num_heads * seqlen_q)
+                    .w()?,
+                stream
+                    .alloc_zeros::<f32>(
+                        num_splits as usize * b_sz * num_heads * seqlen_q * head_size_rounded,
+                    )
+                    .w()?,
+            ))
+        } else {
+            None
+        };
 
         let mut softcap = self.softcap.unwrap_or(0.0);
         let (softmax_scale, scale_softmatx_log2) = if softcap > 0.0 {
@@ -253,11 +281,16 @@ impl FlashAttention {
         };
 
         unsafe {
-            let q_ptr = *q.device_ptr() as *const core::ffi::c_void;
-            let k_ptr = *k.device_ptr() as *const core::ffi::c_void;
-            let v_ptr = *v.device_ptr() as *const core::ffi::c_void;
-            let dst_ptr = *dst.device_ptr() as *const core::ffi::c_void;
-            let softmax_lse_ptr = *softmax_lse.device_ptr() as *const core::ffi::c_void;
+            let (q_ptr, _q_guard) = q.device_ptr(&stream);
+            let (k_ptr, _k_guard) = k.device_ptr(&stream);
+            let (v_ptr, _v_guard) = v.device_ptr(&stream);
+            let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&stream);
+            let (softmax_lse_ptr, _softmax_lse_guard) = softmax_lse.device_ptr_mut(&stream);
+            let q_ptr = q_ptr as *const core::ffi::c_void;
+            let k_ptr = k_ptr as *const core::ffi::c_void;
+            let v_ptr = v_ptr as *const core::ffi::c_void;
+            let dst_ptr = dst_ptr as *const core::ffi::c_void;
+            let softmax_lse_ptr = softmax_lse_ptr as *const core::ffi::c_void;
             let (q_batch_stride, o_batch_stride) = if !seqlenq_ngroups_swapped {
                 (q_stride[0] as u32, o_stride[0] as u32)
             } else {
@@ -266,21 +299,18 @@ impl FlashAttention {
                     (o_stride[0] * seqlen_q) as u32,
                 )
             };
-            let (softmax_lseaccum_ptr, oaccum_ptr) = if num_splits > 1 {
-                let softmax_lseaccum_ptr = device
-                    .alloc_zeros::<f32>(num_splits as usize * b_sz * num_heads * seqlen_q)
-                    .w()?;
-                let oaccum_ptr = device
-                    .alloc_zeros::<f32>(
-                        num_splits as usize * b_sz * num_heads * seqlen_q * head_size_rounded,
+            let (softmax_lseaccum_ptr, oaccum_ptr, _split_guards) = match &mut split_accumulators {
+                Some((softmax_lseaccum, oaccum)) => {
+                    let (softmax_lseaccum_ptr, softmax_lseaccum_guard) =
+                        softmax_lseaccum.device_ptr_mut(&stream);
+                    let (oaccum_ptr, oaccum_guard) = oaccum.device_ptr_mut(&stream);
+                    (
+                        softmax_lseaccum_ptr as *const core::ffi::c_void,
+                        oaccum_ptr as *const core::ffi::c_void,
+                        Some((softmax_lseaccum_guard, oaccum_guard)),
                     )
-                    .w()?;
-                (
-                    *softmax_lseaccum_ptr.device_ptr() as *const core::ffi::c_void,
-                    *oaccum_ptr.device_ptr() as *const core::ffi::c_void,
-                )
-            } else {
-                (std::ptr::null(), std::ptr::null())
+                }
+                None => (std::ptr::null(), std::ptr::null(), None),
             };
             ffi::run_mha(
                 q_ptr,
@@ -330,6 +360,7 @@ impl FlashAttention {
                 /* force_split_kernel */ false,
                 /* softmax_lseaccum_ptr */ softmax_lseaccum_ptr,
                 /* oaccum_ptr */ oaccum_ptr,
+                /* stream */ stream.cu_stream() as *mut core::ffi::c_void,
             )
         }
 
@@ -624,9 +655,10 @@ impl FlashAttentionVarLen {
     ) -> Result<(candle_core::CudaStorage, Shape)> {
         // https://github.com/Dao-AILab/flash-attention/blob/7551202cb2dd245432bc878447e19015c0af3c22/csrc/flash_attn/flash_api.cpp#L528
         let dev = q.device();
+        let stream = dev.cuda_stream();
 
         // Check GPU device compatibility
-        utils::check_gpu_compatibility(dev.ordinal())?;
+        utils::check_gpu_compatibility(utils::device_ordinal(dev))?;
 
         if q.dtype() != k.dtype() {
             candle_core::bail!("query and key must have the same dtype");
@@ -678,7 +710,7 @@ impl FlashAttentionVarLen {
                     if block_table_stride[block_table_rank - 1] != 1 {
                         candle_core::bail!("block_table must be contiguous")
                     }
-                    *block_table.device_ptr() as *const i32
+                    block_table.view_ptr(&stream).0 as *const i32
                 }
                 _ => candle_core::bail!("block_table must be a cuda tensor"),
             };
@@ -864,8 +896,17 @@ impl FlashAttentionVarLen {
             candle_core::bail!("seqlens_q and seqlens_k should have the same number of elements {nseqlens_q} <> {nseqlens_k}")
         }
 
-        let (alibi_slopes_ptr, alibi_slopes_batch_stride) =
-            if let Some(alibi_slopes) = &self.alibi_slopes {
+        // Bound outside the block below so the read guard produced by `device_ptr` outlives the
+        // kernel launch that consumes the pointer.
+        let alibi_slopes_storage = self
+            .alibi_slopes
+            .as_ref()
+            .map(|alibi_slopes| alibi_slopes.storage_and_layout());
+
+        let (alibi_slopes_ptr, alibi_slopes_batch_stride, _alibi_slopes_guard) =
+            if let (Some(alibi_slopes), Some((alibi_slopes_storage, alibi_slopes_layout))) =
+                (&self.alibi_slopes, &alibi_slopes_storage)
+            {
                 if alibi_slopes.dtype() != DType::F32 {
                     candle_core::bail!(
                         "DType mismatch alibi_slopes {:?}, expected {:?}",
@@ -880,8 +921,6 @@ impl FlashAttentionVarLen {
                     0
                 };
 
-                let (alibi_slopes, alibi_slopes_layout) = alibi_slopes.storage_and_layout();
-
                 if num_heads != alibi_slopes_layout.shape().dims1()? {
                     candle_core::bail!(
                         "shape mismatch alibi_slopes {:?}, expected {:?}",
@@ -890,19 +929,20 @@ impl FlashAttentionVarLen {
                     );
                 }
 
-                let alibi_slopes = match &*alibi_slopes {
-                    candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                    _ => candle_core::bail!("alibi_slopes must be a cuda tensor"),
-                };
-
-                let alibi_slopes = alibi_slopes.slice(alibi_slopes_layout.start_offset()..);
+                let (alibi_slopes_ptr, alibi_slopes_guard) = utils::device_ptr::<f32>(
+                    alibi_slopes_storage,
+                    alibi_slopes_layout,
+                    &stream,
+                    "alibi_slopes",
+                )?;
 
                 (
-                    *alibi_slopes.device_ptr() as *const core::ffi::c_void,
+                    alibi_slopes_ptr as *const core::ffi::c_void,
                     alibi_slopes_batch_stride,
+                    Some(alibi_slopes_guard),
                 )
             } else {
-                (std::ptr::null(), 0)
+                (std::ptr::null(), 0, None)
             };
 
         let seqused_k = if let Some(seqused_k) = &self.seqused_k {
@@ -916,7 +956,7 @@ impl FlashAttentionVarLen {
                     if seqused_k_stride[seqused_k_rank - 1] != 1 {
                         candle_core::bail!("block_table must be contiguous")
                     }
-                    *seqused_k.device_ptr() as *const i32
+                    seqused_k.view_ptr(&stream).0 as *const i32
                 }
                 _ => candle_core::bail!("block_table must be a cuda tensor"),
             };
@@ -945,8 +985,8 @@ impl FlashAttentionVarLen {
         let seqlen_k_rounded = utils::round_multiple(self.max_seqlen_k, 128);
 
         let elem_count = out_shape.elem_count();
-        let dst = unsafe { dev.alloc::<T>(elem_count) }.w()?;
-        let softmax_lse = dev.alloc_zeros::<f32>(total_q * num_heads).w()?;
+        let mut dst = unsafe { stream.alloc::<T>(elem_count) }.w()?;
+        let mut softmax_lse = stream.alloc_zeros::<f32>(total_q * num_heads).w()?;
 
         let is_bf16 = if is_bf16 { 1 } else { 0 };
 
@@ -972,10 +1012,33 @@ impl FlashAttentionVarLen {
                 head_size,
                 self.max_seqlen_k,
                 max_seqlen_q,
-                dev.ordinal(),
+                utils::device_ordinal(dev),
             )?
         } else {
             0
+        };
+
+        // The split-KV accumulators must stay alive until the kernel that writes them has been
+        // enqueued, so they are bound here rather than inside the launch block.
+        let mut split_accumulators = if num_splits > 1 {
+            Some((
+                unsafe {
+                    stream.alloc::<f32>(num_splits as usize * batch_size * num_heads * max_seqlen_q)
+                }
+                .w()?,
+                unsafe {
+                    stream.alloc::<f32>(
+                        num_splits as usize
+                            * batch_size
+                            * num_heads
+                            * max_seqlen_q
+                            * head_size_rounded,
+                    )
+                }
+                .w()?,
+            ))
+        } else {
+            None
         };
 
         let mut softcap = self.softcap.unwrap_or(0.0);
@@ -992,22 +1055,29 @@ impl FlashAttentionVarLen {
         };
 
         unsafe {
-            let q_ptr = *q.device_ptr() as *const core::ffi::c_void;
-            let k_ptr = *k.device_ptr() as *const core::ffi::c_void;
-            let v_ptr = *v.device_ptr() as *const core::ffi::c_void;
+            let (q_ptr, _q_guard) = q.device_ptr(&stream);
+            let (k_ptr, _k_guard) = k.device_ptr(&stream);
+            let (v_ptr, _v_guard) = v.device_ptr(&stream);
+            let q_ptr = q_ptr as *const core::ffi::c_void;
+            let k_ptr = k_ptr as *const core::ffi::c_void;
+            let v_ptr = v_ptr as *const core::ffi::c_void;
             let block_table_batch_stride = if let Some(layout) = block_table_layout {
                 layout.stride()[0] as u32
             } else {
                 0
             };
-            let dst_ptr = *dst.device_ptr() as *const core::ffi::c_void;
-            let softmax_lse_ptr = *softmax_lse.device_ptr() as *const core::ffi::c_void;
-            let seqlens_q_ptr = if !seqlenq_ngroups_swapped {
-                *seqlens_q.device_ptr() as *const core::ffi::c_int
+            let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&stream);
+            let (softmax_lse_ptr, _softmax_lse_guard) = softmax_lse.device_ptr_mut(&stream);
+            let dst_ptr = dst_ptr as *const core::ffi::c_void;
+            let softmax_lse_ptr = softmax_lse_ptr as *const core::ffi::c_void;
+            let (seqlens_q_ptr, _seqlens_q_guard) = if !seqlenq_ngroups_swapped {
+                let (ptr, guard) = seqlens_q.device_ptr(&stream);
+                (ptr as *const core::ffi::c_int, Some(guard))
             } else {
-                std::ptr::null()
+                (std::ptr::null(), None)
             };
-            let seqlens_k_ptr = *seqlens_k.device_ptr() as *const core::ffi::c_int;
+            let (seqlens_k_ptr, _seqlens_k_guard) = seqlens_k.device_ptr(&stream);
+            let seqlens_k_ptr = seqlens_k_ptr as *const core::ffi::c_int;
             let (q_batch_stride, o_batch_stride) =
                 match (seqlens_q_ptr.is_null(), seqlenq_ngroups_swapped) {
                     (false, _) => (0, 0),
@@ -1022,25 +1092,18 @@ impl FlashAttentionVarLen {
                 .map(|_| (k_stride[0] as u32, v_stride[0] as u32))
                 .unwrap_or((0, 0));
             // TODO: handle case where max_seqlen_q == 0, separately
-            let (softmax_lseaccum_ptr, oaccum_ptr) = if num_splits > 1 {
-                let softmax_lseaccum_ptr = dev
-                    .alloc::<f32>(num_splits as usize * batch_size * num_heads * max_seqlen_q)
-                    .w()?;
-                let oaccum_ptr = dev
-                    .alloc::<f32>(
-                        num_splits as usize
-                            * batch_size
-                            * num_heads
-                            * max_seqlen_q
-                            * head_size_rounded,
+            let (softmax_lseaccum_ptr, oaccum_ptr, _split_guards) = match &mut split_accumulators {
+                Some((softmax_lseaccum, oaccum)) => {
+                    let (softmax_lseaccum_ptr, softmax_lseaccum_guard) =
+                        softmax_lseaccum.device_ptr_mut(&stream);
+                    let (oaccum_ptr, oaccum_guard) = oaccum.device_ptr_mut(&stream);
+                    (
+                        softmax_lseaccum_ptr as *const core::ffi::c_void,
+                        oaccum_ptr as *const core::ffi::c_void,
+                        Some((softmax_lseaccum_guard, oaccum_guard)),
                     )
-                    .w()?;
-                (
-                    *softmax_lseaccum_ptr.device_ptr() as *const core::ffi::c_void,
-                    *oaccum_ptr.device_ptr() as *const core::ffi::c_void,
-                )
-            } else {
-                (std::ptr::null(), std::ptr::null())
+                }
+                None => (std::ptr::null(), std::ptr::null(), None),
             };
             ffi::run_mha(
                 /* q_ptr */ q_ptr,
@@ -1090,6 +1153,7 @@ impl FlashAttentionVarLen {
                 /* force_split_kernel */ !block_table_ptr.is_null(),
                 /* softmax_lseaccum_ptr */ softmax_lseaccum_ptr,
                 /* oaccum_ptr */ oaccum_ptr,
+                /* stream */ stream.cu_stream() as *mut core::ffi::c_void,
             )
         }
 
@@ -1542,9 +1606,10 @@ impl FlashAttentionKvCache {
     ) -> Result<(candle_core::CudaStorage, Shape)> {
         // https://github.com/Dao-AILab/flash-attention/blob/7551202cb2dd245432bc878447e19015c0af3c22/csrc/flash_attn/flash_api.cpp#L1284
         let dev = q.device();
+        let stream = dev.cuda_stream();
 
         // Check GPU device compatibility
-        utils::check_gpu_compatibility(dev.ordinal())?;
+        utils::check_gpu_compatibility(utils::device_ordinal(dev))?;
 
         if q.dtype() != kc.dtype() {
             candle_core::bail!("query and key must have the same dtype");
@@ -1565,7 +1630,7 @@ impl FlashAttentionKvCache {
                     if block_table_stride[block_table_rank - 1] != 1 {
                         candle_core::bail!("block_table must be contiguous")
                     }
-                    *block_table.device_ptr() as *const i32
+                    block_table.view_ptr(&stream).0 as *const i32
                 }
                 _ => candle_core::bail!("block_table must be a cuda tensor"),
             };
@@ -1678,8 +1743,17 @@ impl FlashAttentionKvCache {
             candle_core::bail!("the last dim of v must be contiguous {vc_stride:?}")
         }
 
-        let (alibi_slopes_ptr, alibi_slopes_batch_stride) =
-            if let Some(alibi_slopes) = &self.alibi_slopes {
+        // Bound outside the block below so the read guard produced by `device_ptr` outlives the
+        // kernel launch that consumes the pointer.
+        let alibi_slopes_storage = self
+            .alibi_slopes
+            .as_ref()
+            .map(|alibi_slopes| alibi_slopes.storage_and_layout());
+
+        let (alibi_slopes_ptr, alibi_slopes_batch_stride, _alibi_slopes_guard) =
+            if let (Some(alibi_slopes), Some((alibi_slopes_storage, alibi_slopes_layout))) =
+                (&self.alibi_slopes, &alibi_slopes_storage)
+            {
                 if alibi_slopes.dtype() != DType::F32 {
                     candle_core::bail!(
                         "DType mismatch alibi_slopes {:?}, expected {:?}",
@@ -1694,8 +1768,6 @@ impl FlashAttentionKvCache {
                     0
                 };
 
-                let (alibi_slopes, alibi_slopes_layout) = alibi_slopes.storage_and_layout();
-
                 if num_heads != alibi_slopes_layout.shape().dims1()? {
                     candle_core::bail!(
                         "shape mismatch alibi_slopes {:?}, expected {:?}",
@@ -1704,19 +1776,20 @@ impl FlashAttentionKvCache {
                     );
                 }
 
-                let alibi_slopes = match &*alibi_slopes {
-                    candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                    _ => candle_core::bail!("alibi_slopes must be a cuda tensor"),
-                };
-
-                let alibi_slopes = alibi_slopes.slice(alibi_slopes_layout.start_offset()..);
+                let (alibi_slopes_ptr, alibi_slopes_guard) = utils::device_ptr::<f32>(
+                    alibi_slopes_storage,
+                    alibi_slopes_layout,
+                    &stream,
+                    "alibi_slopes",
+                )?;
 
                 (
-                    *alibi_slopes.device_ptr() as *const core::ffi::c_void,
+                    alibi_slopes_ptr as *const core::ffi::c_void,
                     alibi_slopes_batch_stride,
+                    Some(alibi_slopes_guard),
                 )
             } else {
-                (std::ptr::null(), 0)
+                (std::ptr::null(), 0, None)
             };
 
         let head_size = utils::round_multiple(head_size_og, 8);
@@ -1725,80 +1798,112 @@ impl FlashAttentionKvCache {
         let seqlen_k_rounded = utils::round_multiple(seqlen_k, 128);
 
         let elem_count = out_shape.elem_count();
-        let dst = unsafe { dev.alloc::<T>(elem_count) }.w()?;
-        let softmax_lse = dev
+        let mut dst = unsafe { stream.alloc::<T>(elem_count) }.w()?;
+        let mut softmax_lse = stream
             .alloc_zeros::<f32>(batch_size * num_heads * seqlen_q)
             .w()?;
 
         let is_bf16 = if is_bf16 { 1 } else { 0 };
 
+        let num_splits = utils::compute_num_splits(
+            batch_size,
+            num_heads,
+            head_size,
+            seqlen_k,
+            seqlen_q,
+            utils::device_ordinal(dev),
+        )?;
+
+        // The split-KV accumulators must stay alive until the kernel that writes them has been
+        // enqueued, so they are bound here rather than inside the launch block.
+        let mut split_accumulators = if num_splits > 1 {
+            Some((
+                stream
+                    .alloc_zeros::<f32>(num_splits as usize * batch_size * num_heads * seqlen_q)
+                    .w()?,
+                stream
+                    .alloc_zeros::<f32>(
+                        num_splits as usize * batch_size * num_heads * seqlen_q * head_size_rounded,
+                    )
+                    .w()?,
+            ))
+        } else {
+            None
+        };
+
+        // Bound outside the launch block so the read guard outlives the launch.
+        let seqlens_k_storage = self
+            .seqlens_k
+            .as_ref()
+            .map(|seqlens_k| seqlens_k.storage_and_layout());
+
         unsafe {
-            let q_ptr = *q.device_ptr() as *const core::ffi::c_void;
-            let kc_ptr = *kc.device_ptr() as *const core::ffi::c_void;
-            let vc_ptr = *vc.device_ptr() as *const core::ffi::c_void;
-            let dst_ptr = *dst.device_ptr() as *const core::ffi::c_void;
-            let softmax_lse_ptr = *softmax_lse.device_ptr() as *const core::ffi::c_void;
-            let cu_seqlens_k_ptr = if let Some(seqlens_k) = &self.seqlens_k {
-                if seqlens_k.dims() != [batch_size] {
-                    candle_core::bail!(
-                        "shape mismatch of seqlens_k (got {:?}) expected {:?})",
-                        seqlens_k.dims(),
-                        [batch_size]
+            let (q_ptr, _q_guard) = q.device_ptr(&stream);
+            let (kc_ptr, _kc_guard) = kc.device_ptr(&stream);
+            let (vc_ptr, _vc_guard) = vc.device_ptr(&stream);
+            let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&stream);
+            let (softmax_lse_ptr, _softmax_lse_guard) = softmax_lse.device_ptr_mut(&stream);
+            let q_ptr = q_ptr as *const core::ffi::c_void;
+            let kc_ptr = kc_ptr as *const core::ffi::c_void;
+            let vc_ptr = vc_ptr as *const core::ffi::c_void;
+            let dst_ptr = dst_ptr as *const core::ffi::c_void;
+            let softmax_lse_ptr = softmax_lse_ptr as *const core::ffi::c_void;
+            let (cu_seqlens_k_ptr, _cu_seqlens_k_guard) =
+                if let (Some(seqlens_k), Some((seqlens_k_storage, seqlens_k_layout))) =
+                    (&self.seqlens_k, &seqlens_k_storage)
+                {
+                    if seqlens_k.dims() != [batch_size] {
+                        candle_core::bail!(
+                            "shape mismatch of seqlens_k (got {:?}) expected {:?})",
+                            seqlens_k.dims(),
+                            [batch_size]
+                        )
+                    }
+                    if seqlens_k.dtype() != DType::U32 {
+                        candle_core::bail!(
+                            "DType mismatch seqlens_k {:?}, expected {:?}",
+                            seqlens_k.dtype(),
+                            DType::U32
+                        );
+                    }
+                    let seqlens_k_stride = seqlens_k_layout.stride();
+                    let seqlens_k_rank = seqlens_k_stride.len();
+                    if seqlens_k_stride[seqlens_k_rank - 1] != 1 {
+                        candle_core::bail!(
+                            "the last dim of seqlens_k must be contiguous {seqlens_k_stride:?}"
+                        )
+                    }
+                    let (seqlens_k_ptr, seqlens_k_guard) = utils::device_ptr::<u32>(
+                        seqlens_k_storage,
+                        seqlens_k_layout,
+                        &stream,
+                        "seqlens_k",
+                    )?;
+                    (
+                        seqlens_k_ptr as *const core::ffi::c_int,
+                        Some(seqlens_k_guard),
                     )
-                }
-                if seqlens_k.dtype() != DType::U32 {
-                    candle_core::bail!(
-                        "DType mismatch seqlens_k {:?}, expected {:?}",
-                        seqlens_k.dtype(),
-                        DType::U32
-                    );
-                }
-                let (seqlens_k, seqlens_k_layout) = seqlens_k.storage_and_layout();
-                let seqlens_k = match &*seqlens_k {
-                    candle_core::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
-                    _ => candle_core::bail!("seqlens_k must be a cuda tensor"),
+                } else {
+                    (std::ptr::null(), None)
                 };
-                let seqlens_k = seqlens_k.slice(seqlens_k_layout.start_offset()..);
-                let seqlens_k_stride = seqlens_k_layout.stride();
-                let seqlens_k_rank = seqlens_k_stride.len();
-                if seqlens_k_stride[seqlens_k_rank - 1] != 1 {
-                    candle_core::bail!(
-                        "the last dim of seqlens_k must be contiguous {seqlens_k_stride:?}"
-                    )
-                }
-                *seqlens_k.device_ptr() as *const core::ffi::c_int
-            } else {
-                std::ptr::null()
-            };
             let is_seqlens_k_cumulative = self.seqlens_k.is_none();
-            let num_splits = utils::compute_num_splits(
-                batch_size,
-                num_heads,
-                head_size,
-                seqlen_k,
-                seqlen_q,
-                dev.ordinal(),
-            )?;
             let block_table_batch_stride = if let Some(layout) = block_table_layout {
                 layout.stride()[0] as u32
             } else {
                 0
             };
-            let (softmax_lseaccum_ptr, oaccum_ptr) = if num_splits > 1 {
-                let softmax_lseaccum_ptr = dev
-                    .alloc_zeros::<f32>(num_splits as usize * batch_size * num_heads * seqlen_q)
-                    .w()?;
-                let oaccum_ptr = dev
-                    .alloc_zeros::<f32>(
-                        num_splits as usize * batch_size * num_heads * seqlen_q * head_size_rounded,
+            let (softmax_lseaccum_ptr, oaccum_ptr, _split_guards) = match &mut split_accumulators {
+                Some((softmax_lseaccum, oaccum)) => {
+                    let (softmax_lseaccum_ptr, softmax_lseaccum_guard) =
+                        softmax_lseaccum.device_ptr_mut(&stream);
+                    let (oaccum_ptr, oaccum_guard) = oaccum.device_ptr_mut(&stream);
+                    (
+                        softmax_lseaccum_ptr as *const core::ffi::c_void,
+                        oaccum_ptr as *const core::ffi::c_void,
+                        Some((softmax_lseaccum_guard, oaccum_guard)),
                     )
-                    .w()?;
-                (
-                    *softmax_lseaccum_ptr.device_ptr() as *const core::ffi::c_void,
-                    *oaccum_ptr.device_ptr() as *const core::ffi::c_void,
-                )
-            } else {
-                (std::ptr::null(), std::ptr::null())
+                }
+                None => (std::ptr::null(), std::ptr::null(), None),
             };
             ffi::run_mha(
                 /* q_ptr */ q_ptr,
@@ -1848,6 +1953,7 @@ impl FlashAttentionKvCache {
                 /* force_split_kernel */ self.block_table.is_some(),
                 /* softmax_lseaccum_ptr */ softmax_lseaccum_ptr,
                 /* oaccum_ptr */ oaccum_ptr,
+                /* stream */ stream.cu_stream() as *mut core::ffi::c_void,
             )
         }
 
@@ -2108,11 +2214,51 @@ pub fn flash_attn_kv_cache_full(
 
 pub(crate) mod utils {
 
+    use candle_core::cuda_backend::cudarc::driver::{sys::CUdeviceptr, CudaStream, SyncOnDrop};
     use cuda_runtime_sys::*;
 
     use super::*;
     pub(crate) fn round_multiple(x: usize, m: usize) -> usize {
         (x + m - 1) / m * m
+    }
+
+    /// Returns the ordinal of the cuda device backing `device`.
+    ///
+    /// cudarc 0.19 moved device identity onto the context, which candle exposes through its stream.
+    pub(crate) fn device_ordinal(device: &candle_core::CudaDevice) -> usize {
+        device.cuda_stream().context().ordinal()
+    }
+
+    /// Resolves the device pointer of a cuda tensor's storage, offset by its layout.
+    ///
+    /// cudarc 0.19 hands out device pointers against an explicit stream so it can order the access
+    /// against prior writes. The returned guard records the read on `stream` when dropped, so
+    /// callers must hold it until the launch consuming the pointer has been enqueued.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - Storage of the tensor whose pointer is needed; must be cuda storage.
+    /// * `layout` - Layout supplying the tensor's start offset, in elements of `T`.
+    /// * `stream` - The caller's stream, which the access is ordered against.
+    /// * `name` - Tensor name, used to build an actionable error when `storage` is not on cuda.
+    pub(crate) fn device_ptr<'a, T>(
+        storage: &'a candle_core::Storage,
+        layout: &Layout,
+        stream: &'a CudaStream,
+        name: &str,
+    ) -> Result<(CUdeviceptr, SyncOnDrop<'a>)>
+    where
+        T: candle_core::cuda_backend::CudaDType
+            + candle_core::cuda_backend::cudarc::driver::DeviceRepr
+            + 'a,
+    {
+        match storage {
+            candle_core::Storage::Cuda(c) => Ok(c
+                .as_cuda_slice::<T>()?
+                .slice(layout.start_offset()..)
+                .view_ptr(stream)),
+            _ => candle_core::bail!("{name} must be a cuda tensor"),
+        }
     }
 
     /// Find the number of splits that maximizes the occupancy. For example, if we have
