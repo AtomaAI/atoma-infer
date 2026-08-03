@@ -148,8 +148,7 @@ impl<'a> InplaceOp1 for SwapBlockCpuToGpuOp<'a> {
         let mut dst_c =
             dst_c.slice_mut(self.dst_offset..self.dst_offset + self.block_size_in_bytes);
 
-        // Copying on the caller's stream orders this write against the surrounding work. A forked
-        // stream would leave the copy unordered with respect to it.
+        // The caller's stream orders this write against the surrounding device work.
         dst_device
             .cuda_stream()
             .memcpy_htod(self.src_slice, &mut dst_c)
@@ -196,10 +195,8 @@ impl<'a> InplaceOp1 for SwapBlockGpuToCpuOp<'a> {
 
         let stream = self.cuda_device.cuda_stream();
 
-        // The copy must run on the caller's stream so it is ordered after the device-side writes
-        // that produced `src_slice`. The previous implementation issued it on a freshly forked
-        // stream that nothing ever waited on, so the copy could read the block before those writes
-        // landed.
+        // The caller's stream orders this copy after the device-side writes that produced
+        // `src_slice`; on any other stream it could read the block before those writes land.
         stream
             .memcpy_dtoh(
                 &self.src_slice,

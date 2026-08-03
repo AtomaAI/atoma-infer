@@ -199,11 +199,12 @@ extern "C" void reshape_and_cache(
     int32_t key_stride,
     int32_t value_stride,
 
-    uint32_t dtype  // 0 => f16; 1 => bf16
+    uint32_t dtype,  // 0 => f16; 1 => bf16
+
+    cudaStream_t stream
 ) {
     dim3 grid(num_tokens);
     dim3 block(std::min(num_heads * head_size, 512));
-    const cudaStream_t stream = 0;
 
     if (dtype == 0) {
         CALL_RESHAPE_AND_CACHE(uint16_t);

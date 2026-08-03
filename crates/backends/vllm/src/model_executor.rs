@@ -555,11 +555,9 @@ fn cuda_stream(
 ) -> Result<std::sync::Arc<cudarc::driver::CudaStream>, ModelThreadError> {
     match device {
         Device::Cuda(device) => Ok(device.cuda_stream()),
-        Device::Cpu | Device::Metal(_) => {
-            Err(ModelThreadError::CandleError(candle_core::Error::Msg(
-                format!("tensor parallelism requires a cuda device, got {device:?}"),
-            )))
-        }
+        Device::Cpu | Device::Metal(_) => Err(ModelThreadError::NonCudaDevice(format!(
+            "{device:?}, set the configuration's device ids to cuda devices"
+        ))),
     }
 }
 
@@ -585,6 +583,9 @@ pub enum ModelThreadError {
     #[cfg(feature = "nccl")]
     #[error("Nccl error: `{}`", 0.0)]
     NcclError(NcclError),
+    #[cfg(feature = "nccl")]
+    #[error("Tensor parallelism requires a cuda device, got: `{0}`")]
+    NonCudaDevice(String),
 }
 
 #[derive(Debug, Error)]

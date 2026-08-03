@@ -182,12 +182,16 @@ impl FlashAttention {
                     );
                 }
 
-                let (alibi_slopes_ptr, alibi_slopes_guard) = utils::device_ptr::<f32>(
-                    alibi_slopes_storage,
-                    alibi_slopes_layout,
-                    &stream,
-                    "alibi_slopes",
-                )?;
+                // Unlike the varlen and kv-cache paths, this one takes the pointer at the
+                // allocation base without applying the layout's start offset. That predates this
+                // port, and #155 is a mechanical port that preserves existing behavior, so the
+                // difference is kept rather than silently changing attention numerics. It belongs
+                // with the kernel-defect fixes in #156.
+                let alibi_slopes_slice = match &**alibi_slopes_storage {
+                    candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                    _ => candle_core::bail!("alibi_slopes must be a cuda tensor"),
+                };
+                let (alibi_slopes_ptr, alibi_slopes_guard) = alibi_slopes_slice.device_ptr(&stream);
 
                 (
                     alibi_slopes_ptr as *const core::ffi::c_void,
@@ -699,26 +703,33 @@ impl FlashAttentionVarLen {
         let batch_size = nseqlens_q - 1;
         let (total_q, num_heads, head_size_og) = q_l.shape().dims3()?;
 
-        let (block_table_ptr, block_table_layout) = if let Some(block_table) = &self.block_table {
-            let (block_table_storage, block_table_layout) = block_table.storage_and_layout();
-            let block_table_ptr = match &*block_table_storage {
-                candle_core::Storage::Cuda(c) => {
-                    let cuda_slice = c.as_cuda_slice::<u32>()?;
-                    let block_table = cuda_slice.slice(block_table_layout.start_offset()..);
-                    let block_table_stride = block_table_layout.stride();
-                    let block_table_rank = block_table_stride.len();
-                    if block_table_stride[block_table_rank - 1] != 1 {
-                        candle_core::bail!("block_table must be contiguous")
-                    }
-                    block_table.view_ptr(&stream).0 as *const i32
+        // Bound outside the block below so the read guard outlives the kernel launch.
+        let block_table_storage = self
+            .block_table
+            .as_ref()
+            .map(|block_table| block_table.storage_and_layout());
+
+        let (block_table_ptr, block_table_layout, _block_table_guard) =
+            if let Some((block_table_storage, block_table_layout)) = &block_table_storage {
+                let block_table_stride = block_table_layout.stride();
+                let block_table_rank = block_table_stride.len();
+                if block_table_stride[block_table_rank - 1] != 1 {
+                    candle_core::bail!("block_table must be contiguous")
                 }
-                _ => candle_core::bail!("block_table must be a cuda tensor"),
+                let (block_table_ptr, block_table_guard) = utils::device_ptr::<u32>(
+                    block_table_storage,
+                    block_table_layout,
+                    &stream,
+                    "block_table",
+                )?;
+                (
+                    block_table_ptr as *const i32,
+                    Some(*block_table_layout),
+                    Some(block_table_guard),
+                )
+            } else {
+                (std::ptr::null(), None, None)
             };
-            // Clone block_table_storage to extend its lifetime
-            (block_table_ptr, Some(block_table_layout))
-        } else {
-            (std::ptr::null(), None)
-        };
 
         let (num_blocks, total_k, num_heads_k, head_size_og) = if !block_table_ptr.is_null() {
             k_l.shape().dims4()?
@@ -945,25 +956,29 @@ impl FlashAttentionVarLen {
                 (std::ptr::null(), 0, None)
             };
 
-        let seqused_k = if let Some(seqused_k) = &self.seqused_k {
-            let (seqused_k_storage, seqused_k_layout) = seqused_k.storage_and_layout();
-            let seqused_k_ptr = match &*seqused_k_storage {
-                candle_core::Storage::Cuda(c) => {
-                    let cuda_slice = c.as_cuda_slice::<u32>()?;
-                    let seqused_k = cuda_slice.slice(seqused_k_layout.start_offset()..);
-                    let seqused_k_stride = seqused_k_layout.stride();
-                    let seqused_k_rank = seqused_k_stride.len();
-                    if seqused_k_stride[seqused_k_rank - 1] != 1 {
-                        candle_core::bail!("block_table must be contiguous")
-                    }
-                    seqused_k.view_ptr(&stream).0 as *const i32
+        // Bound outside the block below so the read guard outlives the kernel launch.
+        let seqused_k_storage = self
+            .seqused_k
+            .as_ref()
+            .map(|seqused_k| seqused_k.storage_and_layout());
+
+        let (seqused_k, _seqused_k_guard) =
+            if let Some((seqused_k_storage, seqused_k_layout)) = &seqused_k_storage {
+                let seqused_k_stride = seqused_k_layout.stride();
+                let seqused_k_rank = seqused_k_stride.len();
+                if seqused_k_stride[seqused_k_rank - 1] != 1 {
+                    candle_core::bail!("seqused_k must be contiguous")
                 }
-                _ => candle_core::bail!("block_table must be a cuda tensor"),
+                let (seqused_k_ptr, seqused_k_guard) = utils::device_ptr::<u32>(
+                    seqused_k_storage,
+                    seqused_k_layout,
+                    &stream,
+                    "seqused_k",
+                )?;
+                (seqused_k_ptr as *const i32, Some(seqused_k_guard))
+            } else {
+                (std::ptr::null(), None)
             };
-            seqused_k_ptr
-        } else {
-            std::ptr::null()
-        };
 
         // if window_size_left > self.max_seqlen_k or None => -1
         let mut window_size_left = self
@@ -1619,26 +1634,33 @@ impl FlashAttentionKvCache {
             candle_core::bail!("query and value must have the same dtype");
         }
 
-        let (block_table_ptr, block_table_layout) = if let Some(block_table) = &self.block_table {
-            let (block_table_storage, block_table_layout) = block_table.storage_and_layout();
-            let block_table_ptr = match &*block_table_storage {
-                candle_core::Storage::Cuda(c) => {
-                    let cuda_slice = c.as_cuda_slice::<u32>()?;
-                    let block_table = cuda_slice.slice(block_table_layout.start_offset()..);
-                    let block_table_stride = block_table_layout.stride();
-                    let block_table_rank = block_table_stride.len();
-                    if block_table_stride[block_table_rank - 1] != 1 {
-                        candle_core::bail!("block_table must be contiguous")
-                    }
-                    block_table.view_ptr(&stream).0 as *const i32
+        // Bound outside the block below so the read guard outlives the kernel launch.
+        let block_table_storage = self
+            .block_table
+            .as_ref()
+            .map(|block_table| block_table.storage_and_layout());
+
+        let (block_table_ptr, block_table_layout, _block_table_guard) =
+            if let Some((block_table_storage, block_table_layout)) = &block_table_storage {
+                let block_table_stride = block_table_layout.stride();
+                let block_table_rank = block_table_stride.len();
+                if block_table_stride[block_table_rank - 1] != 1 {
+                    candle_core::bail!("block_table must be contiguous")
                 }
-                _ => candle_core::bail!("block_table must be a cuda tensor"),
+                let (block_table_ptr, block_table_guard) = utils::device_ptr::<u32>(
+                    block_table_storage,
+                    block_table_layout,
+                    &stream,
+                    "block_table",
+                )?;
+                (
+                    block_table_ptr as *const i32,
+                    Some(*block_table_layout),
+                    Some(block_table_guard),
+                )
+            } else {
+                (std::ptr::null(), None, None)
             };
-            // Clone block_table_storage to extend its lifetime
-            (block_table_ptr, Some(block_table_layout))
-        } else {
-            (std::ptr::null(), None)
-        };
 
         let (batch_size, seqlen_q, num_heads, head_size_og) = q_l.shape().dims4()?;
         let max_num_blocks_per_sequence = if let Some(layout) = block_table_layout {
