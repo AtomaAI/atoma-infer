@@ -1,5 +1,4 @@
-//! Responsible for creating the json schema associated with the AtomaAPI, which is modeled after
-//! OpenAI's own API.
+//! OpenAI-compatible chat completion request and response types.
 
 #[cfg(feature = "vllm")]
 use atoma_backends::{
@@ -11,7 +10,6 @@ use std::{
 };
 use utoipa::ToSchema;
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -20,10 +18,10 @@ use serde_json::Value;
 // just `String` since a user could input anything if we allow them to.
 // On our end, it's also beneficial since we will want to match on that
 // type. For now a naive version of this is OK, but may want to do this
-// before deploying v1 of the schema to avoid misuse.
+// before stabilizing the API to avoid misuse.
 
 /// ID of the model to use.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename(serialize = "model", deserialize = "model"))]
 pub enum Model {
     #[serde(rename(
@@ -173,7 +171,7 @@ impl Model {
 
 /// A message that is part of a conversation which is based on the role
 /// of the author of the message.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Message {
     /// The role of the messages author, in this case system.
@@ -443,7 +441,7 @@ pub(crate) mod messages {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum MessageContent {
     /// The text contents of the message.
@@ -497,7 +495,7 @@ impl<'de> Deserialize<'de> for MessageContent {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContentPart {
     #[serde(rename(serialize = "text", deserialize = "text"))]
@@ -530,7 +528,7 @@ impl std::fmt::Display for MessageContentPart {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename(serialize = "image_url", deserialize = "image_url"))]
 pub struct MessageContentPartImageUrl {
     /// Either a URL of the image or the base64 encoded image data.
@@ -549,7 +547,7 @@ impl std::fmt::Display for MessageContentPartImageUrl {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallFunction {
     /// The name of the function to call.
     name: String,
@@ -560,7 +558,7 @@ pub struct ToolCallFunction {
     arguments: Value,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename(serialize = "tool_call", deserialize = "tool_call"))]
 pub struct ToolCall {
     /// The ID of the tool call.
@@ -646,7 +644,7 @@ impl ToolCall {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename(serialize = "tool", deserialize = "tool"))]
 pub struct Tool {
     /// The type of the tool. Currently, only function is supported.
@@ -656,7 +654,7 @@ pub struct Tool {
     function: ToolFunction,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolFunction {
     /// Description of the function to call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -674,7 +672,7 @@ pub struct ToolFunction {
 }
 
 /// The stop condition for the chat completion.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename(serialize = "stop", deserialize = "stop"))]
 #[serde(untagged)]
 pub enum StopCondition {
@@ -682,7 +680,7 @@ pub enum StopCondition {
     String(String),
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename(serialize = "requestBody", deserialize = "requestBody"))]
 pub struct RequestBody {
     /// A list of messages comprising the conversation so far.
@@ -812,78 +810,6 @@ impl RequestBody {
 
     pub fn user(&self) -> Option<&String> {
         self.user.as_ref()
-    }
-
-    /// The control structure for testing the rust to json api, and schema.
-    /// Represents all possible values for serialization.
-    #[cfg(test)]
-    pub(crate) fn control() -> Self {
-        use serde_json::json;
-
-        Self {
-            model: Model::Llama38b,
-            messages: vec![
-                Message::System {
-                    content: Some(MessageContent::Text("test".into())),
-                    name: Some("test".into()),
-                },
-                Message::User {
-                    content: Some(MessageContent::Array(vec![
-                        MessageContentPart::Text {
-                            r#type: "test".into(),
-                            text: "test".into(),
-                        },
-                        MessageContentPart::Image {
-                            r#type: "test".into(),
-                            image_url: MessageContentPartImageUrl {
-                                url: "https://imgur.com/m6eWDSz".into(),
-                                detail: Some("high".into()),
-                            },
-                        },
-                    ])),
-                    name: Some("test".into()),
-                },
-                Message::Assistant {
-                    content: Some(MessageContent::Text("test".into())),
-                    name: Some("test".into()),
-                    refusal: None,
-                    tool_calls: vec![ToolCall {
-                        id: "chatcmpl-123".into(),
-                        r#type: "function".into(),
-                        function: ToolCallFunction {
-                            name: "myFunction".into(),
-                            arguments: serde_json::json!({"key": "value"}),
-                        },
-                    }],
-                },
-                Message::Tool {
-                    content: Some(MessageContent::Text("test".into())),
-                    tool_call_id: "0".into(),
-                },
-            ],
-            frequency_penalty: Some(0.5),
-            logit_bias: Some(HashMap::from_iter(vec![(String::from("test"), 0.5)])),
-            logprobs: Some(true),
-            top_logprobs: Some(1),
-            max_completion_tokens: Some(100),
-            n: Some(1),
-            presence_penalty: Some(0.5),
-            seed: Some(1),
-            stop: Some(StopCondition::String("test".into())),
-            stream: Some(true),
-            temperature: Some(0.5),
-            top_p: Some(0.5),
-            tools: Some(vec![Tool {
-                r#type: "function".into(),
-                function: ToolFunction {
-                    name: "myFunction".into(),
-                    description: Some("This is a test function".into()),
-                    parameters: Some(json!({"key": "value"})),
-                    strict: Some(true),
-                },
-            }]),
-            user: Some("test".into()),
-        }
     }
 }
 
@@ -1131,14 +1057,7 @@ impl TryFrom<(String, GenerateStreamingOutput)> for ChatCompletionChunk {
 }
 
 #[cfg(test)]
-pub mod json_schema_tests {
-    // TODO: Move check functions to a test utils module.
-    //! Note: These tests make use of the `expect_test` crate, and can be updated by
-    //! setting `UPDATE_EXPECT=1`.
-    use std::{fs::File, io::BufReader};
-
-    use expect_test::{expect_file, ExpectFile};
-    use schemars::schema_for;
+pub mod tests {
     use serde_json::json;
 
     use super::{
@@ -1146,48 +1065,6 @@ pub mod json_schema_tests {
         Message, MessageContent, MessageContentPart, MessageContentPartImageUrl, Model,
         RequestBody, StreamChoice, ToolCall, ToolCallFunction, Usage,
     };
-    use crate::api::validate_with_schema;
-
-    /// Used in tandem with a schema file, this will check if there are
-    /// changes to the JSON API schema, and show a diff if so.
-    /// If there are changes, running the test with `UPDATE_EXPECT=1`
-    /// will update the json schema file.
-    fn check_schema(schema: &str, expect_file: ExpectFile) {
-        expect_file.assert_eq(schema);
-    }
-
-    #[test]
-    /// Used in tandem with a schema file, this will check if there are
-    /// changes to the JSON API schema, and show a diff if so.
-    /// If there are changes, running the test with `UPDATE_EXPECT=1`
-    /// will update the json schema file.
-    fn verify_request_schema() {
-        let request_schema = schema_for!(RequestBody);
-        let json_request_schema = serde_json::to_string_pretty(&request_schema)
-            .expect("failed to parse json schema into str while verifying request schema");
-        check_schema(
-            &json_request_schema,
-            expect_file!["../../request_schema.json"],
-        );
-    }
-
-    // TODO: Add the above test for response_schema
-
-    #[test]
-    fn request_schema_control() {
-        let schema_path = concat!(env!("CARGO_MANIFEST_DIR"), "/request_schema.json");
-        let schema_file = File::open(schema_path).expect("request_schema.json not found, try running the verify_request_schema test with UPDATE_EXPECT=1 and try again.");
-        let reader = BufReader::new(schema_file);
-        let schema: serde_json::Value =
-            serde_json::from_reader(reader).expect("failed to read request schema");
-        let validator = jsonschema::draft7::new(&schema)
-            .expect("failed to create validator from request schema");
-        let request = serde_json::json!(RequestBody::control());
-        assert!(
-            validate_with_schema(validator, request).is_none(),
-            "Failed to validate control from request schema.\nThe AtomaAPI JSON schema is auto generated by running 'UPDATE_EXPECT=1 cargo test verify_request_schema' and is located in 'server/request_schema.json'."
-        );
-    }
 
     #[test]
     fn deserialize_request_body_basic() {

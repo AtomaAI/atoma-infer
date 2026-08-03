@@ -30,10 +30,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
-    api::{
-        chat_completions::{ChatCompletionResponse, RequestBody},
-        validate_schema::validate_with_schema,
-    },
+    api::chat_completions::{ChatCompletionResponse, RequestBody},
     stream::Streamer,
 };
 
@@ -77,10 +74,7 @@ pub struct AppState {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(
-        completion_handler,
-        validate_completion_handler
-    ),
+    paths(completion_handler),
     components(schemas(ChatCompletionResponse, RequestBody)),
     tags(
         (name = "Atoma's Chat Completions", description = "Atoma's Chat completion API")
@@ -106,7 +100,7 @@ pub struct ApiDoc;
 ///
 /// # Flow
 ///
-/// 1. Sets up the HTTP router with routes for chat completions and validation.
+/// 1. Sets up the HTTP router with the chat completions route.
 /// 2. Configures a shutdown signal to listen for Ctrl+C.
 /// 3. Starts the server with graceful shutdown capabilities.
 /// 4. Waits for the shutdown signal.
@@ -125,10 +119,6 @@ pub async fn run_server(
     let shutdown_signal_sender = app_state.shutdown_signal_sender.clone();
     let http_router = Router::new()
         .route(CHAT_COMPLETIONS_PATH, post(completion_handler))
-        .route(
-            &format!("{CHAT_COMPLETIONS_PATH}/validate"),
-            post(validate_completion_handler),
-        )
         .with_state(app_state)
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()));
 
@@ -281,48 +271,6 @@ pub async fn completion_handler(
     };
 
     Ok(chat_response)
-}
-
-/// Validates the incoming JSON request body against the OpenAI Chat Completion API schema.
-///
-/// This handler is used to validate the structure and content of a request body
-/// before it's processed by the actual completion handler. It helps clients
-/// ensure their requests are properly formatted.
-///
-/// # Arguments
-///
-/// * `instance` - The JSON request body to validate, extracted from the request.
-///
-/// # Returns
-///
-/// Returns a JSON response indicating whether the validation was successful or not.
-/// If validation fails, it returns details about the validation errors.
-#[utoipa::path(
-    post,
-    path = "/chat/completions/validate",
-    request_body = serde_json::Value,
-    responses(
-        (status = 200, description = "Validation success"),
-        (status = 400, description = "Validation failed")
-    )
-)]
-#[instrument(skip_all)]
-pub async fn validate_completion_handler(
-    Json(instance): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let schema = include_bytes!("../request_schema.json");
-    let schema = serde_json::from_slice(schema).expect("failed to read schema file");
-    let Ok(validator) = jsonschema::draft7::new(&schema) else {
-        return Json(json!({
-            "status": "failed",
-            "reason": "failed to create validator from json schema"
-        }));
-    };
-    if let Some(errors) = validate_with_schema(validator, instance) {
-        error!("Validation failed: {errors:?}");
-        return Json(json!(errors));
-    }
-    Json(json!({"status": "success"}))
 }
 
 /// Handles a generate request by sending it to the LLM service and processing the response.

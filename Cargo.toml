@@ -8,7 +8,6 @@ edition = "2021"
 
 [workspace.dependencies]
 anyhow = "1.0.89"
-async-openai = "0.24.1"
 axum = "0.7"
 atoma-backends = { path = "./backends/" }
 bindgen_cuda = "0.1.5"
@@ -32,7 +31,6 @@ cudarc = { version = "0.17.3", features = [
 ], default-features = false }
 cuda-runtime-sys = "0.3.0-alpha.1"
 dotenv = "0.15.0"
-expect-test = "1.5"
 flume = "0.11.0"
 futures = "0.3.30"
 half = "2.4.1"
