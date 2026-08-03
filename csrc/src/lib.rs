@@ -1,3 +1,5 @@
+#![cfg(feature = "cuda")]
+
 pub mod cache_manager;
 mod ffi;
 pub mod ops;

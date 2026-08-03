@@ -1,6 +1,5 @@
 //! OpenAI-compatible chat completion request and response types.
 
-#[cfg(feature = "vllm")]
 use atoma_backends::{
     GenerateParameters, GenerateRequest, GenerateRequestOutput, GenerateStreamingOutput,
 };

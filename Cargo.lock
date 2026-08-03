@@ -409,7 +409,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1af6498885edc8e68fb914c31046c5321ca9a421d53965d445ddf98000453b2e"
 dependencies = [
  "anyhow",
- "bindgen_cuda",
  "candle-core",
  "candle-nn",
  "candle-transformers",

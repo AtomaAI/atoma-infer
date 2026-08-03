@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-atoma-vllm-backend = { path = "vllm", optional = true }
+atoma-vllm-backend = { path = "vllm" }
 serde = { workspace = true, features = ["derive"] }
 
 [features]
-vllm = ["dep:atoma-vllm-backend"]
-nccl = ["vllm", "atoma-vllm-backend/nccl"]
+cuda = ["atoma-vllm-backend/cuda"]
+nccl = ["cuda", "atoma-vllm-backend/nccl"]

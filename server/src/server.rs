@@ -6,7 +6,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(feature = "vllm")]
 use atoma_backends::{GenerateRequest, ServiceRequest};
 use axum::{
     extract::State,

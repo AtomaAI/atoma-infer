@@ -1,34 +1,49 @@
+use crate::{
+    config::{CacheConfigError, SchedulerConfigError},
+    llm_engine::{EngineError, GenerateRequestOutput, StreamResponse},
+    scheduler::SchedulerError,
+    sequence::{SequenceError, SequenceGroup},
+    tokenizer::TokenizerError,
+    types::GenerateRequest,
+    validation::ValidationError,
+};
+use candle_core::{DTypeParseError, Error as CandleError};
+use thiserror::Error;
+use tokio::sync::{mpsc::error::SendError, oneshot};
+
+#[cfg(feature = "cuda")]
 use std::{path::Path, str::FromStr, time::Instant};
 
+#[cfg(feature = "cuda")]
 use crate::{
-    config::{
-        CacheConfig, CacheConfigError, ModelConfig, SchedulerConfig, SchedulerConfigError,
-        ValidationConfig,
-    },
-    llm_engine::{EngineError, GenerateRequestOutput, LlmEngine, StreamResponse},
+    config::{CacheConfig, ModelConfig, SchedulerConfig, ValidationConfig},
+    llm_engine::LlmEngine,
     model_executor::{
-        Config, ConfigError, ModelExecutor, ModelLoaderError, ModelThreadDispatcher,
-        ModelThreadError,
+        Config, ModelExecutor, ModelLoaderError, ModelThreadDispatcher, ModelThreadError,
     },
-    scheduler::{Scheduler, SchedulerError},
-    sequence::{Sequence, SequenceError, SequenceGroup},
-    tokenizer::{TokenizerError, TokenizerWorker},
-    types::GenerateRequest,
-    validation::{ValidGenerateRequest, Validation, ValidationError},
+    scheduler::Scheduler,
+    sequence::Sequence,
+    tokenizer::TokenizerWorker,
+    validation::{ValidGenerateRequest, Validation},
 };
-use candle_core::{DType, DTypeParseError, Error as CandleError};
+#[cfg(feature = "cuda")]
+use candle_core::DType;
+#[cfg(feature = "cuda")]
 use candle_transformers::generation::{LogitsProcessor, Sampling};
+#[cfg(feature = "cuda")]
 use metrics::{counter, gauge};
-use thiserror::Error;
+#[cfg(feature = "cuda")]
 use tokenizers::Tokenizer;
+#[cfg(feature = "cuda")]
 use tokio::{
-    sync::{
-        mpsc::{self, error::SendError, UnboundedReceiver, UnboundedSender},
-        oneshot,
-    },
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
 };
+#[cfg(feature = "cuda")]
 use tracing::{error, info, info_span, instrument, Span};
+
+#[cfg(feature = "cuda")]
+use crate::model_executor::ConfigError;
 
 // TODO:
 // 1. Add proper tokenizer shutdown logic, and other related services
@@ -69,6 +84,7 @@ pub enum EngineRequest {
 /// It receives requests from the Atoma's event subscriber
 /// service. It validates and tokenizes such requests
 /// and sends the valid request to the `LlmEngine`
+#[cfg(feature = "cuda")]
 pub struct LlmService {
     /// A receiver channel, it is responsible for
     /// receiving incoming requests from the OpenAI API server
@@ -96,6 +112,7 @@ pub struct LlmService {
     span: Span,
 }
 
+#[cfg(feature = "cuda")]
 impl LlmService {
     /// Starts the service
     #[instrument(skip_all)]
@@ -452,12 +469,15 @@ pub enum LlmServiceError {
     CacheConfigError(#[from] CacheConfigError),
     #[error("Candle error: `{0}`")]
     CandleError(#[from] CandleError),
+    #[cfg(feature = "cuda")]
     #[error("Config error: `{0}`")]
     ConfigError(#[from] ConfigError),
     #[error("DType parse error: `{0}`")]
     DTypeParseError(#[from] DTypeParseError),
+    #[cfg(feature = "cuda")]
     #[error("Model loader error: `{0}`")]
     ModelLoaderError(#[from] ModelLoaderError),
+    #[cfg(feature = "cuda")]
     #[error("Model thread error: `{0}`")]
     ModelThreadError(#[from] ModelThreadError),
     #[error("Engine error: `{0}`")]

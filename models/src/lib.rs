@@ -1,3 +1,5 @@
+#![cfg(feature = "cuda")]
+
 pub mod flash_attention;
 pub mod llama;
 #[cfg(feature = "nccl")]

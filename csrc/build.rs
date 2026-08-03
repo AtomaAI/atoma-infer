@@ -1,9 +1,12 @@
 // Build script to run nvcc and generate the C glue code for launching the flash-attention kernel.
 // The cuda build time is very long so one can set the ATOMA_FLASH_ATTN_BUILD_DIR environment
 // variable in order to cache the compiled artifacts and avoid recompiling too often.
+#[cfg(feature = "cuda")]
 use anyhow::{Context, Result};
+#[cfg(feature = "cuda")]
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "cuda")]
 const KERNEL_FILES: [&str; 66] = [
     "kernels/cache_manager.cu",
     "kernels/flash_api.cu",
@@ -73,6 +76,10 @@ const KERNEL_FILES: [&str; 66] = [
     "kernels/flash_fwd_split_hdim256_fp16_sm80.cu",
 ];
 
+#[cfg(not(feature = "cuda"))]
+fn main() {}
+
+#[cfg(feature = "cuda")]
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     for kernel_file in KERNEL_FILES.iter() {
@@ -114,6 +121,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn compile_cuda_files(build_dir: &Path) -> Result<()> {
     let kernels: Vec<_> = KERNEL_FILES.iter().map(|&s| s.to_string()).collect();
     let builder = bindgen_cuda::Builder::default()

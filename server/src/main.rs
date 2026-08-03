@@ -1,22 +1,28 @@
+#[cfg(feature = "cuda")]
+use atoma_backends::{LlamaModel, LlmService};
+#[cfg(feature = "cuda")]
 use clap::Parser;
+#[cfg(feature = "cuda")]
 use std::{
     env,
     sync::{atomic::AtomicU64, Arc},
 };
-
-#[cfg(feature = "vllm")]
-use atoma_backends::{LlamaModel, LlmService};
+#[cfg(feature = "cuda")]
 use tokio::{net::TcpListener, sync::mpsc};
 
+#[cfg(feature = "cuda")]
 use server::{run_server, AppState};
 
 pub mod api;
 pub mod server;
 pub mod stream;
 
+#[cfg(feature = "cuda")]
 pub const DEFAULT_SERVER_ADDRESS: &str = "0.0.0.0";
+#[cfg(feature = "cuda")]
 pub const DEFAULT_SERVER_PORT: &str = "8080";
 
+#[cfg(feature = "cuda")]
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
@@ -24,6 +30,7 @@ pub struct Args {
     config_path: String,
 }
 
+#[cfg(feature = "cuda")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -65,4 +72,9 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(100),
     };
     run_server(listener, app_state, join_handle).await
+}
+
+#[cfg(not(feature = "cuda"))]
+fn main() -> anyhow::Result<()> {
+    anyhow::bail!("CUDA support is disabled; rebuild with `--features cuda`")
 }

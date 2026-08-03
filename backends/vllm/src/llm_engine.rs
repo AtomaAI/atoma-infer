@@ -1,26 +1,39 @@
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
-    time::{Duration, Instant, SystemTime},
+    time::Instant,
 };
 
-use futures::StreamExt;
 use thiserror::Error;
-use tokenizers::Tokenizer;
-use tokio::sync::{
-    mpsc::{error::SendError, UnboundedReceiver},
-    oneshot::{self, error::RecvError},
-};
-use tracing::{debug, error, info, info_span, instrument, trace, Span};
+use tokio::sync::{mpsc::error::SendError, oneshot::error::RecvError};
+use tracing::debug;
 
+use crate::{
+    scheduler::SchedulerError,
+    sequence::{LogProb, RequestMetrics, SequenceError, SequenceGroup},
+};
+
+#[cfg(feature = "cuda")]
+use std::time::{Duration, SystemTime};
+
+#[cfg(feature = "cuda")]
+use futures::StreamExt;
+#[cfg(feature = "cuda")]
+use tokenizers::Tokenizer;
+#[cfg(feature = "cuda")]
+use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
+#[cfg(feature = "cuda")]
+use tracing::{error, info, info_span, instrument, trace, Span};
+
+#[cfg(feature = "cuda")]
 use crate::{
     llm_service::EngineRequest,
     model_executor::ModelThreadDispatcher,
     policy::FcfsPolicy,
-    scheduler::{Scheduler, SchedulerError, SchedulerOutputs},
+    scheduler::{Scheduler, SchedulerOutputs},
     sequence::{
-        ExecuteModelRequest, LogProb, RequestMetrics, Sequence, SequenceError, SequenceGroup,
-        SequenceGroupMetadata, SequenceGroupOutput, SequenceOutput, SequenceStatus,
+        ExecuteModelRequest, Sequence, SequenceGroupMetadata, SequenceGroupOutput, SequenceOutput,
+        SequenceStatus,
     },
     types::{ReadLock, WriteLock},
     validation::StoppingCriteriaParameters,
@@ -28,11 +41,13 @@ use crate::{
 
 /// Time in milliseconds we wait until we schedule new received requests,
 /// in case the `LlmEngine` was on halt.
+#[cfg(feature = "cuda")]
 const SCHEDULE_WAIT_PERIOD: u64 = 100;
 
 /// `LlmEngine` - An asynchronous worker responsible for scheduling new requests
 /// and communicating with the `ModelExecutor` service to send new requests
 /// for continuously batched AI inference.
+#[cfg(feature = "cuda")]
 pub struct LlmEngine {
     /// Dispatcher for communicating with the model executor's running thread,
     /// responsible for running prefill and decoding inference to produce AI-generated outputs.
@@ -56,6 +71,7 @@ pub struct LlmEngine {
     span: Span,
 }
 
+#[cfg(feature = "cuda")]
 impl LlmEngine {
     /// Constructor
     pub fn new(

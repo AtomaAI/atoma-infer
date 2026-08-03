@@ -1,3 +1,5 @@
+#![cfg(feature = "cuda")]
+
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use serial_test::serial;

@@ -19,5 +19,5 @@ utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-swagger-ui = { workspace = true, features = ["axum"] }
 
 [features]
-vllm = ["atoma-backends/vllm"]
-nccl = ["vllm", "atoma-backends/nccl"]
+cuda = ["atoma-backends/cuda"]
+nccl = ["cuda", "atoma-backends/nccl"]

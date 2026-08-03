@@ -1,7 +1,9 @@
 use candle_core::{DType, DTypeParseError};
 use config::Config;
 use serde::{Deserialize, Serialize};
-use std::{path::Path, str::FromStr};
+use std::path::Path;
+#[cfg(feature = "cuda")]
+use std::str::FromStr;
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -110,6 +112,7 @@ pub struct CacheConfig {
 
 impl CacheConfig {
     /// Creates a new instance of `CacheConfig` from a `.toml` file.
+    #[cfg(feature = "cuda")]
     pub fn from_file_path<P: AsRef<Path>>(
         config_file_path: P,
         num_kv_heads: usize,
@@ -439,6 +442,7 @@ impl ValidationConfig {
 
 pub(crate) mod utils {
     use super::*;
+    #[cfg(feature = "cuda")]
     use cuda_runtime_sys::*;
 
     /// Calculate the swap space in bytes based on the available system memory and the specified
@@ -537,6 +541,7 @@ pub(crate) mod utils {
     ///   across all devices.
     /// - The actual number of blocks is determined by the available free memory and the specified
     ///   utilization rate.
+    #[cfg(feature = "cuda")]
     pub(crate) fn calculate_num_gpu_blocks(
         block_size: usize,
         gpu_memory_utilization: f32,

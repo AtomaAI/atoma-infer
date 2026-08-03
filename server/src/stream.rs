@@ -1,5 +1,4 @@
 use crate::api::chat_completions::ChatCompletionChunk;
-#[cfg(feature = "vllm")]
 use atoma_backends::StreamResponse;
 use axum::{response::sse::Event, Error};
 use flume::Receiver;
