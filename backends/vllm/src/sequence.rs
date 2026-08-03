@@ -998,7 +998,7 @@ impl ReadLock for SyncSequence {
     type Error = SequenceError;
     type Inner = Sequence;
 
-    fn read_lock(&self) -> Result<std::sync::RwLockReadGuard<Self::Inner>, Self::Error> {
+    fn read_lock(&self) -> Result<std::sync::RwLockReadGuard<'_, Self::Inner>, Self::Error> {
         self.read()
             .map_err(|e| SequenceError::ReadLockError(e.to_string()))
     }
@@ -1008,7 +1008,7 @@ impl WriteLock for SyncSequence {
     type Error = SequenceError;
     type Inner = Sequence;
 
-    fn write_lock(&self) -> Result<std::sync::RwLockWriteGuard<Self::Inner>, Self::Error> {
+    fn write_lock(&self) -> Result<std::sync::RwLockWriteGuard<'_, Self::Inner>, Self::Error> {
         self.write()
             .map_err(|e| SequenceError::WriteLockError(e.to_string()))
     }

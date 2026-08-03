@@ -1806,7 +1806,7 @@ impl<P: Debug> Scheduler<P> {
             preemption_mode.unwrap()
         };
 
-        if self.num_cumulative_preemption % 50 == 0 {
+        if self.num_cumulative_preemption.is_multiple_of(50) {
             warn!("Sequence group with id = {} is preempted by {:?} mode because there is not enough KV cache space. 
                     This can affect the end-to-end performance. Increase `gpu_memory_utilization` or `tensor_parallel_size` 
                     to provide more KV cache memory. `total_num_cumulative_preemption = {}` ", 

@@ -8,9 +8,11 @@ use crate::{
     types::{GenerateParameters, GenerateRequest},
 };
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const DEFAULT_RANDOM_SEED: u64 = 1_283_768_955;
 
 /// `Validation` - Responsible for validating `Request`/`Response` parameters
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub struct Validation {
     /// Maximum number of sequences to generate for ranking (currently unused)
@@ -381,6 +383,7 @@ impl Validation {
 ///
 /// This struct is created after input validation has taken place, ensuring that all
 /// parameters are within acceptable ranges and the input is properly tokenized.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct ValidGenerateRequest {
     /// Unique identifier for the request

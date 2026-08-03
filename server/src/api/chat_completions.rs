@@ -637,7 +637,7 @@ impl ToolCall {
                 }
             }
             Model::Llama27b | Model::Llama27bChatHf | Model::Llama270b => {
-                format!("{}", self.function.name)
+                self.function.name.to_string()
             }
         }
     }

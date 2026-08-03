@@ -5,13 +5,13 @@ use serde::{Deserialize, Serialize};
 pub trait ReadLock {
     type Error;
     type Inner;
-    fn read_lock(&self) -> Result<RwLockReadGuard<Self::Inner>, Self::Error>;
+    fn read_lock(&self) -> Result<RwLockReadGuard<'_, Self::Inner>, Self::Error>;
 }
 
 pub trait WriteLock {
     type Error;
     type Inner;
-    fn write_lock(&self) -> Result<RwLockWriteGuard<Self::Inner>, Self::Error>;
+    fn write_lock(&self) -> Result<RwLockWriteGuard<'_, Self::Inner>, Self::Error>;
 }
 
 /// `GenerateRequest` - LLM inference request

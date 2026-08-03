@@ -268,7 +268,7 @@ impl ReadLock for SyncPhysicalTokenBlock {
     type Error = BlockError;
     type Inner = PhysicalTokenBlock;
 
-    fn read_lock(&self) -> Result<RwLockReadGuard<Self::Inner>, Self::Error> {
+    fn read_lock(&self) -> Result<RwLockReadGuard<'_, Self::Inner>, Self::Error> {
         self.read()
             .map_err(|e| Self::Error::PoisonError(e.to_string()))
     }
@@ -278,7 +278,7 @@ impl WriteLock for SyncPhysicalTokenBlock {
     type Error = BlockError;
     type Inner = PhysicalTokenBlock;
 
-    fn write_lock(&self) -> Result<RwLockWriteGuard<Self::Inner>, Self::Error> {
+    fn write_lock(&self) -> Result<RwLockWriteGuard<'_, Self::Inner>, Self::Error> {
         self.write()
             .map_err(|e| Self::Error::PoisonError(e.to_string()))
     }

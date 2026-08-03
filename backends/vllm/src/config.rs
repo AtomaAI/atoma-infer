@@ -1,4 +1,6 @@
-use candle_core::{DType, DTypeParseError};
+#[cfg(feature = "cuda")]
+use candle_core::DType;
+use candle_core::DTypeParseError;
 use config::Config;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -619,6 +621,7 @@ pub(crate) mod utils {
     /// # Errors
     ///
     /// This function will return an error if the calculation of the total block memory fails.
+    #[cfg(feature = "cuda")]
     pub(crate) fn calculate_num_cpu_blocks(
         block_size: usize,
         dtype: DType,
@@ -660,6 +663,7 @@ pub(crate) mod utils {
     /// # Note
     ///
     /// The function doubles the calculated memory to account for both Key and Value tensors.
+    #[cfg(feature = "cuda")]
     fn compute_total_block_memory_in_bytes(
         block_size: usize,
         num_hidden_layers: usize,
