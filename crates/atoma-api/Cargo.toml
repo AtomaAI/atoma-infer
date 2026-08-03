@@ -1,0 +1,24 @@
+[package]
+edition = "2021"
+license = "Apache-2.0"
+name    = "atoma-api"
+version = { workspace = true }
+
+[dependencies]
+anyhow             = { workspace = true }
+atoma-backends     = { workspace = true }
+axum               = { workspace = true }
+clap               = { workspace = true, features = [ "derive" ] }
+flume              = { workspace = true }
+futures            = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+tokio              = { workspace = true, features = [ "macros", "rt-multi-thread", "signal" ] }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+utoipa             = { workspace = true, features = [ "axum_extras" ] }
+utoipa-swagger-ui  = { workspace = true, features = [ "axum" ] }
+
+[features]
+cuda = [ "atoma-backends/cuda" ]
+nccl = [ "atoma-backends/nccl", "cuda" ]

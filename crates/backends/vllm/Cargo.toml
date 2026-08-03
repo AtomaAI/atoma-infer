@@ -1,0 +1,39 @@
+[package]
+edition = { workspace = true }
+license = "Apache-2.0"
+name    = "atoma-vllm-backend"
+version = { workspace = true }
+
+[dependencies]
+candle-core         = { workspace = true }
+candle-nn           = { workspace = true }
+candle-transformers = { workspace = true }
+config              = { workspace = true }
+cuda-runtime-sys    = { workspace = true, optional = true }
+cudarc              = { workspace = true, optional = true }
+flume               = { workspace = true }
+futures             = { workspace = true }
+hf-hub              = { workspace = true }
+metrics             = { workspace = true }
+models              = { workspace = true }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+sys-info            = { workspace = true }
+thiserror           = { workspace = true }
+tokenizers          = { workspace = true }
+tokio               = { workspace = true, features = [ "fs", "macros" ] }
+tracing             = { workspace = true }
+
+[dev-dependencies]
+rand               = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+    "dep:cuda-runtime-sys",
+    "models/cuda",
+]
+nccl = [ "cuda", "cudarc/nccl", "dep:cudarc", "models/nccl" ]

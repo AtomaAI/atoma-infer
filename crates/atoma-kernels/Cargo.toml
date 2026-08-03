@@ -1,0 +1,23 @@
+[package]
+description = "Flash attention 2 kernels, with paged attention enabled"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+name        = "atoma-kernels"
+version     = "0.1.0"
+
+[dependencies]
+candle-core      = { workspace = true }
+cuda-runtime-sys = { workspace = true, optional = true }
+half             = { workspace = true, features = [ "num-traits" ] }
+
+[build-dependencies]
+anyhow       = { workspace = true, features = [ "backtrace" ] }
+bindgen_cuda = { workspace = true }
+
+[dev-dependencies]
+anyhow      = { workspace = true, features = [ "backtrace" ] }
+candle-nn   = { workspace = true }
+serial_test = { workspace = true }
+
+[features]
+cuda = [ "candle-core/cuda", "dep:cuda-runtime-sys" ]

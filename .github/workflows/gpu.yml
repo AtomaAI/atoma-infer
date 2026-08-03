@@ -1,0 +1,39 @@
+name: GPU CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-ci
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cuda-tests:
+    name: CUDA tests
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - gpu
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository and CUTLASS
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install stable Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rustflags: ""
+
+      - name: Run CUDA workspace tests
+        run: cargo test --workspace --features cuda --locked
