@@ -20,7 +20,7 @@ use serde_json::Value;
 // before stabilizing the API to avoid misuse.
 
 /// ID of the model to use.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename(serialize = "model", deserialize = "model"))]
 pub enum Model {
     #[serde(rename(
@@ -170,7 +170,7 @@ impl Model {
 
 /// A message that is part of a conversation which is based on the role
 /// of the author of the message.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Message {
     /// The role of the messages author, in this case system.
@@ -440,7 +440,7 @@ pub(crate) mod messages {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum MessageContent {
     /// The text contents of the message.
@@ -494,7 +494,7 @@ impl<'de> Deserialize<'de> for MessageContent {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum MessageContentPart {
     #[serde(rename(serialize = "text", deserialize = "text"))]
@@ -527,7 +527,7 @@ impl std::fmt::Display for MessageContentPart {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename(serialize = "image_url", deserialize = "image_url"))]
 pub struct MessageContentPartImageUrl {
     /// Either a URL of the image or the base64 encoded image data.
@@ -546,7 +546,7 @@ impl std::fmt::Display for MessageContentPartImageUrl {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ToolCallFunction {
     /// The name of the function to call.
     name: String,
@@ -557,7 +557,7 @@ pub struct ToolCallFunction {
     arguments: Value,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename(serialize = "tool_call", deserialize = "tool_call"))]
 pub struct ToolCall {
     /// The ID of the tool call.
@@ -643,7 +643,7 @@ impl ToolCall {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename(serialize = "tool", deserialize = "tool"))]
 pub struct Tool {
     /// The type of the tool. Currently, only function is supported.
@@ -653,7 +653,7 @@ pub struct Tool {
     function: ToolFunction,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ToolFunction {
     /// Description of the function to call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -671,7 +671,7 @@ pub struct ToolFunction {
 }
 
 /// The stop condition for the chat completion.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename(serialize = "stop", deserialize = "stop"))]
 #[serde(untagged)]
 pub enum StopCondition {
@@ -868,7 +868,7 @@ pub struct ChatCompletionResponse {
     pub usage: Usage,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Choice {
     pub index: u32,
     pub message: Message,
@@ -876,7 +876,7 @@ pub struct Choice {
     pub finish_reason: FinishReason,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stopped,
@@ -898,7 +898,7 @@ impl TryFrom<Option<&str>> for FinishReason {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -987,7 +987,7 @@ pub struct ChatCompletionChunk {
 }
 
 /// Represents a single choice in a streaming chat completion response.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct StreamChoice {
     /// The index of this choice in the list of choices.
     pub index: u32,
@@ -1002,7 +1002,7 @@ pub struct StreamChoice {
 }
 
 /// Represents the delta (incremental update) in a streaming chat completion response.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Delta {
     /// The role of the message author (e.g., "assistant").
     pub role: String,

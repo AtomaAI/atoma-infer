@@ -10,7 +10,10 @@ use atoma_backends::{GenerateRequest, ServiceRequest};
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
-    response::{sse::KeepAlive, IntoResponse, Sse},
+    response::{
+        sse::{KeepAlive, KeepAliveStream},
+        IntoResponse, Sse,
+    },
     routing::post,
     Json, Router,
 };
@@ -25,7 +28,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::{error, info, instrument};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
@@ -156,12 +159,12 @@ pub async fn run_server(
 
 /// Represents the response from a chat completion request.
 /// This enum can either be a full completion response or a stream chunk.
-#[derive(Debug, ToSchema)]
+#[derive(Debug)]
 pub enum ChatResponse {
     /// A complete chat completion response.
     Completion(ChatCompletionResponse),
     /// A chunk of a streaming chat completion response.
-    Stream(Sse<Streamer>),
+    Stream(Sse<KeepAliveStream<Streamer>>),
 }
 
 impl IntoResponse for ChatResponse {
@@ -384,7 +387,7 @@ async fn handle_generate_stream_request(
     app_state: &AppState,
     model: String,
     generate_request: GenerateRequest,
-) -> Result<Sse<Streamer>, (StatusCode, Json<Value>)> {
+) -> Result<Sse<KeepAliveStream<Streamer>>, (StatusCode, Json<Value>)> {
     let (sender, receiver) = flume::unbounded();
     if let Err(send_error) =
         app_state
