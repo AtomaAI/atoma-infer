@@ -1,29 +1,20 @@
-use crate::{
-    config::{CacheConfigError, SchedulerConfigError},
-    llm_engine::{EngineError, GenerateRequestOutput, StreamResponse},
-    scheduler::SchedulerError,
-    sequence::{SequenceError, SequenceGroup},
-    tokenizer::TokenizerError,
-    types::GenerateRequest,
-    validation::ValidationError,
-};
-use candle_core::{DTypeParseError, Error as CandleError};
-use thiserror::Error;
-use tokio::sync::{mpsc::error::SendError, oneshot};
-
 #[cfg(feature = "cuda")]
 use std::{path::Path, str::FromStr, time::Instant};
 
 #[cfg(feature = "cuda")]
 use crate::{
     config::{CacheConfig, ModelConfig, SchedulerConfig, ValidationConfig},
+    error::LlmServiceError,
     llm_engine::LlmEngine,
     model_executor::{
-        Config, ModelExecutor, ModelLoaderError, ModelThreadDispatcher, ModelThreadError,
+        Config, ConfigError, ModelExecutor, ModelLoaderError, ModelThreadDispatcher,
+        ModelThreadError,
     },
+    request::{EngineRequest, ServiceRequest},
     scheduler::Scheduler,
-    sequence::Sequence,
+    sequence::{Sequence, SequenceGroup},
     tokenizer::TokenizerWorker,
+    types::GenerateRequest,
     validation::{ValidGenerateRequest, Validation},
 };
 #[cfg(feature = "cuda")]
@@ -36,49 +27,17 @@ use metrics::{counter, gauge};
 use tokenizers::Tokenizer;
 #[cfg(feature = "cuda")]
 use tokio::{
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    sync::{
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
     task::JoinHandle,
 };
 #[cfg(feature = "cuda")]
 use tracing::{error, info, info_span, instrument, Span};
 
-#[cfg(feature = "cuda")]
-use crate::model_executor::ConfigError;
-
 // TODO:
 // 1. Add proper tokenizer shutdown logic, and other related services
-
-/// Represents different types of requests that can be sent to the LLM service.
-pub enum ServiceRequest {
-    /// A request for generating text without streaming.
-    ///
-    /// # Fields
-    /// * `GenerateRequest` - The request parameters for text generation.
-    /// * `oneshot::Sender<GenerateRequestOutput>` - A channel to send back the generated output.
-    GenerateRequest(GenerateRequest, oneshot::Sender<GenerateRequestOutput>),
-    /// A request for generating text with streaming output.
-    ///
-    /// # Fields
-    /// * `GenerateRequest` - The request parameters for text generation.
-    /// * `flume::Sender<GenerateStreamingOutput>` - A channel to stream the generated output.
-    GenerateStreamingRequest(GenerateRequest, flume::Sender<StreamResponse>),
-}
-
-/// Represents different types of requests that can be sent to the LLM engine.
-pub enum EngineRequest {
-    /// A request for generating text without streaming.
-    ///
-    /// # Fields
-    /// * `SequenceGroup` - The sequence group to be processed.
-    /// * `oneshot::Sender<GenerateRequestOutput>` - A channel to send back the generated output.
-    GenerateRequest(SequenceGroup, oneshot::Sender<GenerateRequestOutput>),
-    /// A request for generating text with streaming output.
-    ///
-    /// # Fields
-    /// * `SequenceGroup` - The sequence group to be processed.
-    /// * `flume::Sender<GenerateStreamingOutput>` - A channel to stream the generated output.
-    GenerateStreamingRequest(SequenceGroup, flume::Sender<StreamResponse>),
-}
 
 /// `LlmService` - the entrypoint of the Atoma's inference service.
 /// It receives requests from the Atoma's event subscriber
@@ -457,41 +416,4 @@ impl LlmService {
         info!("`LlmService` stopped successfully");
         Ok(())
     }
-}
-
-#[derive(Debug, Error)]
-pub enum LlmServiceError {
-    #[error("Boxed error: `{0}`")]
-    BoxedError(#[from] Box<dyn std::error::Error + Send + Sync>),
-    #[error("Broadcast sender error: `{0}`")]
-    BroadcastSenderError(String),
-    #[error("Cache config error: `{0}`")]
-    CacheConfigError(#[from] CacheConfigError),
-    #[error("Candle error: `{0}`")]
-    CandleError(#[from] CandleError),
-    #[cfg(feature = "cuda")]
-    #[error("Config error: `{0}`")]
-    ConfigError(#[from] ConfigError),
-    #[error("DType parse error: `{0}`")]
-    DTypeParseError(#[from] DTypeParseError),
-    #[cfg(feature = "cuda")]
-    #[error("Model loader error: `{0}`")]
-    ModelLoaderError(#[from] ModelLoaderError),
-    #[cfg(feature = "cuda")]
-    #[error("Model thread error: `{0}`")]
-    ModelThreadError(#[from] ModelThreadError),
-    #[error("Engine error: `{0}`")]
-    EngineError(#[from] EngineError),
-    #[error("Validation error: `{0}`")]
-    ValidationError(#[from] ValidationError),
-    #[error("Scheduler error: `{0}`")]
-    SchedulerError(#[from] SchedulerError),
-    #[error("Scheduler config error: `{0}`")]
-    SchedulerConfigError(#[from] SchedulerConfigError),
-    #[error("Sequence error: `{0}`")]
-    SequenceError(#[from] SequenceError),
-    #[error("Send error: `{0}`")]
-    SendError(#[from] Box<SendError<EngineRequest>>),
-    #[error("Tokenizer error: `{0}`")]
-    TokenizerError(#[from] TokenizerError),
 }

@@ -20,11 +20,12 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
 use crate::{
-    llm_service::{LlmService, ServiceRequest},
+    llm_service::LlmService,
     model_executor::{
         Config, ConfigError, ModelExecutor, ModelExecutorError, ModelFilePaths, ModelLoader,
         ModelLoaderError,
     },
+    request::ServiceRequest,
     sequence::ExecuteModelRequest,
     types::{GenerateParameters, GenerateRequest},
 };

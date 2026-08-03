@@ -1,20 +1,9 @@
+#[cfg(feature = "cuda")]
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
-
-use thiserror::Error;
-use tokio::sync::{mpsc::error::SendError, oneshot::error::RecvError};
-use tracing::debug;
-
-use crate::{
-    scheduler::SchedulerError,
-    sequence::{LogProb, RequestMetrics, SequenceError, SequenceGroup},
-};
-
-#[cfg(feature = "cuda")]
-use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "cuda")]
 use futures::StreamExt;
@@ -27,9 +16,11 @@ use tracing::{error, info, info_span, instrument, trace, Span};
 
 #[cfg(feature = "cuda")]
 use crate::{
-    llm_service::EngineRequest,
+    error::EngineError,
     model_executor::ModelThreadDispatcher,
+    output::{GenerateRequestOutput, GenerateStreamingOutput, StreamResponse},
     policy::FcfsPolicy,
+    request::EngineRequest,
     scheduler::{Scheduler, SchedulerOutputs},
     sequence::{
         ExecuteModelRequest, Sequence, SequenceGroupMetadata, SequenceGroupOutput, SequenceOutput,
@@ -535,152 +526,4 @@ impl LlmEngine {
 
         Ok(())
     }
-}
-
-/// `RequestOutput` - Output of running AI inference over a `SequenceGroup`
-#[derive(Debug)]
-pub struct GenerateRequestOutput {
-    /// Request id
-    pub request_id: String,
-    /// The `String` prompt
-    pub prompt: String,
-    /// Inference outputs
-    pub inference_outputs: Vec<InferenceOutput>,
-    /// Prompt token ids
-    pub prompt_token_ids: Vec<u32>,
-    /// Is finished
-    pub is_finished: bool,
-    /// Metrics
-    pub metrics: Arc<RwLock<RequestMetrics>>,
-}
-
-impl GenerateRequestOutput {
-    /// Creates a new `Self` instance from a `SequenceGroup`
-    pub fn from_sequence_group(sequence_group: &SequenceGroup) -> Self {
-        debug!(
-            "Creating `GenerateRequestOutput` from sequence group with id = {}",
-            sequence_group.request_id
-        );
-        let mut sequences = sequence_group.sequences.values().collect::<Vec<_>>();
-
-        let top_n_sequences = if sequences.len() == 1 {
-            sequences
-        } else {
-            // Get top n sequences
-            let n = sequence_group.next_token_chooser_params().n;
-            sequences.sort_by(|s1, s2| {
-                s1.read()
-                    .unwrap()
-                    .cumulative_logprob()
-                    .partial_cmp(&s2.read().unwrap().cumulative_logprob())
-                    .unwrap()
-            });
-            sequences[..n].to_vec()
-        };
-
-        let inference_outputs = top_n_sequences
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let s = s.read().unwrap();
-                InferenceOutput {
-                    index: i,
-                    output_text: s.get_output_text(),
-                    token_ids: s.get_token_ids(),
-                    cumulative_logprob: s.cumulative_logprob(),
-                    logprobs: s.output_logprobs.clone(),
-                    finish_reason: s.get_sequence_status().finished_reason(),
-                    stop_reason: s.stop_reason,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let is_finished = sequence_group.is_finished();
-        if is_finished {
-            sequence_group.set_finished_time(Instant::now());
-        }
-        Self {
-            request_id: sequence_group.request_id.clone(),
-            inference_outputs,
-            prompt: sequence_group.prompt(),
-            prompt_token_ids: sequence_group.prompt_token_ids(),
-            is_finished,
-            metrics: sequence_group.metrics.clone(),
-        }
-    }
-}
-
-/// `InferenceOutput` - Output of running AI inference on a given sequence group
-#[derive(Clone, Debug)]
-pub struct InferenceOutput {
-    /// The index of the output in the request
-    pub index: usize,
-    /// The generated output text
-    pub output_text: String,
-    /// The token ids of the generated output text
-    pub token_ids: Vec<u32>,
-    /// The cumulative log probability of the generated
-    /// output text
-    pub cumulative_logprob: f32,
-    /// The log probabilities of the top probability words at each
-    /// position if the logprobs are requested
-    pub logprobs: Vec<HashMap<u32, LogProb>>,
-    /// The reason why the sequence is finished
-    pub finish_reason: Option<String>,
-    /// The stop token id that caused the completion
-    /// to stop, None if the completion finished for some other reason
-    /// including encountering the eos token
-    pub stop_reason: Option<u32>,
-}
-
-#[derive(Clone, Debug)]
-pub struct GenerateStreamingOutput {
-    pub request_id: String,
-    pub created: u64,
-    pub finish_reason: Option<String>,
-    pub logprobs: Vec<HashMap<u32, LogProb>>,
-    pub num_prompt_tokens: usize,
-    pub num_completion_tokens: usize,
-    pub output_text: String,
-}
-
-/// Represents the different types of responses that can be received during streaming.
-///
-/// This enum is used to encapsulate the various outcomes of a streaming operation,
-/// allowing for proper handling of successful chunks, errors, and stream completion.
-pub enum StreamResponse {
-    /// Represents a successful chunk of generated output.
-    ///
-    /// This variant is used when a new piece of generated content is available for streaming.
-    Chunk(GenerateStreamingOutput),
-    /// Represents an error that occurred during the streaming process.
-    ///
-    /// This variant is used when an error is encountered, allowing for proper error handling and
-    /// reporting.
-    Error(String),
-    /// Indicates that the streaming process has finished successfully.
-    ///
-    /// This variant is used to signal the end of the stream when all data has been processed
-    /// without errors.
-    Finished,
-}
-
-#[derive(Debug, Error)]
-pub enum EngineError {
-    #[error("Flume send error: `{0}`")]
-    FlumeSendError(String),
-    #[error("Scheduler error: `{0}`")]
-    SchedulerError(#[from] SchedulerError),
-    #[error("Sequence error: `{0}`")]
-    SequenceError(#[from] SequenceError),
-    #[error("Missing sequence output token, id = `{0}`")]
-    MissingSequenceOutputToken(u64),
-    #[error("Tokenizer error: `{0}`")]
-    TokenizerError(String),
-    #[error("Send error: `{0}`")]
-    SendError(#[from] SendError<Vec<GenerateRequestOutput>>),
-    #[error("Recv error: `{0}`")]
-    RecvError(#[from] RecvError),
-    #[error("Failed to send response to the OpenAI API service: {0}")]
-    SendResponseError(String),
 }

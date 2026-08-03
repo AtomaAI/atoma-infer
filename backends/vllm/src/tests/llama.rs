@@ -1,7 +1,7 @@
-use crate::llm_service::ServiceRequest;
 use crate::models::llama::LlamaModel;
 use crate::{
     llm_service::LlmService,
+    request::ServiceRequest,
     types::{GenerateParameters, GenerateRequest},
 };
 use futures::{stream::FuturesUnordered, StreamExt};

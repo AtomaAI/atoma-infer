@@ -6,13 +6,16 @@ pub mod block;
 pub mod block_allocator;
 pub mod block_manager;
 pub mod config;
+pub mod error;
 pub mod llm_engine;
 pub mod llm_service;
 #[cfg(feature = "cuda")]
 pub mod model_executor;
 #[cfg(feature = "cuda")]
 pub mod models;
+pub mod output;
 pub mod policy;
+pub mod request;
 pub mod scheduler;
 pub mod sequence;
 #[cfg(all(test, feature = "cuda"))]
@@ -23,10 +26,11 @@ pub mod validation;
 #[cfg(feature = "cuda")]
 pub mod worker;
 
-pub use llm_engine::{GenerateRequestOutput, GenerateStreamingOutput, StreamResponse};
+pub use error::LlmServiceError;
 #[cfg(feature = "cuda")]
 pub use llm_service::LlmService;
-pub use llm_service::{LlmServiceError, ServiceRequest};
+pub use output::{GenerateRequestOutput, GenerateStreamingOutput, StreamResponse};
+pub use request::ServiceRequest;
 pub use types::{GenerateParameters, GenerateRequest};
 pub use validation::Validation;
 
