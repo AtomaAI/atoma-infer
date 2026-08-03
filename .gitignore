@@ -1,4 +1,4 @@
 /target
 *.tensor
 config.toml
-.env
+.env*

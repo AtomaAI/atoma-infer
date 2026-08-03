@@ -13,8 +13,6 @@ use server::{run_server, AppState};
 pub mod api;
 pub mod server;
 pub mod stream;
-#[cfg(test)]
-pub mod tests;
 
 pub const DEFAULT_SERVER_ADDRESS: &str = "0.0.0.0";
 pub const DEFAULT_SERVER_PORT: &str = "8080";

@@ -1,6 +1,5 @@
 use candle_core::{DType, DTypeParseError};
 use config::Config;
-use dotenv::dotenv;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, str::FromStr};
 use thiserror::Error;
@@ -80,55 +79,6 @@ impl ModelConfig {
         config
             .get::<Self>("inference")
             .expect("Failed to generated config file")
-    }
-
-    /// Creates a new instance of `ModelConfig` from a `.env` file.
-    pub fn from_env_file() -> Self {
-        dotenv().ok();
-
-        let api_key = std::env::var("API_KEY").ok().unwrap_or_default();
-        let cache_dir = std::env::var("CACHE_DIR")
-            .unwrap_or_default()
-            .parse()
-            .unwrap();
-        let flush_storage = std::env::var("FLUSH_STORAGE")
-            .unwrap_or_default()
-            .parse()
-            .unwrap();
-        let model_name = serde_json::from_str(
-            &std::env::var("MODEL_NAME")
-                .expect("Failed to retrieve models metadata, from .env file"),
-        )
-        .unwrap();
-        let num_tokenizer_workers = serde_json::from_str(
-            &std::env::var("NUM_TOKENIZER_WORKERS")
-                .expect("Failed to retrieve models metadata, from .env file"),
-        )
-        .unwrap();
-        let revision = serde_json::from_str(
-            &std::env::var("REVISION").expect("Failed to retrieve models metadata, from .env file"),
-        )
-        .unwrap();
-        let device_ids = serde_json::from_str(
-            &std::env::var("DEVICE_IDS")
-                .expect("Failed to retrieve models metadata, from .env file"),
-        )
-        .unwrap();
-        let dtype = serde_json::from_str(
-            &std::env::var("DTYPE").expect("Failed to retrieve models metadata, from .env file"),
-        )
-        .unwrap();
-
-        Self {
-            api_key,
-            cache_dir,
-            flush_storage,
-            model_name,
-            num_tokenizer_workers,
-            revision,
-            device_ids,
-            dtype,
-        }
     }
 }
 

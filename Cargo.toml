@@ -30,7 +30,6 @@ cudarc = { version = "0.17.3", features = [
   "dynamic-linking",
 ], default-features = false }
 cuda-runtime-sys = "0.3.0-alpha.1"
-dotenv = "0.15.0"
 flume = "0.11.0"
 futures = "0.3.30"
 half = "2.4.1"

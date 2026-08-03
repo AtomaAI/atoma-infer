@@ -10,7 +10,6 @@ candle-transformers = { workspace = true, features = ["cuda"] }
 config.workspace = true
 cudarc = { workspace = true, optional = true }
 cuda-runtime-sys.workspace = true
-dotenv.workspace = true
 futures.workspace = true
 flume.workspace = true
 hf-hub.workspace = true
