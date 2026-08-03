@@ -1,23 +1,23 @@
 [package]
-name = "atoma-infer-server"
+edition           = "2021"
+name              = "atoma-infer-server"
 version.workspace = true
-edition = "2021"
 
 [dependencies]
-anyhow.workspace = true
-axum.workspace = true
-atoma-backends.workspace = true
-clap = { workspace = true, features = ["derive"] }
-flume.workspace = true
-futures.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
-tracing.workspace = true
+anyhow.workspace             = true
+atoma-backends.workspace     = true
+axum.workspace               = true
+clap                         = { workspace = true, features = [ "derive" ] }
+flume.workspace              = true
+futures.workspace            = true
+serde.workspace              = true
+serde_json.workspace         = true
+tokio                        = { workspace = true, features = [ "macros", "rt-multi-thread", "signal" ] }
+tracing.workspace            = true
 tracing-subscriber.workspace = true
-utoipa = { workspace = true, features = ["axum_extras"] }
-utoipa-swagger-ui = { workspace = true, features = ["axum"] }
+utoipa                       = { workspace = true, features = [ "axum_extras" ] }
+utoipa-swagger-ui            = { workspace = true, features = [ "axum" ] }
 
 [features]
-cuda = ["atoma-backends/cuda"]
-nccl = ["cuda", "atoma-backends/nccl"]
+cuda = [ "atoma-backends/cuda" ]
+nccl = [ "atoma-backends/nccl", "cuda" ]

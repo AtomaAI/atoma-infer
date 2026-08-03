@@ -1,35 +1,35 @@
 [workspace]
-members = ["backends", "backends/vllm", "csrc", "models", "server"]
+members  = [ "backends", "backends/vllm", "csrc", "models", "server" ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
 edition = "2021"
+version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1.0.89"
-axum = "0.7"
 atoma-backends = { path = "./backends/" }
+axum = "0.7"
 bindgen_cuda = "0.1.5"
 candle-core = "0.9.2-alpha.1"
+candle-examples = "0.9.2-alpha.1"
 candle-nn = "0.9.2-alpha.1"
 candle-transformers = "0.9.2-alpha.1"
-candle-examples = "0.9.2-alpha.1"
 clap = "4.5.18"
 config = "0.14.0"
 csrc = { path = "csrc" }
-cudarc = { version = "0.17.3", features = [
-  "std",
-  "cublas",
-  "cublaslt",
-  "curand",
-  "driver",
-  "nvrtc",
-  "f16",
-  "cuda-version-from-build-system",
-  "dynamic-linking",
-], default-features = false }
 cuda-runtime-sys = "0.3.0-alpha.1"
+cudarc = { version = "0.17.3", features = [
+    "cublas",
+    "cublaslt",
+    "cuda-version-from-build-system",
+    "curand",
+    "driver",
+    "dynamic-linking",
+    "f16",
+    "nvrtc",
+    "std",
+], default-features = false }
 flume = "0.11.0"
 futures = "0.3.30"
 half = "2.4.1"

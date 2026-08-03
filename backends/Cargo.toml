@@ -1,12 +1,12 @@
 [package]
-name = "atoma-backends"
-version.workspace = true
 edition.workspace = true
+name              = "atoma-backends"
+version.workspace = true
 
 [dependencies]
 atoma-vllm-backend = { path = "vllm" }
-serde = { workspace = true, features = ["derive"] }
+serde              = { workspace = true, features = [ "derive" ] }
 
 [features]
-cuda = ["atoma-vllm-backend/cuda"]
-nccl = ["cuda", "atoma-vllm-backend/nccl"]
+cuda = [ "atoma-vllm-backend/cuda" ]
+nccl = [ "atoma-vllm-backend/nccl", "cuda" ]

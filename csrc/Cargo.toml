@@ -1,24 +1,24 @@
 [package]
-name = "csrc"
-version = "0.1.0"
-edition = "2021"
+categories  = [ "science" ]
 description = "Flash attention 2 kernels, with paged attention enabled"
-categories = ["science"]
-license = "MIT OR Apache-2.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+name        = "csrc"
+version     = "0.1.0"
 
 [dependencies]
 candle-core.workspace = true
-cuda-runtime-sys = { workspace = true, optional = true }
-half = { workspace = true, features = ["num-traits"] }
+cuda-runtime-sys      = { workspace = true, optional = true }
+half                  = { workspace = true, features = [ "num-traits" ] }
 
 [build-dependencies]
-anyhow = { workspace = true, features = ["backtrace"] }
+anyhow       = { workspace = true, features = [ "backtrace" ] }
 bindgen_cuda = { workspace = true }
 
 [dev-dependencies]
-anyhow = { workspace = true, features = ["backtrace"] }
+anyhow              = { workspace = true, features = [ "backtrace" ] }
 candle-nn.workspace = true
-serial_test = { workspace = true }
+serial_test         = { workspace = true }
 
 [features]
-cuda = ["candle-core/cuda", "dep:cuda-runtime-sys"]
+cuda = [ "candle-core/cuda", "dep:cuda-runtime-sys" ]
