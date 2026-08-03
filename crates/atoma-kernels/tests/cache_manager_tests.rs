@@ -76,7 +76,7 @@ mod swap_blocks {
         let original_src = src.clone();
         let original_dst = dst.clone();
 
-        csrc::swap_blocks(&src, &mut dst, &block_mapping)?;
+        atoma_kernels::swap_blocks(&src, &mut dst, &block_mapping)?;
 
         verify_swap::<half::f16>(&original_src, &original_dst, &dst, &block_mapping)?;
 
@@ -96,7 +96,7 @@ mod swap_blocks {
         let original_src = src.clone();
         let original_dst = dst.clone();
 
-        csrc::swap_blocks(&src, &mut dst, &block_mapping)?;
+        atoma_kernels::swap_blocks(&src, &mut dst, &block_mapping)?;
 
         verify_swap::<half::bf16>(&original_src, &original_dst, &dst, &block_mapping)?;
 
@@ -117,7 +117,7 @@ mod swap_blocks {
         let original_src = src.clone();
         let original_dst = dst.clone();
 
-        csrc::swap_blocks(&src, &mut dst, &block_mapping)?;
+        atoma_kernels::swap_blocks(&src, &mut dst, &block_mapping)?;
 
         verify_swap::<half::f16>(&original_src, &original_dst, &dst, &block_mapping)?;
 
@@ -138,7 +138,7 @@ mod swap_blocks {
         let original_src = src.clone();
         let original_dst = dst.clone();
 
-        csrc::swap_blocks(&src, &mut dst, &block_mapping)?;
+        atoma_kernels::swap_blocks(&src, &mut dst, &block_mapping)?;
 
         verify_swap::<half::f16>(&original_src, &original_dst, &dst, &block_mapping)?;
 
@@ -159,7 +159,7 @@ mod swap_blocks {
         let original_src = src.clone();
         let original_dst = dst.clone();
 
-        csrc::swap_blocks(&src, &mut dst, &block_mapping)?;
+        atoma_kernels::swap_blocks(&src, &mut dst, &block_mapping)?;
 
         verify_swap::<half::bf16>(&original_src, &original_dst, &dst, &block_mapping)?;
 
@@ -180,7 +180,7 @@ mod swap_blocks {
         let original_src = src.clone();
         let original_dst = dst.clone();
 
-        csrc::swap_blocks(&src, &mut dst, &block_mapping)?;
+        atoma_kernels::swap_blocks(&src, &mut dst, &block_mapping)?;
 
         verify_swap::<half::bf16>(&original_src, &original_dst, &dst, &block_mapping)?;
 
@@ -200,7 +200,7 @@ mod swap_blocks {
         block_mapping.insert(0, 2);
         block_mapping.insert(1, 0);
 
-        csrc::swap_blocks(&src, &mut dst, &block_mapping).unwrap();
+        atoma_kernels::swap_blocks(&src, &mut dst, &block_mapping).unwrap();
     }
 }
 
@@ -261,7 +261,8 @@ mod copy_blocks {
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
         unsafe {
-            csrc::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
+            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
+                .unwrap();
         }
 
         // Check if blocks were correctly copied
@@ -368,7 +369,8 @@ mod copy_blocks {
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
         unsafe {
-            csrc::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
+            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
+                .unwrap();
         }
 
         // Check if blocks were correctly copied
@@ -470,7 +472,8 @@ mod copy_blocks {
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
         unsafe {
-            csrc::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
+            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
+                .unwrap();
         }
     }
 
@@ -486,7 +489,8 @@ mod copy_blocks {
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
         unsafe {
-            csrc::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
+            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
+                .unwrap();
         }
     }
 
@@ -502,7 +506,8 @@ mod copy_blocks {
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
         unsafe {
-            csrc::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
+            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
+                .unwrap();
         }
     }
 
@@ -518,7 +523,8 @@ mod copy_blocks {
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
         unsafe {
-            csrc::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
+            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
+                .unwrap();
         }
     }
 
@@ -534,15 +540,16 @@ mod copy_blocks {
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
         unsafe {
-            csrc::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
+            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
+                .unwrap();
         }
     }
 }
 
 #[cfg(test)]
 mod reshape_and_cache {
+    use atoma_kernels::cache_manager::reshape_and_cache_flash;
     use candle_core::{DType, Device, IndexOp, Tensor};
-    use csrc::cache_manager::reshape_and_cache_flash;
 
     fn create_random_tensor(shape: &[usize], device: &Device, dtype: DType) -> Tensor {
         Tensor::rand(0f32, 1f32, shape, device)

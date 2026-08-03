@@ -1,5 +1,11 @@
 [workspace]
-members  = [ "backends", "backends/vllm", "csrc", "models", "server" ]
+members = [
+    "crates/atoma-api",
+    "crates/atoma-kernels",
+    "crates/backends",
+    "crates/backends/vllm",
+    "crates/models",
+]
 resolver = "2"
 
 [workspace.package]
@@ -8,7 +14,8 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1.0.89"
-atoma-backends = { path = "./backends/" }
+atoma-backends = { path = "crates/backends" }
+atoma-kernels = { path = "crates/atoma-kernels" }
 axum = "0.7"
 bindgen_cuda = "0.1.5"
 candle-core = "0.9.2-alpha.1"
@@ -17,7 +24,6 @@ candle-nn = "0.9.2-alpha.1"
 candle-transformers = "0.9.2-alpha.1"
 clap = "4.5.18"
 config = "0.14.0"
-csrc = { path = "csrc" }
 cuda-runtime-sys = "0.3.0-alpha.1"
 cudarc = { version = "0.17.3", features = [
     "cublas",
@@ -36,7 +42,7 @@ half = "2.4.1"
 hf-hub = "0.3.2"
 metrics = "0.23"
 metrics-exporter-prometheus = "0.14.0"
-models = { path = "models" }
+models = { path = "crates/models" }
 rand = "0.8.5"
 serde = "1.0.204"
 serde_json = "1.0.120"

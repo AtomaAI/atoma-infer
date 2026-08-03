@@ -1,3 +1,3 @@
-[submodule "csrc/cutlass"]
-	path = csrc/cutlass
+[submodule "crates/atoma-kernels/cutlass"]
+	path = crates/atoma-kernels/cutlass
 	url = https://github.com/NVIDIA/cutlass/

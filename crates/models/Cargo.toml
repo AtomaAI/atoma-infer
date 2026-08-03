@@ -9,10 +9,10 @@ version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+atoma-kernels                 = { workspace = true }
 candle-core.workspace         = true
 candle-nn.workspace           = true
 candle-transformers.workspace = true
-csrc                          = { workspace = true }
 cudarc                        = { workspace = true, optional = true }
 half                          = { workspace = true, features = [ "num-traits" ] }
 serde                         = { workspace = true, features = [ "derive" ] }
@@ -28,5 +28,5 @@ serial_test.workspace     = true
 tokenizers                = { workspace = true }
 
 [features]
-cuda = [ "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "csrc/cuda" ]
+cuda = [ "atoma-kernels/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda" ]
 nccl = [ "cuda", "cudarc/nccl", "dep:cudarc" ]

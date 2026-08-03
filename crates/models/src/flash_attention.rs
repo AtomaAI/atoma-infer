@@ -1,8 +1,8 @@
-use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use csrc::{
+use atoma_kernels::{
     copy_blocks, flash_attn_kv_cache_full, flash_attn_varlen, flash_attn_varlen_with_block_table,
     reshape_and_cache_flash, swap_blocks,
 };
+use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use std::collections::HashMap;
 
 /// `FlashAttentionDecodingMetadata` - Structure wrapping the metadata

@@ -47,7 +47,7 @@ fn flash_attn_acausal() -> Result<()> {
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-        csrc::flash_attn(&q, &k, &v, 0.5, false)?.transpose(1, 2)?
+        atoma_kernels::flash_attn(&q, &k, &v, 0.5, false)?.transpose(1, 2)?
     };
     let ys2 = ys2.i(0)?.to_dtype(DType::F32)?;
     let diff = ys1.sub(&ys2)?.abs()?.flatten_all()?.max(0)?;
@@ -112,7 +112,7 @@ fn flash_attn_varlen() -> Result<()> {
         let q = q.transpose(0, 1)?;
         let k = k.transpose(0, 1)?;
         let v = v.transpose(0, 1)?;
-        csrc::flash_attn_varlen(&q, &k, &v, &seqlens_q, &seqlens_k, 32, 32, 0.5, false)?
+        atoma_kernels::flash_attn_varlen(&q, &k, &v, &seqlens_q, &seqlens_k, 32, 32, 0.5, false)?
             .transpose(0, 1)?
     };
     let ys = ys.to_dtype(DType::F32)?;
@@ -157,7 +157,7 @@ fn flash_attn_varlen_with_block_table() -> Result<()> {
 
     let ys = {
         let block_table = Some(Tensor::arange(0u32, 4, &device)?.reshape((2, 2))?);
-        csrc::flash_attn_varlen_with_block_table(
+        atoma_kernels::flash_attn_varlen_with_block_table(
             &q,
             &k,
             &v,
@@ -184,7 +184,7 @@ fn flash_attn_varlen_with_block_table() -> Result<()> {
     let q = (&q / 30.)?;
 
     let should_be_ys =
-        csrc::flash_attn_varlen(&q, &k, &v, &seqlens_q, &seqlens_k, 32, 32, 0.5, false)?;
+        atoma_kernels::flash_attn_varlen(&q, &k, &v, &seqlens_q, &seqlens_k, 32, 32, 0.5, false)?;
     let should_be_ys = should_be_ys.to_dtype(DType::F32)?;
 
     assert_eq!(should_be_ys.dims(), &[32, 2, 8]);
@@ -210,8 +210,17 @@ fn flash_attn_kv_cache() -> Result<()> {
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
-        csrc::flash_attn_kv_cache_full(&q, &k, &v, None, 0.5, None, Some(&seqlens_k), false)?
-            .transpose(1, 2)?
+        atoma_kernels::flash_attn_kv_cache_full(
+            &q,
+            &k,
+            &v,
+            None,
+            0.5,
+            None,
+            Some(&seqlens_k),
+            false,
+        )?
+        .transpose(1, 2)?
     };
     let ys = ys.to_dtype(DType::F32)?;
 
@@ -254,7 +263,7 @@ fn test_flash_attn_kv_cache_with_block_table() -> Result<()> {
 
     let ys = {
         let block_table = Some(Tensor::arange(0u32, 64, &device)?.reshape((32, 2))?);
-        csrc::flash_attn_kv_cache_full(
+        atoma_kernels::flash_attn_kv_cache_full(
             &q,
             &k,
             &v,
@@ -281,7 +290,7 @@ fn test_flash_attn_kv_cache_with_block_table() -> Result<()> {
 
     let should_be_ys = {
         let block_table = Some(Tensor::arange(0u32, 64, &device)?.reshape((32, 2))?);
-        csrc::flash_attn_varlen_with_block_table(
+        atoma_kernels::flash_attn_varlen_with_block_table(
             &q,
             &k,
             &v,

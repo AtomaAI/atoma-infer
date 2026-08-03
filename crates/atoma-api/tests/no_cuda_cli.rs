@@ -4,7 +4,7 @@ use std::process::Command;
 
 #[test]
 fn default_binary_exits_with_actionable_cuda_message() {
-    let output = Command::new(env!("CARGO_BIN_EXE_atoma-infer-server"))
+    let output = Command::new(env!("CARGO_BIN_EXE_atoma-api"))
         .output()
         .expect("server binary should launch");
 
