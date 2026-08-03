@@ -84,7 +84,7 @@ impl SequenceStatus {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```text
     /// use atoma_vllm::sequence::SequenceStatus;
     ///
     /// assert!(SequenceStatus::FinishedStopped.is_finished());
@@ -109,7 +109,7 @@ impl SequenceStatus {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```text
     /// use atoma_vllm::sequence::SequenceStatus;
     ///
     /// assert_eq!(SequenceStatus::FinishedStopped.finished_reason(), Some("stopped".to_string()));
@@ -233,7 +233,7 @@ impl SequenceData {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```text
     /// let sequence_data = SequenceData::new(vec![1, 2, 3], vec![4, 5]);
     /// assert_eq!(sequence_data.length(), 5);
     /// ```
@@ -299,7 +299,7 @@ impl SequenceData {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```text
     /// let sequence_data = SequenceData::new(vec![1, 2, 3], vec![4, 5, 6]);
     ///
     /// assert_eq!(sequence_data.get_prefix_token_ids(2), (vec![1, 2], vec![]));
@@ -894,7 +894,7 @@ impl Sequence {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let original_sequence = Sequence::new(/* ... */);
     /// let forked_sequence = original_sequence.fork(new_sequence_id);
     /// assert_ne!(original_sequence.sequence_id(), forked_sequence.sequence_id());
@@ -919,7 +919,7 @@ impl Sequence {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```text
     /// let sequence = Sequence::new(/* ... */);
     ///
     /// // During prefill stage with 5 uncomputed tokens
@@ -943,7 +943,7 @@ impl Sequence {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let sequence = Sequence::new(/* ... */);
     /// assert!(sequence.is_prefill());
     /// // After processing some tokens...
@@ -961,7 +961,7 @@ impl Sequence {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let sequence = Sequence::new(42, /* ... */);
     /// assert_eq!(sequence.sequence_id(), 42);
     /// ```
@@ -982,7 +982,7 @@ impl Sequence {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let sequence = Sequence::new(/* ... */);
     /// let data = sequence.sequence_data();
     /// assert_eq!(data.length(), sequence.length());
@@ -1113,7 +1113,7 @@ impl SequenceGroup {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let seq_group = SequenceGroup::new(/* ... */);
     /// let prompt = seq_group.prompt();
     /// println!("Prompt: {}", prompt);
@@ -1185,7 +1185,7 @@ impl SequenceGroup {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let seq_group = SequenceGroup::new(/* ... */);
     /// let prompt_tokens = seq_group.prompt_token_ids();
     /// println!("Prompt tokens: {:?}", prompt_tokens);
@@ -1226,7 +1226,7 @@ impl SequenceGroup {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let mut seq_group = SequenceGroup::new(/* ... */);
     /// // ... after some token generation ...
     /// match seq_group.get_last_latency(Instant::now()) {
@@ -1405,7 +1405,7 @@ impl SequenceGroup {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```text
     /// let seq_group = SequenceGroup::new(/* ... */);
     ///
     /// // Get all sequences
@@ -1448,7 +1448,7 @@ impl SequenceGroup {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```text
     /// let seq_group = SequenceGroup::new(/* ... */);
     ///
     /// // Get all sequence IDs
@@ -1495,7 +1495,7 @@ impl SequenceGroup {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```text
     /// let seq_group = SequenceGroup::new(/* ... */);
     ///
     /// // Get the first sequence regardless of status
@@ -1543,7 +1543,7 @@ impl SequenceGroup {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let seq_group = SequenceGroup::new(/* ... */);
     /// let sequence_id = 42;
     /// if let Some(sequence) = seq_group.get_sequence_from_id(sequence_id) {
@@ -1581,7 +1581,7 @@ impl SequenceGroup {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let seq_group = SequenceGroup::new(/* ... */);
     /// let unfinished_seqs = seq_group.get_unfinished_sequences();
     /// println!("Number of unfinished sequences: {}", unfinished_seqs.len());
@@ -1617,7 +1617,7 @@ impl SequenceGroup {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let seq_group = SequenceGroup::new(/* ... */);
     /// let finished_seqs = seq_group.get_finished_sequences();
     /// println!("Number of finished sequences: {}", finished_seqs.len());
@@ -1701,7 +1701,7 @@ impl SequenceGroup {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let seq_group = SequenceGroup::new(/* ... */);
     /// let uncomputed_tokens = seq_group.get_num_uncomputed_tokens();
     /// println!("Number of uncomputed tokens: {}", uncomputed_tokens);
@@ -1733,7 +1733,7 @@ impl SequenceGroup {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```text
     /// let seq_group = SequenceGroup::new(/* ... */);
     ///
     /// // Get total number of sequences

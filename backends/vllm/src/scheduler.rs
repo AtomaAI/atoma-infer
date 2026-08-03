@@ -466,7 +466,7 @@ impl<P> Scheduler<P> {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let request_ids = vec!["req1".to_string(), "req2".to_string()];
     /// scheduler.abort_sequence_groups(request_ids.into_iter())?;
     /// ```
@@ -1725,7 +1725,7 @@ impl<P: Debug> Scheduler<P> {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let mut scheduler = Scheduler::new(/* ... */);
     /// let new_sequence_group = SequenceGroup::new(/* ... */);
     /// scheduler.add_sequence_group(new_sequence_group);
@@ -2154,7 +2154,7 @@ impl<P: Debug> Scheduler<P> {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```text
     /// let mut scheduler = Scheduler::new(/* ... */);
     /// let mut sequence_group = SequenceGroup::new(/* ... */);
     ///

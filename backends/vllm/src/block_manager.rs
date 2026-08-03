@@ -187,7 +187,7 @@ impl BlockSpaceManager {
     /// - Consider separating the allocation logic for new and existing `SequenceGroup`s.
     ///
     /// # Example
-    /// ```
+    /// ```text
     /// let seq_group = SequenceGroup::new(...);
     /// block_manager.allocate(&seq_group)?;
     /// ```
@@ -712,7 +712,7 @@ impl BlockSpaceManager {
     /// It should be used judiciously to optimize memory usage and performance.
     ///
     /// # Example
-    /// ```
+    /// ```text
     /// let mut seq_group = SequenceGroup::new(...);
     /// let block_mapping = block_manager.swap_out(&mut seq_group)?;
     /// ```
@@ -862,7 +862,7 @@ impl BlockSpaceManager {
     /// - The `free_block_table` operation fails.
     ///
     /// # Example
-    /// ```
+    /// ```text
     /// let sequence_id = 123;
     /// block_manager.free(sequence_id)?;
     /// ```

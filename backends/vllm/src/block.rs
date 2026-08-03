@@ -95,7 +95,7 @@ impl LogicalTokenBlock {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```text
     /// let mut block = LogicalTokenBlock::new(0, 10);
     /// assert!(block.append_tokens(&[1, 2, 3]).is_ok());
     /// assert!(block.append_tokens(&[4, 5, 6, 7, 8, 9, 10]).is_ok());
