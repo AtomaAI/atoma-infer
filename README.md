@@ -26,7 +26,30 @@ The canonical [revival decision map](https://github.com/AtomaAI/atoma-infer/issu
 4. Install Rust using [rustup](https://www.rust-lang.org/tools/install). The repository's toolchain file selects the required Rust version.
 5. Initialize dependencies: `git submodule update --init --recursive`.
 
-Verified build and test commands will be documented after rung 0 establishes the green baseline. Until then, failures from the inherited checkout are tracked by the [rung-0 specification](https://github.com/AtomaAI/atoma-infer/issues/147).
+Run the GPU-less workspace checks with:
+
+```shell
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+Install [prek](https://prek.j178.dev/), then install and run the repository hooks with `prek install` and `prek run --all-files`.
+
+## Configuration and running
+
+Copy the example configuration and provide the Hugging Face API key, model, cache path, and GPU device IDs for your environment:
+
+```shell
+cp config.example.toml config.toml
+```
+
+`config.toml` is ignored by Git. The server requires the opt-in `cuda` feature and accepts the configuration path through `--config-path`:
+
+```shell
+RUST_LOG=info cargo run --release --features cuda --bin atoma-api -- --config-path config.toml
+```
+
+CUDA compilation and live GPU execution remain unverified until the remaining rung-0 CUDA checkpoints are complete.
 
 ## Contributing
 
