@@ -51,16 +51,50 @@ fn workspace_rust_sources() -> Vec<PathBuf> {
     sources
 }
 
+/// Collects every `.cu` entry-point source in the kernels directory.
+///
+/// The per-head-dimension `flash_fwd_*` files only instantiate templates; the launch-configuring
+/// entry points are the ones that can name a stream.
+fn kernel_entry_point_sources() -> Vec<PathBuf> {
+    let kernels_dir = crate_root().join("kernels");
+    let entries = std::fs::read_dir(&kernels_dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", kernels_dir.display()));
+    entries
+        .map(|entry| entry.expect("failed to read dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "cu"))
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            !name.starts_with("flash_fwd_")
+        })
+        .collect()
+}
+
 #[test]
-fn flash_attention_entry_point_takes_a_stream() {
-    let flash_api = crate_root().join("kernels/flash_api.cu");
-    let source = read(&flash_api);
+fn no_kernel_source_hardcodes_the_default_stream() {
+    // `cudaStream_t stream = 0` and its const form bind the legacy default stream, so any launch
+    // below such a binding ignores the stream the caller asked for.
+    let offenders: Vec<_> = kernel_entry_point_sources()
+        .into_iter()
+        .filter(|path| {
+            let source = read(path);
+            source.contains("cudaStream_t stream = 0")
+                || source.contains("const cudaStream_t stream = 0")
+        })
+        .collect();
 
     assert!(
-        !source.contains("cudaStream_t stream = 0"),
-        "flash_api.cu still hardcodes the legacy default stream; run_mha must launch on the \
-         caller's stream instead"
+        offenders.is_empty(),
+        "these kernel sources bind the legacy default stream instead of taking the caller's \
+         stream as a parameter: {offenders:?}"
     );
+}
+
+#[test]
+fn flash_attention_entry_point_takes_a_stream() {
+    let source = read(&crate_root().join("kernels/flash_api.cu"));
 
     let run_mha = source
         .split_once("extern \"C\" void run_mha(")
@@ -77,15 +111,26 @@ fn flash_attention_entry_point_takes_a_stream() {
 }
 
 #[test]
-fn no_rust_source_forks_a_throwaway_stream() {
+fn no_rust_source_uses_a_stream_the_caller_did_not_supply() {
+    // `fork_default_stream` creates a stream nothing waits on; `wait_for` and the raw `.stream`
+    // field are the device-side halves of that same pattern, all removed by the cudarc 0.19 port.
+    const BANNED: [&str; 2] = ["fork_default_stream", ".wait_for("];
+
     let offenders: Vec<_> = workspace_rust_sources()
         .into_iter()
-        .filter(|path| read(path).contains("fork_default_stream"))
+        .filter_map(|path| {
+            let source = read(&path);
+            let hits: Vec<_> = BANNED
+                .iter()
+                .filter(|pattern| source.contains(**pattern))
+                .collect();
+            (!hits.is_empty()).then_some((path, hits))
+        })
         .collect();
 
     assert!(
         offenders.is_empty(),
-        "fork_default_stream creates a stream nothing waits on; recover the caller's stream from \
-         candle tensor storage instead. Offending files: {offenders:?}"
+        "these sources drive a stream the caller did not supply; recover the caller's stream from \
+         candle tensor storage instead: {offenders:?}"
     );
 }
