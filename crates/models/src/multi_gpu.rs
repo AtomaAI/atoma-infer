@@ -78,11 +78,11 @@ impl CustomOp1 for AllGather {
         l: &Layout,
     ) -> Result<(candle_core::CudaStorage, Shape)> {
         use candle_core::{backend::BackendStorage, cuda_backend::WrapErr};
-        use cudarc::driver::DeviceSlice;
 
         let elem_count = l.shape().elem_count();
         let num_devices = self.comm.world_size();
         let dev = s.device().clone();
+        let stream = dev.cuda_stream();
         let mut new_shape: Vec<usize> = l.shape().dims().to_vec();
         if let Some(last) = new_shape.last_mut() {
             *last *= num_devices;
@@ -96,7 +96,7 @@ impl CustomOp1 for AllGather {
                     Some((0, l)) if l == s.len() => s,
                     Some(_) | None => candle_core::bail!("input has to be contiguous"),
                 };
-                let mut dst = unsafe { dev.alloc::<bf16>(elem_count * num_devices) }.w()?;
+                let mut dst = unsafe { stream.alloc::<bf16>(elem_count * num_devices) }.w()?;
                 self.comm
                     .all_gather(s, &mut dst)
                     .map_err(candle_core::Error::debug)?;
@@ -108,7 +108,7 @@ impl CustomOp1 for AllGather {
                     Some((0, l)) if l == s.len() => s,
                     Some(_) | None => candle_core::bail!("input has to be contiguous"),
                 };
-                let mut dst = unsafe { dev.alloc::<f16>(elem_count * num_devices) }.w()?;
+                let mut dst = unsafe { stream.alloc::<f16>(elem_count * num_devices) }.w()?;
                 self.comm
                     .all_gather(s, &mut dst)
                     .map_err(candle_core::Error::debug)?;
@@ -144,10 +144,11 @@ impl CustomOp1 for AllReduce {
         l: &Layout,
     ) -> Result<(candle_core::CudaStorage, Shape)> {
         use candle_core::{backend::BackendStorage, cuda_backend::WrapErr};
-        use cudarc::{driver::DeviceSlice, nccl::ReduceOp};
+        use cudarc::nccl::ReduceOp;
 
         let elem_count = l.shape().elem_count();
         let dev = s.device().clone();
+        let stream = dev.cuda_stream();
         let dst = match s.dtype() {
             DType::BF16 => {
                 let s = s.as_cuda_slice::<bf16>()?;
@@ -155,7 +156,7 @@ impl CustomOp1 for AllReduce {
                     Some((0, l)) if l == s.len() => s,
                     Some(_) | None => candle_core::bail!("input has to be contiguous"),
                 };
-                let mut dst = unsafe { dev.alloc::<bf16>(elem_count) }.w()?;
+                let mut dst = unsafe { stream.alloc::<bf16>(elem_count) }.w()?;
                 self.comm
                     .all_reduce(s, &mut dst, &ReduceOp::Sum)
                     .map_err(candle_core::Error::debug)?;
@@ -167,7 +168,7 @@ impl CustomOp1 for AllReduce {
                     Some((0, l)) if l == s.len() => s,
                     Some(_) | None => candle_core::bail!("input has to be contiguous"),
                 };
-                let mut dst = unsafe { dev.alloc::<f16>(elem_count) }.w()?;
+                let mut dst = unsafe { stream.alloc::<f16>(elem_count) }.w()?;
                 self.comm
                     .all_reduce(s, &mut dst, &ReduceOp::Sum)
                     .map_err(candle_core::Error::debug)?;

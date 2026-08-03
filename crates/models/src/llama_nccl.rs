@@ -346,10 +346,7 @@ mod tests {
     use crate::llama::{LlamaConfig, LlamaEosToks};
     use candle_transformers::generation::{LogitsProcessor, Sampling};
     #[cfg(feature = "nccl")]
-    use cudarc::{
-        driver::safe::CudaDevice,
-        nccl::safe::{Comm, Id},
-    };
+    use cudarc::nccl::safe::{Comm, Id};
     use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
     use rand::Rng;
     use serial_test::serial;
@@ -397,9 +394,12 @@ mod tests {
             candle_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?;
 
         let id = Id::new().unwrap();
-        let cuda_device = CudaDevice::new(DEVICE_ID).expect("Failed to create the CUDA device");
+        let cuda_stream = match &device {
+            Device::Cuda(device) => device.cuda_stream(),
+            _ => panic!("the nccl model test requires a cuda device"),
+        };
         let comm = std::rc::Rc::new(
-            Comm::from_rank(cuda_device, DEVICE_ID, 1, id)
+            Comm::from_rank(cuda_stream, DEVICE_ID, 1, id)
                 .expect("Failed to create the NCCL communicator"),
         );
         let vb = unsafe {

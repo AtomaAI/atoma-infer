@@ -9,7 +9,7 @@ use std::{
 use candle_core::{DType, Device, IndexOp, Tensor};
 #[cfg(feature = "nccl")]
 use cudarc::{
-    driver::{safe::CudaDevice, DriverError},
+    driver::DriverError,
     nccl::{
         result::NcclError,
         safe::{Comm, Id},
@@ -426,18 +426,17 @@ impl ModelThreadDispatcher {
                 //    scheduler configs, to be sent to all the model thread dispatchers, now that
                 //    the model weights are loaded in each GPU device memory.
                 let join_handle = tokio::task::spawn_blocking(move || {
-                    #[cfg(feature = "nccl")]
-                    let cuda_device = CudaDevice::new(device_id)?;
+                    let device = Device::new_cuda(device_id)?;
                     // Initialize the Communicator from Nvidia Collective Communication Library.
                     // This is for the inter gpu communication. For more information visit https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/overview.html
                     #[cfg(feature = "nccl")]
                     // 4. Create a new communicator for each GPU device, to be used for inter-GPU
-                    //    communication
+                    //    communication. cudarc 0.19 binds a communicator to a stream, so the
+                    //    collectives are ordered against the same stream the model computes on.
                     let comm = Rc::new(
-                        Comm::from_rank(cuda_device, rank, num_shards, id)
+                        Comm::from_rank(cuda_stream(&device)?, rank, num_shards, id)
                             .map_err(ModelThreadError::NcclError)?,
                     );
-                    let device = Device::new_cuda(device_id)?;
                     // 5. Load the model weights into the GPU device memory
                     let model = M::load(
                         config_clone,
@@ -542,6 +541,25 @@ impl ModelThreadDispatcher {
         }
 
         self.responses.push(receiver);
+    }
+}
+
+/// Returns the cuda stream backing `device`, which NCCL collectives are bound to.
+///
+/// # Arguments
+///
+/// * `device` - Must be a cuda device; tensor parallelism has no cpu path.
+#[cfg(feature = "nccl")]
+fn cuda_stream(
+    device: &Device,
+) -> Result<std::sync::Arc<cudarc::driver::CudaStream>, ModelThreadError> {
+    match device {
+        Device::Cuda(device) => Ok(device.cuda_stream()),
+        Device::Cpu | Device::Metal(_) => {
+            Err(ModelThreadError::CandleError(candle_core::Error::Msg(
+                format!("tensor parallelism requires a cuda device, got {device:?}"),
+            )))
+        }
     }
 }
 
