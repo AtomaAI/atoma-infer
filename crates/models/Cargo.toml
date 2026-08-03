@@ -1,5 +1,4 @@
 [package]
-categories  = [ "science" ]
 description = "Large language models library, with fast and efficient memory management attention"
 edition     = "2021"
 license     = "MIT OR Apache-2.0"
