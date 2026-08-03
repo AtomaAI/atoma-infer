@@ -1,0 +1,73 @@
+name: CPU CI
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+  push:
+    branches:
+      - develop
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cpu-checks:
+    name: CPU checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          components: clippy
+          rustflags: ""
+
+      - name: Install nightly rustfmt
+        run: rustup toolchain install nightly-2025-09-19 --profile minimal --component rustfmt
+
+      - name: Install repository tools
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2,prek@0.4.11,taplo@0.10.0,zizmor@1.28.0
+
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: Validate workflows
+        run: |
+          "$(go env GOPATH)/bin/actionlint"
+          zizmor .github/workflows
+
+      - name: Run prek hooks
+        run: |
+          prek validate-config prek.toml
+          prek run --all-files
+
+      - name: Check Rust formatting
+        run: cargo +nightly-2025-09-19 fmt --all -- --check
+
+      - name: Check TOML formatting
+        run: taplo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Check dependency policy
+        run: cargo deny --locked check
+
+      - name: Audit dependencies
+        run: cargo audit
