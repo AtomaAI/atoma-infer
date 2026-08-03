@@ -1,5 +1,5 @@
 [workspace]
-members = ["backends", "backends/vllm", "csrc", "help", "models", "server"]
+members = ["backends", "backends/vllm", "csrc", "models", "server"]
 resolver = "2"
 
 [workspace.package]
@@ -36,7 +36,6 @@ expect-test = "1.5"
 flume = "0.11.0"
 futures = "0.3.30"
 half = "2.4.1"
-help = { path = "help" }
 hf-hub = "0.3.2"
 indexmap = "2.2.6"
 metrics = "0.23"
