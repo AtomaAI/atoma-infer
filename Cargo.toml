@@ -37,7 +37,6 @@ flume = "0.11.0"
 futures = "0.3.30"
 half = "2.4.1"
 hf-hub = "0.3.2"
-indexmap = "2.2.6"
 metrics = "0.23"
 metrics-exporter-prometheus = "0.14.0"
 models = { path = "models" }

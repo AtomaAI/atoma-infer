@@ -210,7 +210,6 @@ dependencies = [
  "flume",
  "futures",
  "hf-hub 0.3.2",
- "indexmap",
  "metrics 0.23.0",
  "metrics-exporter-prometheus",
  "models",

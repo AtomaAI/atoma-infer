@@ -14,7 +14,6 @@ dotenv.workspace = true
 futures.workspace = true
 flume.workspace = true
 hf-hub.workspace = true
-indexmap.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 models.workspace = true
