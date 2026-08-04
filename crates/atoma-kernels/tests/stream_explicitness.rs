@@ -114,7 +114,11 @@ fn flash_attention_entry_point_takes_a_stream() {
 fn no_rust_source_uses_a_stream_the_caller_did_not_supply() {
     // `fork_default_stream` creates a stream nothing waits on; `wait_for` and the raw `.stream`
     // field are the device-side halves of that same pattern, all removed by the cudarc 0.19 port.
-    const BANNED: [&str; 2] = ["fork_default_stream", ".wait_for("];
+    const BANNED: [&str; 3] = [
+        "fork_default_stream",
+        ".wait_for(",
+        "device_ptr_write_target",
+    ];
 
     let offenders: Vec<_> = workspace_rust_sources()
         .into_iter()

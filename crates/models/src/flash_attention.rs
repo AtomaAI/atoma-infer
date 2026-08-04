@@ -302,7 +302,7 @@ impl FlashAttention {
             .map(|kv_cache| kv_cache.i(1)?.squeeze(0))
             .collect::<Result<Vec<_>>>()?;
         let value_caches = value_caches.iter_mut().collect::<Vec<_>>();
-        unsafe { copy_blocks(&key_caches, &value_caches, block_mapping) }
+        copy_blocks(&key_caches, &value_caches, block_mapping)
     }
 
     /// Flash attention forward pass

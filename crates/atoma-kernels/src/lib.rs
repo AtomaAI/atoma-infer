@@ -2283,43 +2283,6 @@ pub(crate) mod utils {
         }
     }
 
-    /// Resolves the device pointer of a cuda tensor that the launched kernel *writes* to.
-    ///
-    /// Signalling a write would require [`DevicePtrMut::device_ptr_mut`], which needs
-    /// `&mut CudaSlice`, reachable only from `&mut CudaStorage`. candle 0.11 keeps
-    /// `Tensor::storage_mut_and_layout` `pub(crate)` and exposes mutable storage solely through
-    /// `Tensor::inplace_op{1,2,3}`, whose one-mutable-operand shape does not fit these kernels
-    /// (`copy_blocks` writes every layer's cache in a single launch; `reshape_and_cache_flash`
-    /// writes two caches). So this necessarily acquires read intent, which differs in two ways:
-    /// it does not make `stream` wait for prior *reads* of the cache, and it records the access
-    /// as a read, so a later reader will not wait on this kernel's write.
-    ///
-    /// Both differences are inert while the context stays in single-stream mode, since
-    /// `CudaContext::is_managing_stream_synchronization` additionally requires multi-stream mode
-    /// and every device here is built with `Device::new_cuda` (the context default stream). They
-    /// become real the moment a second stream appears, so this must be revisited before
-    /// `new_with_stream` or cuda-graph capture lands.
-    ///
-    /// # Arguments
-    ///
-    /// * `storage` - Storage of the written tensor; must be cuda storage.
-    /// * `layout` - Layout supplying the tensor's start offset, in elements of `T`.
-    /// * `stream` - The caller's stream, which the access is ordered against.
-    /// * `name` - Tensor name, used to build an actionable error when `storage` is not on cuda.
-    pub(crate) fn device_ptr_write_target<'a, T>(
-        storage: &'a candle_core::Storage,
-        layout: &Layout,
-        stream: &'a CudaStream,
-        name: &str,
-    ) -> Result<(CUdeviceptr, SyncOnDrop<'a>)>
-    where
-        T: candle_core::cuda_backend::CudaDType
-            + candle_core::cuda_backend::cudarc::driver::DeviceRepr
-            + 'a,
-    {
-        device_ptr::<T>(storage, layout, stream, name)
-    }
-
     /// Find the number of splits that maximizes the occupancy. For example, if we have
     /// batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
     /// better than having 3 splits (efficiency = 0.67). However, we also don't want too many
