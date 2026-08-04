@@ -478,7 +478,7 @@ mod copy_blocks {
     }
 
     #[test]
-    #[should_panic(expected = "device must be a cuda device")]
+    #[should_panic(expected = "key_caches and value_caches must be CUDA tensors")]
     fn test_copy_blocks_non_cuda_device() {
         let device = Device::Cpu;
         let mut key_caches = vec![create_test_tensor(&device, DType::F16)];
@@ -495,7 +495,9 @@ mod copy_blocks {
     }
 
     #[test]
-    #[should_panic(expected = "Only support f16/bf16 dtypes and src and dst must have same dtype")]
+    #[should_panic(
+        expected = "key_caches and value_caches must have the same dtype and CUDA device"
+    )]
     fn test_copy_blocks_different_dtypes() {
         let device = Device::new_cuda(0).unwrap();
         let mut key_caches = vec![create_test_tensor(&device, DType::F16)];
@@ -512,7 +514,7 @@ mod copy_blocks {
     }
 
     #[test]
-    #[should_panic(expected = "Only support f16/bf16 dtypes and src and dst must have same dtype")]
+    #[should_panic(expected = "copy_blocks only supports f16/bf16 caches, got F32")]
     fn test_copy_blocks_invalid_dtype() {
         let device = Device::new_cuda(0).unwrap();
         let mut key_caches = vec![create_test_tensor(&device, DType::F32)];
