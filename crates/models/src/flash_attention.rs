@@ -185,9 +185,6 @@ pub struct FlashAttention {
     pub softmax_scale: f32,
     /// Alibi slopes,
     pub alibi_slopes: Option<Tensor>,
-    /// Sliding window, for local attention,
-    /// only supports causal sliding window
-    pub sliding_window: Option<usize>,
     /// Key and value cache dtype
     pub kv_cache_dtype: DType,
     /// Device, in most cases it should be
@@ -199,7 +196,8 @@ impl FlashAttention {
     /// Constructor.
     ///
     /// A `sliding_window` is rejected here rather than on the first prefix-cached prefill, which
-    /// is the only forward path that would otherwise carry it into the kernels.
+    /// is the only forward path that would otherwise carry it into the kernels: every other path
+    /// drops it, so an accepted window would produce full attention without saying so.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_heads: usize,
@@ -229,7 +227,6 @@ impl FlashAttention {
             head_dim,
             softmax_scale,
             alibi_slopes,
-            sliding_window,
             kv_cache_dtype,
             device,
         })
@@ -448,8 +445,8 @@ impl FlashAttention {
                     prefill_metadata.max_prefill_sequence_length,
                     max_sequence_length_k,
                     self.softmax_scale,
-                    self.sliding_window,
-                    None,
+                    /* window_size_left */ None,
+                    /* window_size_right */ None,
                     prefill_metadata.block_tables.as_ref(),
                 )?;
                 output.slice_set(&out, 0, 0)?;
@@ -572,7 +569,6 @@ mod tests {
             head_dim: 32,
             softmax_scale: 1.0,
             alibi_slopes: None,
-            sliding_window: None,
             kv_cache_dtype: DType::BF16,
             device: device.clone(),
         };
@@ -666,7 +662,6 @@ mod tests {
             head_dim: 8,
             softmax_scale: 0.5,
             alibi_slopes: None,
-            sliding_window: None,
             kv_cache_dtype: DType::F16,
             device: device.clone(),
         };

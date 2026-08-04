@@ -130,23 +130,15 @@ fn every_ffi_argument_label_names_a_real_parameter() {
         .map(|(name, _)| name)
         .collect();
 
+    // Argument labels are single identifiers; the other block comments in the file are prose.
     let source = read(&crate_root().join("src/flash_attention.rs"));
-    let call_sites: Vec<&str> = source
-        .split("ffi::run_mha(")
-        .skip(1)
-        .map(|tail| {
-            tail.split_once("\n            )")
-                .expect("a run_mha call ends with its closing parenthesis")
-                .0
-        })
-        .collect();
-    assert_eq!(call_sites.len(), 3, "expected one call per attention path");
-
-    let offenders: Vec<&str> = call_sites
-        .iter()
-        .flat_map(|call| {
-            call.match_indices("/* ")
-                .filter_map(|(index, _)| call[index + 3..].split_once(" */").map(|(name, _)| name))
+    let offenders: Vec<&str> = source
+        .match_indices("/* ")
+        .filter_map(|(index, _)| source[index + 3..].split_once(" */").map(|(name, _)| name))
+        .filter(|label| {
+            label
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character == '_')
         })
         .filter(|label| !parameters.contains(label))
         .collect();

@@ -149,9 +149,10 @@ fn check_cutlass_checkout() -> Result<()> {
 /// panics with `Failed to get compute_cap` when neither answers, naming none of the causes.
 #[cfg(feature = "cuda")]
 fn check_cuda_toolchain() -> Result<()> {
-    if Command::new("nvcc").arg("--version").output().is_err() {
+    let nvcc = Command::new("nvcc").arg("--version").output();
+    if !nvcc.is_ok_and(|output| output.status.success()) {
         anyhow::bail!(
-            "`nvcc` was not found on PATH; the CUDA toolkit is required to build the `cuda` feature."
+            "`nvcc` did not answer; the CUDA toolkit is required to build the `cuda` feature."
         )
     }
     if std::env::var_os("CUDA_COMPUTE_CAP").is_some() {

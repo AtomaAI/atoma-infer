@@ -50,6 +50,7 @@ extern "C" {
         seqused_k: *const c_int,
         seqlen_q: u32,
         seqlen_k: u32,
+        total_q: u32,
         seqlen_q_rounded: u32,
         seqlen_k_rounded: u32,
 

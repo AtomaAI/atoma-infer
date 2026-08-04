@@ -331,35 +331,82 @@ fn test_flash_attn_kv_cache_with_block_table() -> Result<()> {
     Ok(())
 }
 
+/// Attention over `q`, `k` and `v` of shape `[1, num_heads, seq_len, head_dim]`, masked so each
+/// query only attends to keys at or before its own position.
+fn fa_causal(q: &Tensor, k: &Tensor, v: &Tensor, softmax_scale: f32) -> Result<Tensor> {
+    let in_dtype = q.dtype();
+    let (_, _, seq_len, _) = q.dims4()?;
+    let q = q.to_dtype(DType::F32)?;
+    let k = k.to_dtype(DType::F32)?;
+    let v = v.to_dtype(DType::F32)?;
+    let mask: Vec<_> = (0..seq_len)
+        .flat_map(|row| (0..seq_len).map(move |column| f32::from(column > row)))
+        .collect();
+    let mask = (Tensor::from_vec(mask, (seq_len, seq_len), q.device())? * f64::from(f32::MIN))?;
+    let att = (q.matmul(&k.t()?)? * softmax_scale as f64)?.broadcast_add(&mask)?;
+    let att = candle_nn::ops::softmax(&att, D::Minus1)?;
+    Ok(att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?)
+}
+
+/// Asserts that the flash output matches a reference computed the naive way.
+fn assert_close(expected: &Tensor, actual: &Tensor, what: &str) -> Result<()> {
+    let diff = expected
+        .to_dtype(DType::F32)?
+        .sub(&actual.to_dtype(DType::F32)?)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_vec0::<f32>()?;
+    assert!(diff < 2e-3, "{what} deviates from the reference by {diff}");
+    Ok(())
+}
+
 /// Head dimensions that are not a multiple of 32 take the uneven-K kernels, which
-/// `models::FlashAttention::supported_head_sizes` advertises and #161 re-enabled.
+/// `models::FlashAttention::supported_head_sizes` advertises and #161 re-enabled. Every entry
+/// point that serves those head dims is covered, because each dispatches differently.
 fn assert_uneven_head_dim_matches_reference(head_dim: usize) -> Result<()> {
     let device = Device::new_cuda(0)?;
     let (num_heads, seq_len) = (2, 8);
     let (q, k, v) = qkv(&device, num_heads, seq_len, head_dim)?;
     let softmax_scale = 1.0 / (head_dim as f32).sqrt();
+    let (qt, kt, vt) = (q.transpose(1, 2)?, k.transpose(1, 2)?, v.transpose(1, 2)?);
 
+    for causal in [false, true] {
+        let expected = if causal {
+            fa_causal(&q, &k, &v, softmax_scale)?
+        } else {
+            fa_acausal(&q, &k, &v, softmax_scale)?
+        }
+        .i(0)?;
+        let actual = atoma_kernels::flash_attn(&qt, &kt, &vt, softmax_scale, causal)?
+            .transpose(1, 2)?
+            .i(0)?;
+        assert_eq!(actual.dims(), &[num_heads, seq_len, head_dim]);
+        assert_close(
+            &expected,
+            &actual,
+            &format!("head dim {head_dim}, causal {causal}"),
+        )?;
+    }
+
+    // The varlen entry point takes `[total_q, num_heads, head_dim]` and a single sequence here.
+    let seqlens = Tensor::new(&[0u32, seq_len as u32], &device)?;
     let expected = fa_acausal(&q, &k, &v, softmax_scale)?
         .i(0)?
-        .to_dtype(DType::F32)?;
-    let actual = atoma_kernels::flash_attn(
-        &q.transpose(1, 2)?,
-        &k.transpose(1, 2)?,
-        &v.transpose(1, 2)?,
+        .transpose(0, 1)?;
+    let actual = atoma_kernels::flash_attn_varlen(
+        &q.i(0)?.transpose(0, 1)?.contiguous()?,
+        &k.i(0)?.transpose(0, 1)?.contiguous()?,
+        &v.i(0)?.transpose(0, 1)?.contiguous()?,
+        &seqlens,
+        &seqlens,
+        seq_len,
+        seq_len,
         softmax_scale,
         false,
-    )?
-    .transpose(1, 2)?
-    .i(0)?
-    .to_dtype(DType::F32)?;
-
-    assert_eq!(actual.dims(), &[num_heads, seq_len, head_dim]);
-    let diff = expected.sub(&actual)?.abs()?.flatten_all()?.max(0)?;
-    let diff = diff.to_vec0::<f32>()?;
-    assert!(
-        diff < 2e-3,
-        "head dim {head_dim} deviates from the reference by {diff}"
-    );
+    )?;
+    assert_eq!(actual.dims(), &[seq_len, num_heads, head_dim]);
+    assert_close(&expected, &actual, &format!("head dim {head_dim}, varlen"))?;
 
     Ok(())
 }

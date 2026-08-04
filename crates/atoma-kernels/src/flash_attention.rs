@@ -227,6 +227,8 @@ impl FlashAttention {
 
         let elem_count = out_shape.elem_count();
         let mut dst = unsafe { stream.alloc::<T>(elem_count) }.w()?;
+        // The kernels write the LSE as `[b, h, seqlen_q]` whenever `unpadded_lse` is false, which
+        // is what this path passes.
         let mut softmax_lse = stream.alloc_zeros::<f32>(b_sz * num_heads * seqlen_q).w()?;
 
         let is_bf16 = if is_bf16 { 1 } else { 0 };
@@ -330,6 +332,7 @@ impl FlashAttention {
                 /* seqused_k */ std::ptr::null(),
                 /* seqlen_q */ seqlen_q as u32,
                 /* seqlen_k */ seqlen_k as u32,
+                /* total_q */ (b_sz * seqlen_q) as u32,
                 /* seqlen_q_rounded */ seqlen_q_rounded as u32,
                 /* seqlen_k_rounded */ seqlen_k_rounded as u32,
                 /* is_bf16 */ is_bf16,
@@ -337,7 +340,7 @@ impl FlashAttention {
                 /* window_size_left */ window_size_left,
                 /* window_size_right */ window_size_right,
                 /* softcap */ 0.0,
-                /* unpadded_lse */ true,
+                /* unpadded_lse */ false,
                 /* force_split_kernel */ false,
                 /* softmax_lseaccum_ptr */ softmax_lseaccum_ptr,
                 /* oaccum_ptr */ oaccum_ptr,
@@ -996,6 +999,8 @@ impl FlashAttentionVarLen {
 
         let elem_count = out_shape.elem_count();
         let mut dst = unsafe { stream.alloc::<T>(elem_count) }.w()?;
+        // With `unpadded_lse` the kernels write the LSE as `[h, total_q]`, indexed through
+        // `params.total_q`.
         let mut softmax_lse = stream.alloc_zeros::<f32>(total_q * num_heads).w()?;
 
         let is_bf16 = if is_bf16 { 1 } else { 0 };
@@ -1142,6 +1147,7 @@ impl FlashAttentionVarLen {
                 /* seqused_k */ seqused_k,
                 /* seqlen_q */ self.max_seqlen_q as u32,
                 /* seqlen_k */ self.max_seqlen_k as u32,
+                /* total_q */ total_q as u32,
                 /* seqlen_q_rounded */ seqlen_q_rounded as u32,
                 /* seqlen_k_rounded */ seqlen_k_rounded as u32,
                 /* is_bf16 */ is_bf16,
@@ -1876,13 +1882,7 @@ impl FlashAttentionKvCache {
                             [batch_size]
                         )
                     }
-                    if seqlens_k.dtype() != DType::U32 {
-                        candle_core::bail!(
-                            "DType mismatch seqlens_k {:?}, expected {:?}",
-                            seqlens_k.dtype(),
-                            DType::U32
-                        );
-                    }
+                    utils::check_index_tensor(seqlens_k, "seqlens_k")?;
                     let seqlens_k_stride = seqlens_k_layout.stride();
                     let seqlens_k_rank = seqlens_k_stride.len();
                     if seqlens_k_stride[seqlens_k_rank - 1] != 1 {
@@ -1959,6 +1959,7 @@ impl FlashAttentionKvCache {
                 /* seqused_k */ std::ptr::null(),
                 /* seqlen_q */ seqlen_q as u32,
                 /* seqlen_k */ seqlen_k as u32,
+                /* total_q */ (batch_size * seqlen_q) as u32,
                 /* seqlen_q_rounded */ seqlen_q_rounded as u32,
                 /* seqlen_k_rounded */ seqlen_k_rounded as u32,
                 /* is_bf16 */ is_bf16,

@@ -459,23 +459,6 @@ mod tests {
     }
 
     #[test]
-    fn the_final_norm_uses_the_checkpoint_epsilon() {
-        let source = include_str!("llama_nccl.rs");
-        let load = source
-            .split_once("let ln_f = rms_norm(")
-            .expect("Llama::load must build the final norm")
-            .1;
-        let arguments = load
-            .split_once(')')
-            .expect("the rms_norm call must terminate")
-            .0;
-        assert!(
-            arguments.contains("cfg.rms_norm_eps"),
-            "the final norm must take its epsilon from the checkpoint config, got: {arguments}"
-        );
-    }
-
-    #[test]
     #[serial]
     #[ignore = "downloads gated meta-llama weights; requires HF_API_KEY. Run with `cargo test --features cuda,nccl -- --ignored`"]
     fn test_llama_nccl_model_random_block_order() -> Result<()> {

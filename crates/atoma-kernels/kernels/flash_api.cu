@@ -70,6 +70,7 @@ extern "C" cudaError_t run_mha(
     int *seqused_k,
     uint32_t seqlen_q,
     uint32_t seqlen_k,
+    uint32_t total_q,
     uint32_t seqlen_q_rounded,
     uint32_t seqlen_k_rounded,
 
@@ -123,6 +124,7 @@ extern "C" cudaError_t run_mha(
     params.h_h_k_ratio = h / h_k;
     params.seqlen_q = seqlen_q;
     params.seqlen_k = seqlen_k;
+    params.total_q = total_q;
     params.seqlen_q_rounded = seqlen_q_rounded;
     params.seqlen_k_rounded = seqlen_k_rounded;
     params.d = d;
