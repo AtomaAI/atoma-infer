@@ -20,7 +20,7 @@ swap_space_bytes        = 67108864
 [scheduler]
 block_size             = 16
 delay_factor           = 0.8
-enable_chunked_prefill = true
+enable_chunked_prefill = false
 max_model_len          = 1024
 max_num_batched_tokens = 1024
 max_num_sequences      = 32

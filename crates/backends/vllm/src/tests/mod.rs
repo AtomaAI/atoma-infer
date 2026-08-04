@@ -16,6 +16,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use models::FlashAttentionMetadata;
 use rand::Rng;
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
@@ -33,48 +34,66 @@ use crate::{
 const MAX_ELAPSED_INTERNAL: u64 = 50;
 const VOCAB_SIZE: usize = 128;
 
-struct MockModel {}
+/// Shape of the model the engine tests pretend to serve.
+///
+/// The values only have to be self-consistent and cheap: `MockModel::forward` never touches the KV
+/// cache, but the worker still builds a real `CacheEngine` from them, so `MOCK_HEAD_DIM` has to be
+/// one of the head sizes the attention layer supports.
+const MOCK_HEAD_DIM: usize = 64;
+const MOCK_NUM_ATTENTION_HEADS: usize = 4;
+const MOCK_NUM_HIDDEN_LAYERS: usize = 2;
+const MOCK_NUM_KV_HEADS: usize = 4;
 
-impl Config for () {
+struct MockModel {
+    config: MockConfig,
+}
+
+/// Configuration of the mock model served by the engine tests.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct MockConfig {}
+
+impl Config for MockConfig {
     fn alibi_slopes(&self) -> Option<&Tensor> {
-        unimplemented!()
+        None
     }
 
     fn eos_token_ids(&self) -> Option<Vec<u32>> {
-        unimplemented!()
+        None
     }
 
     fn hidden_dim(&self) -> usize {
-        unimplemented!()
+        MOCK_HEAD_DIM
     }
 
     fn num_attention_heads(&self) -> usize {
-        unimplemented!()
+        MOCK_NUM_ATTENTION_HEADS
     }
 
     fn num_hidden_layers(&self) -> usize {
-        unimplemented!()
+        MOCK_NUM_HIDDEN_LAYERS
     }
 
     fn num_kv_heads(&self) -> usize {
-        unimplemented!()
+        MOCK_NUM_KV_HEADS
     }
 
     fn sliding_window(&self) -> Option<usize> {
-        unimplemented!()
+        None
     }
 
     fn softmax_scale(&self) -> f32 {
-        unimplemented!()
+        1f32 / (MOCK_HEAD_DIM as f32).sqrt()
     }
 
+    /// `MockModel::fetch` downloads a tokenizer but no config file, so the shape above is used
+    /// instead of reading `path`.
     fn from_file_path(_: &PathBuf) -> Result<Self, ConfigError> {
-        unimplemented!()
+        Ok(Self::default())
     }
 }
 
 impl ModelLoader for MockModel {
-    type C = ();
+    type C = MockConfig;
 
     fn fetch<T: AsRef<Path>>(
         api_key: String,
@@ -103,23 +122,23 @@ impl ModelLoader for MockModel {
 
     #[cfg(not(feature = "nccl"))]
     fn load(
-        _: Self::C,
+        config: Self::C,
         _: &Device,
         _: DType,
         _: &ModelFilePaths,
     ) -> Result<Self, ModelLoaderError> {
-        Ok(Self {})
+        Ok(Self { config })
     }
 
     #[cfg(feature = "nccl")]
     fn load(
-        _: Self::C,
+        config: Self::C,
         _: &Device,
         _: DType,
         _: &ModelFilePaths,
         _: &Rc<Comm>,
     ) -> Result<Self, ModelLoaderError> {
-        unimplemented!()
+        Ok(Self { config })
     }
 }
 
@@ -160,7 +179,7 @@ impl ModelExecutor for MockModel {
     }
 
     fn config(&self) -> &Self::C {
-        &()
+        &self.config
     }
 }
 
@@ -169,15 +188,13 @@ async fn test_llm_engine() {
     init_tracing();
 
     const NUM_REQUESTS: usize = 128;
-    const MAX_NUM_SEQUENCES: usize = 32;
-    const NUM_RUNS: usize = NUM_REQUESTS / MAX_NUM_SEQUENCES;
 
     let (shutdown_signal_sender, shutdown_signal_receiver) = mpsc::channel(1);
 
     let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
         .join("tests")
-        .join("test_config_enable_chunked_prefill.toml");
+        .join("test_config_disable_chunked_prefill.toml");
 
     let (service_request_sender, service_request_receiver) = mpsc::unbounded_channel();
     let service = LlmService::start::<MockModel, PathBuf>(
@@ -244,15 +261,15 @@ async fn test_llm_engine() {
 
     info!("Elapsed times: {elapsed_times:?}");
 
+    // Every request is answered exactly once, so one completion time is recorded per request.
     assert_eq!(number_of_responses, NUM_REQUESTS);
-    assert_eq!(elapsed_times.len(), NUM_RUNS);
+    assert_eq!(elapsed_times.len(), NUM_REQUESTS);
 
-    // Give enough variability time for different machines
+    // The engine keeps draining the queue: no two consecutive completions are further apart than a
+    // single scheduler run, with enough slack for different machines.
     let max_elapsed_interval = Duration::from_secs(MAX_ELAPSED_INTERNAL);
-    for i in 0..(NUM_RUNS - 1) {
-        let left_run_time = elapsed_times[i];
-        let right_run_time = elapsed_times[i + 1];
-        assert!(right_run_time - left_run_time <= max_elapsed_interval);
+    for window in elapsed_times.windows(2) {
+        assert!(window[1] - window[0] <= max_elapsed_interval);
     }
 
     shutdown_signal_sender.send(()).await.unwrap();
@@ -263,8 +280,6 @@ async fn test_llm_engine_with_enable_chunking() {
     init_tracing();
 
     const NUM_REQUESTS: usize = 128;
-    const MAX_NUM_SEQUENCES: usize = 32;
-    const NUM_RUNS: usize = NUM_REQUESTS / MAX_NUM_SEQUENCES;
 
     let (service_request_sender, service_request_receiver) = mpsc::unbounded_channel();
     let (shutdown_signal_sender, shutdown_signal_receiver) = mpsc::channel(1);
@@ -337,16 +352,15 @@ async fn test_llm_engine_with_enable_chunking() {
     }
     info!("Elapsed times: {elapsed_times:?}");
 
+    // Every request is answered exactly once, so one completion time is recorded per request.
     assert_eq!(number_of_responses, NUM_REQUESTS);
-    assert_eq!(elapsed_times.len(), 2 * NUM_RUNS);
+    assert_eq!(elapsed_times.len(), NUM_REQUESTS);
 
-    // Give enough variability time for different machines
+    // The engine keeps draining the queue: no two consecutive completions are further apart than a
+    // single scheduler run, with enough slack for different machines.
     let max_elapsed_interval = Duration::from_secs(MAX_ELAPSED_INTERNAL);
-    for i in 0..(2 * NUM_RUNS - 1) {
-        let left_run_time = elapsed_times[i];
-        let right_run_time = elapsed_times[i + 1];
-        // Give enough variability time for different machines
-        assert!(right_run_time - left_run_time <= max_elapsed_interval);
+    for window in elapsed_times.windows(2) {
+        assert!(window[1] - window[0] <= max_elapsed_interval);
     }
 
     shutdown_signal_sender.send(()).await.unwrap();
