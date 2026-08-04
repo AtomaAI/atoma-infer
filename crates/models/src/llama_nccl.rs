@@ -357,6 +357,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[ignore = "downloads gated meta-llama weights; requires HF_API_KEY. Run with `cargo test --features cuda,nccl -- --ignored`"]
     fn test_llama_nccl_model_random_block_order() -> Result<()> {
         const DEVICE_ID: usize = 0;
         let prompt = "The History of France starts in ".to_string();

@@ -1153,6 +1153,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[ignore = "downloads gated meta-llama weights; requires HF_API_KEY. Run with `cargo test --features cuda -- --ignored`"]
     fn test_llama_model_llama3_2_1b() -> Result<()> {
         let prompt = "The History of France starts in ".to_string();
 
