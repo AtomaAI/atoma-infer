@@ -98,8 +98,10 @@
     }                                        \
   }()
 
+/// Dispatches on head dimension. The body returns a `cudaError_t`, so an out-of-range head
+/// dimension falls through to an error status instead of off the end of the lambda.
 #define HEADDIM_SWITCH(HEADDIM, ...)   \
-  [&] {                                    \
+  [&]() -> cudaError_t {                   \
     if (HEADDIM <= 32) {                   \
       constexpr static int kHeadDim = 32;  \
       return __VA_ARGS__();                \
@@ -125,4 +127,5 @@
       constexpr static int kHeadDim = 256; \
       return __VA_ARGS__();                \
     }                                      \
+    return cudaErrorInvalidValue;          \
   }()

@@ -18,6 +18,24 @@ fn to_vec3_round(t: Tensor, digits: i32) -> Result<Vec<Vec<Vec<f32>>>> {
     Ok(t)
 }
 
+/// Builds `q`, `k` and `v` of shape `[1, num_heads, seq_len, head_dim]`, with values spread over
+/// `[0, 1)` so f16 rounding does not dominate the comparison against the reference.
+fn qkv(
+    device: &Device,
+    num_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let elem_count = num_heads * seq_len * head_dim;
+    let base = (Tensor::arange(0u32, elem_count as u32, device)?.to_dtype(DType::F32)?
+        / elem_count as f64)?
+        .reshape((1, num_heads, seq_len, head_dim))?
+        .to_dtype(DType::F16)?;
+    let k = (&base * 0.75)?;
+    let v = (&base * 0.5)?;
+    Ok((base, k, v))
+}
+
 fn fa_acausal(q: &Tensor, k: &Tensor, v: &Tensor, softmax_scale: f32) -> Result<Tensor> {
     let in_dtype = q.dtype();
     let q = q.to_dtype(DType::F32)?;
@@ -309,6 +327,153 @@ fn test_flash_attn_kv_cache_with_block_table() -> Result<()> {
 
     assert_eq!(should_be_ys.dims(), &[32, 2, 8]);
     assert_eq!(to_vec3_round(ys, 6)?, to_vec3_round(should_be_ys, 6)?);
+
+    Ok(())
+}
+
+/// Head dimensions that are not a multiple of 32 take the uneven-K kernels, which
+/// `models::FlashAttention::supported_head_sizes` advertises and #161 re-enabled.
+fn assert_uneven_head_dim_matches_reference(head_dim: usize) -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let (num_heads, seq_len) = (2, 8);
+    let (q, k, v) = qkv(&device, num_heads, seq_len, head_dim)?;
+    let softmax_scale = 1.0 / (head_dim as f32).sqrt();
+
+    let expected = fa_acausal(&q, &k, &v, softmax_scale)?
+        .i(0)?
+        .to_dtype(DType::F32)?;
+    let actual = atoma_kernels::flash_attn(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        softmax_scale,
+        false,
+    )?
+    .transpose(1, 2)?
+    .i(0)?
+    .to_dtype(DType::F32)?;
+
+    assert_eq!(actual.dims(), &[num_heads, seq_len, head_dim]);
+    let diff = expected.sub(&actual)?.abs()?.flatten_all()?.max(0)?;
+    let diff = diff.to_vec0::<f32>()?;
+    assert!(
+        diff < 2e-3,
+        "head dim {head_dim} deviates from the reference by {diff}"
+    );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn flash_attn_head_dim_80() -> Result<()> {
+    assert_uneven_head_dim_matches_reference(80)
+}
+
+#[test]
+#[serial]
+fn flash_attn_head_dim_112() -> Result<()> {
+    assert_uneven_head_dim_matches_reference(112)
+}
+
+#[test]
+#[serial]
+fn flash_attn_rejects_softcap() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let (q, k, v) = qkv(&device, 2, 8, 64)?;
+    let alibi_slopes = Tensor::zeros(2, DType::F32, &device)?;
+
+    let result = atoma_kernels::flash_attn_alibi_windowed_with_softcap(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        &alibi_slopes,
+        0.5,
+        None,
+        Some(0),
+        Some(30.0),
+    );
+
+    let error = result
+        .expect_err("softcap must be rejected, not silently dropped")
+        .to_string();
+    assert!(error.contains("softcap"), "{error}");
+    assert!(error.contains("FLASHATTENTION_DISABLE_SOFTCAP"), "{error}");
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn flash_attn_rejects_a_sliding_window() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let (q, k, v) = qkv(&device, 2, 8, 64)?;
+    let (q, k, v) = (q.transpose(1, 2)?, k.transpose(1, 2)?, v.transpose(1, 2)?);
+
+    for (window_size_left, window_size_right) in
+        [(Some(4), None), (None, Some(4)), (Some(4), Some(4))]
+    {
+        let result = atoma_kernels::flash_attn_windowed(
+            &q,
+            &k,
+            &v,
+            0.5,
+            window_size_left,
+            window_size_right,
+        );
+        let error = result
+            .expect_err("a sliding window must be rejected, not silently widened")
+            .to_string();
+        assert!(error.contains("sliding-window attention"), "{error}");
+        assert!(error.contains("FLASHATTENTION_DISABLE_LOCAL"), "{error}");
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn flash_attn_accepts_full_and_causal_attention() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let (q, k, v) = qkv(&device, 2, 8, 64)?;
+    let (q, k, v) = (q.transpose(1, 2)?, k.transpose(1, 2)?, v.transpose(1, 2)?);
+
+    atoma_kernels::flash_attn_windowed(&q, &k, &v, 0.5, None, None)?;
+    atoma_kernels::flash_attn_windowed(&q, &k, &v, 0.5, None, Some(0))?;
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn flash_attn_varlen_rejects_seqlens_the_kernels_cannot_read_as_i32() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let q = Tensor::arange(0u32, 48, &device)?
+        .to_dtype(DType::F16)?
+        .reshape((3, 2, 8))?;
+    let k = (&q / 40.)?;
+    let v = (&q / 50.)?;
+    let q = (&q / 30.)?;
+
+    let seqlens_q = Tensor::new(&[0i64, 2i64], &device)?;
+    let seqlens_k = Tensor::new(&[0u32, 2u32], &device)?;
+
+    let result = atoma_kernels::flash_attn_varlen(
+        &q.transpose(0, 1)?,
+        &k.transpose(0, 1)?,
+        &v.transpose(0, 1)?,
+        &seqlens_q,
+        &seqlens_k,
+        32,
+        32,
+        0.5,
+        false,
+    );
+
+    let error = result
+        .expect_err("i64 sequence lengths must be rejected, not reinterpreted as i32")
+        .to_string();
+    assert!(error.contains("seqlens_q"), "{error}");
 
     Ok(())
 }

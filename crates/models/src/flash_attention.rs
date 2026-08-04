@@ -1,6 +1,6 @@
 use atoma_kernels::{
     copy_blocks, flash_attn_kv_cache_full, flash_attn_varlen, flash_attn_varlen_with_block_table,
-    reshape_and_cache_flash, swap_blocks,
+    reshape_and_cache_flash, swap_blocks, Capability, KernelError,
 };
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use std::collections::HashMap;
@@ -196,7 +196,10 @@ pub struct FlashAttention {
 }
 
 impl FlashAttention {
-    /// Constructor
+    /// Constructor.
+    ///
+    /// A `sliding_window` is rejected here rather than on the first prefix-cached prefill, which
+    /// is the only forward path that would otherwise carry it into the kernels.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_heads: usize,
@@ -215,6 +218,9 @@ impl FlashAttention {
         }
         if !Self::supported_head_sizes().contains(&(head_dim as u32)) {
             candle_core::bail!("head_dim {head_dim} is not supported")
+        }
+        if sliding_window.is_some() {
+            return Err(KernelError::unsupported(Capability::SlidingWindow).into());
         }
         Ok(Self {
             num_heads,
@@ -503,6 +509,17 @@ mod tests {
         let device = Device::Cpu;
         let result = FlashAttention::new(8, 4, 65, 1.0, None, None, DType::F32, device);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_rejects_sliding_window() {
+        let device = Device::Cpu;
+        let result = FlashAttention::new(8, 4, 64, 1.0, None, Some(4096), DType::F32, device);
+        let error = result
+            .err()
+            .expect("a sliding window must be rejected, not silently ignored")
+            .to_string();
+        assert!(error.contains("sliding-window attention"), "{error}");
     }
 
     #[test]

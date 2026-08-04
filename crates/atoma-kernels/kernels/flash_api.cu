@@ -5,21 +5,26 @@
 #include "flash.h"
 #include "static_switch.h"
 
-void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel = false) {
-    FP16_SWITCH(!params.is_bf16, [&] {
-        HEADDIM_SWITCH(params.d, [&] {
-            BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+cudaError_t run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel = false) {
+    return FP16_SWITCH(!params.is_bf16, [&] {
+        return HEADDIM_SWITCH(params.d, [&]() -> cudaError_t {
+            return BOOL_SWITCH(params.is_causal, Is_causal, [&]() -> cudaError_t {
                 if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
-                    run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
-                } else {
-                    run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
+                    return run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
                 }
+                return run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
             });
         });
     });
 }
 
-extern "C" void run_mha(
+// Resolves a `cudaError_t` value returned by a launcher into the driver's description of it, so
+// the Rust side can build an error message without linking the CUDA runtime headers.
+extern "C" const char *flash_cuda_error_string(int code) {
+    return cudaGetErrorString(static_cast<cudaError_t>(code));
+}
+
+extern "C" cudaError_t run_mha(
     void *q_ptr,
     void *k_ptr,
     void *v_ptr,
@@ -56,7 +61,7 @@ extern "C" void run_mha(
     uint32_t d,
     uint32_t d_rounded,
     float softmax_scale,
-    float scale_softmatx_log2,
+    float scale_softmax_log2,
 
     int *block_table,
     uint32_t block_table_batch_stride,
@@ -125,7 +130,7 @@ extern "C" void run_mha(
 
     // Set the different scale values.
     params.scale_softmax = softmax_scale;
-    params.scale_softmax_log2 = scale_softmatx_log2;
+    params.scale_softmax_log2 = scale_softmax_log2;
 
     params.p_dropout = 1.;  // probability to keep
     params.p_dropout_in_uint8_t = uint8_t(std::floor(params.p_dropout * 255.0));
@@ -156,5 +161,5 @@ extern "C" void run_mha(
     params.softmax_lseaccum_ptr = softmax_lseaccum_ptr;
     params.oaccum_ptr = oaccum_ptr;
 
-    run_mha_fwd(params, stream, force_split_kernel);
+    return run_mha_fwd(params, stream, force_split_kernel);
 }

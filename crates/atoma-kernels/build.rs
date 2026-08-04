@@ -5,6 +5,8 @@
 use anyhow::{Context, Result};
 #[cfg(feature = "cuda")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "cuda")]
+use std::process::Command;
 
 #[cfg(feature = "cuda")]
 const KERNEL_FILES: [&str; 66] = [
@@ -121,8 +123,58 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// The CUTLASS header the flash-attention kernels include first.
+#[cfg(feature = "cuda")]
+const CUTLASS_SENTINEL_HEADER: &str = "cutlass/include/cutlass/cutlass.h";
+
+/// Fails with checkout instructions when the CUTLASS submodule is empty.
+///
+/// Without this, nvcc reports a missing-header error for each of the 66 kernel translation units
+/// and never names the submodule.
+#[cfg(feature = "cuda")]
+fn check_cutlass_checkout() -> Result<()> {
+    if Path::new(CUTLASS_SENTINEL_HEADER).is_file() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "CUTLASS headers are missing ({CUTLASS_SENTINEL_HEADER} not found). CUTLASS is a Git \
+         submodule that a plain `git clone` leaves empty; check it out with \
+         `git submodule update --init --depth 1 crates/atoma-kernels/cutlass`."
+    )
+}
+
+/// Fails with an actionable message when the toolchain the kernel build needs is missing.
+///
+/// `bindgen_cuda` resolves the target architecture from `CUDA_COMPUTE_CAP` or `nvidia-smi`, then
+/// panics with `Failed to get compute_cap` when neither answers, naming none of the causes.
+#[cfg(feature = "cuda")]
+fn check_cuda_toolchain() -> Result<()> {
+    if Command::new("nvcc").arg("--version").output().is_err() {
+        anyhow::bail!(
+            "`nvcc` was not found on PATH; the CUDA toolkit is required to build the `cuda` feature."
+        )
+    }
+    if std::env::var_os("CUDA_COMPUTE_CAP").is_some() {
+        return Ok(());
+    }
+    let compute_cap = Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv"])
+        .output();
+    match compute_cap {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(_) | Err(_) => anyhow::bail!(
+            "Could not determine the target compute capability: `nvidia-smi` did not answer and \
+             CUDA_COMPUTE_CAP is unset. Set CUDA_COMPUTE_CAP (for example `CUDA_COMPUTE_CAP=80`) \
+             to build for a specific architecture without a GPU present."
+        ),
+    }
+}
+
 #[cfg(feature = "cuda")]
 fn compile_cuda_files(build_dir: &Path) -> Result<()> {
+    check_cutlass_checkout()?;
+    check_cuda_toolchain()?;
+
     let kernels: Vec<_> = KERNEL_FILES.iter().map(|&s| s.to_string()).collect();
     let builder = bindgen_cuda::Builder::default()
         .kernel_paths(kernels)

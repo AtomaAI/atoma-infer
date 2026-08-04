@@ -1,4 +1,5 @@
 use crate::ffi;
+use crate::flash_attention::utils::device_ordinal;
 use crate::ops::{SwapBlockCpuToGpuOp, SwapBlockGpuToCpuOp, SwapBlockOp};
 use candle_core::CpuStorage;
 use candle_core::{
@@ -32,8 +33,7 @@ pub fn swap_blocks(
     let dst_device = dst.device();
     match (src_device, dst_device) {
         (Device::Cuda(src_device), Device::Cuda(dst_device)) => {
-            if crate::utils::device_ordinal(src_device) != crate::utils::device_ordinal(dst_device)
-            {
+            if device_ordinal(src_device) != device_ordinal(dst_device) {
                 candle_core::bail!(
                     "swap_blocks: Both src and dst tensors should be on the same device to swap"
                 )
@@ -193,15 +193,16 @@ fn launch_copy_blocks<T: CudaDType + DeviceRepr>(
         .slice(block_mapping_layout.start_offset()..);
     let (block_mapping_ptr, _block_mapping_guard) = block_mapping.view_ptr(&stream);
 
-    unsafe {
+    let status = unsafe {
         ffi::copy_blocks_cache(
             cache_ptr as *mut core::ffi::c_void,
             block_mapping_ptr as *const core::ffi::c_void,
             op.num_pairs,
             op.numel_per_block,
             stream.cu_stream() as *mut core::ffi::c_void,
-        );
-    }
+        )
+    };
+    ffi::check_launch("copy_blocks_cache", status)?;
     Ok(())
 }
 
@@ -238,9 +239,7 @@ pub fn copy_blocks(
         candle_core::bail!("copy_blocks only supports f16/bf16 caches, got {dtype:?}")
     }
     match block_mapping.device() {
-        Device::Cuda(device)
-            if crate::utils::device_ordinal(cuda_device)
-                == crate::utils::device_ordinal(device) => {}
+        Device::Cuda(device) if device_ordinal(cuda_device) == device_ordinal(device) => {}
         _ => candle_core::bail!(
             "key_caches, value_caches and block_mapping must be on the same CUDA device"
         ),
@@ -263,8 +262,7 @@ pub fn copy_blocks(
         match cache.device() {
             Device::Cuda(device)
                 if cache.dtype() == dtype
-                    && crate::utils::device_ordinal(cuda_device)
-                        == crate::utils::device_ordinal(device) => {}
+                    && device_ordinal(cuda_device) == device_ordinal(device) => {}
             _ => candle_core::bail!(
                 "key_caches and value_caches must have the same dtype and CUDA device"
             ),
@@ -363,7 +361,7 @@ fn launch_reshape_and_cache_flash<T: CudaDType + DeviceRepr>(
         .slice(slot_mapping_layout.start_offset()..);
     let (slot_mapping_ptr, _slot_mapping_guard) = slot_mapping.view_ptr(&stream);
 
-    unsafe {
+    let status = unsafe {
         ffi::reshape_and_cache_flash_cache(
             source_ptr as *const core::ffi::c_void,
             cache_ptr as *mut core::ffi::c_void,
@@ -376,8 +374,9 @@ fn launch_reshape_and_cache_flash<T: CudaDType + DeviceRepr>(
             op.source_stride,
             op.dtype,
             stream.cu_stream() as *mut core::ffi::c_void,
-        );
-    }
+        )
+    };
+    ffi::check_launch("reshape_and_cache_flash_cache", status)?;
     Ok(())
 }
 
@@ -414,8 +413,8 @@ pub fn reshape_and_cache_flash(
     for tensor in [value, key_cache, value_cache, slot_mapping] {
         match tensor.device() {
             Device::Cuda(device)
-                if crate::utils::device_ordinal(cuda_device)
-                    == crate::utils::device_ordinal(device) => {}
+                if device_ordinal(cuda_device)
+                    == device_ordinal(device) => {}
             _ => candle_core::bail!(
                 "key, value, key_cache, value_cache and slot_mapping must be on the same CUDA device"
             ),
