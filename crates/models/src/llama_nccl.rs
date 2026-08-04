@@ -513,14 +513,14 @@ mod tests {
             std::io::stdout().flush()?;
         }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // decoding loop
         for _ in 1..sample_len {
             if tokens.len() % 16 == 1 {
-                let mut num = rng.gen_range(0..100);
+                let mut num = rng.random_range(0..100);
                 while allocated_blocks.contains(&num) {
-                    num = rng.gen_range(0..100);
+                    num = rng.random_range(0..100);
                 }
                 allocated_blocks.push(num);
             }
@@ -534,7 +534,7 @@ mod tests {
             let last_allocated_block = *allocated_blocks.last().unwrap();
             let slot_mapping = Tensor::new(
                 &[(last_allocated_block as i64) * (block_size as i64)
-                    + ((tokens.len() - 1) % block_size as usize) as i64],
+                    + ((tokens.len() - 1) % block_size) as i64],
                 &device,
             )?;
             let query_start_locations = Tensor::new(&[0u32, 1], &device)?;
@@ -542,9 +542,9 @@ mod tests {
             let sequence_lengths = Tensor::new(&[tokens.len() as u32], &device)?;
 
             let block_tables =
-                Tensor::from_vec(allocated_blocks.clone(), (1, num_blocks as usize), &device)?
+                Tensor::from_vec(allocated_blocks.clone(), (1, num_blocks), &device)?
                     .to_dtype(DType::U32)?
-                    .reshape((1, num_blocks as usize))?;
+                    .reshape((1, num_blocks))?;
 
             let num_prefill_tokens = 0;
             let num_decoding_tokens = 1;

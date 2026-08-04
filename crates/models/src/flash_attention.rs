@@ -208,7 +208,7 @@ impl FlashAttention {
         kv_cache_dtype: DType,
         device: Device,
     ) -> Result<Self> {
-        if num_heads % num_kv_heads != 0 {
+        if !num_heads.is_multiple_of(num_kv_heads) {
             candle_core::bail!(
                 "number of heads {num_heads} must divide number of kv heads {num_kv_heads}"
             )
@@ -625,8 +625,7 @@ mod tests {
             .unwrap()
             .to_vec1::<u8>()
             .unwrap()
-            .iter()
-            .any(|&x| x == 1));
+            .contains(&1));
     }
 
     #[test]

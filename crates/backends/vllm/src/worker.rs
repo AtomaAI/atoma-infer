@@ -318,9 +318,8 @@ where
 
                     // 7. If sliding window is used, we need to trim the block table
                     if let Some(sliding_window) = self.model.config().sliding_window() {
-                        let sw_block_num = (sliding_window + self.cache_engine.get_block_size()
-                            - 1)
-                            / self.cache_engine.get_block_size();
+                        let sw_block_num =
+                            sliding_window.div_ceil(self.cache_engine.get_block_size());
                         let start = block_table.len().saturating_sub(sw_block_num);
                         block_table = block_table[start..].to_vec();
                     }

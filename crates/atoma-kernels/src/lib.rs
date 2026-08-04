@@ -2229,7 +2229,7 @@ pub(crate) mod utils {
 
     use super::*;
     pub(crate) fn round_multiple(x: usize, m: usize) -> usize {
-        (x + m - 1) / m * m
+        x.div_ceil(m) * m
     }
 
     /// Returns the ordinal of the cuda device backing `device`.
@@ -2292,7 +2292,7 @@ pub(crate) mod utils {
         let mut max_efficiency = 0.0;
         let mut efficiency = Vec::with_capacity(max_splits);
 
-        let ceil_div = |a: usize, b: usize| -> usize { (a + b - 1) / b };
+        let ceil_div = |a: usize, b: usize| -> usize { a.div_ceil(b) };
 
         let is_split_eligible = |num_splits: usize| -> bool {
             num_splits == 1
@@ -2339,10 +2339,10 @@ pub(crate) mod utils {
         } else {
             64
         };
-        let num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+        let num_n_blocks = max_seqlen_k.div_ceil(block_n);
         // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
         // In any case we don't expect seqlen_q to be larger than 64 for inference.
-        let num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
+        let num_m_blocks = max_seqlen_q.div_ceil(64);
         let cuda_multiprocessor_count = get_multiprocessor_count(device)?;
         let num_splits = num_splits_heuristic(
             batch_size * num_heads * num_m_blocks,

@@ -213,9 +213,7 @@ pub trait ModelExecutor: ModelLoader {
                 } else {
                     debug_assert!(repeat_last_n > 0, "repeat_last_n should be > 0");
                     let num_sequence_tokens = sequence_data.length();
-                    let start_at = num_sequence_tokens
-                        .checked_sub(repeat_last_n as usize)
-                        .unwrap_or_default();
+                    let start_at = num_sequence_tokens.saturating_sub(repeat_last_n as usize);
                     let context = sequence_data.get_token_ids();
                     candle_transformers::utils::apply_repeat_penalty(
                         &logits.i(logits_idx)?.squeeze(0)?,

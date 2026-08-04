@@ -32,7 +32,7 @@ async fn test_llama_nccl_model() {
         llm_service.run().await.expect("Fail to run llm service");
     });
 
-    let prompts = vec!["The capital of France is ".to_string()];
+    let prompts = ["The capital of France is ".to_string()];
 
     let start = Instant::now();
     let mut futures = FuturesUnordered::new();
