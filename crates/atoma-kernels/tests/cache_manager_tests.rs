@@ -17,7 +17,7 @@ mod swap_blocks {
             0f32,
             10f32,
             (NUM_BLOCKS, BLOCK_SIZE, NUM_HEADS, HEAD_SIZE),
-            &device,
+            device,
         )?
         .to_dtype(dtype)?;
         Ok(tensor)
@@ -260,25 +260,18 @@ mod copy_blocks {
         let key_caches_refs: Vec<_> = key_caches.iter_mut().collect();
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
-        unsafe {
-            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
-                .unwrap();
-        }
+        atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
 
         // Check if blocks were correctly copied
         for layer in 0..NUM_LAYERS {
-            assert!(
-                compare_blocks::<half::f16>(&key_caches_refs[layer], 0, 2, BLOCK_SIZE).unwrap()
-            );
-            assert!(
-                compare_blocks::<half::f16>(&key_caches_refs[layer], 1, 3, BLOCK_SIZE).unwrap()
-            );
+            assert!(compare_blocks::<half::f16>(key_caches_refs[layer], 0, 2, BLOCK_SIZE).unwrap());
+            assert!(compare_blocks::<half::f16>(key_caches_refs[layer], 1, 3, BLOCK_SIZE).unwrap());
 
             assert!(
-                compare_blocks::<half::f16>(&value_caches_refs[layer], 0, 2, BLOCK_SIZE).unwrap()
+                compare_blocks::<half::f16>(value_caches_refs[layer], 0, 2, BLOCK_SIZE).unwrap()
             );
             assert!(
-                compare_blocks::<half::f16>(&value_caches_refs[layer], 1, 3, BLOCK_SIZE).unwrap()
+                compare_blocks::<half::f16>(value_caches_refs[layer], 1, 3, BLOCK_SIZE).unwrap()
             );
 
             // Check that untouched blocks remain the same
@@ -368,25 +361,22 @@ mod copy_blocks {
         let key_caches_refs: Vec<_> = key_caches.iter_mut().collect();
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
-        unsafe {
-            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
-                .unwrap();
-        }
+        atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
 
         // Check if blocks were correctly copied
         for layer in 0..NUM_LAYERS {
             assert!(
-                compare_blocks::<half::bf16>(&key_caches_refs[layer], 0, 2, BLOCK_SIZE).unwrap()
+                compare_blocks::<half::bf16>(key_caches_refs[layer], 0, 2, BLOCK_SIZE).unwrap()
             );
             assert!(
-                compare_blocks::<half::bf16>(&key_caches_refs[layer], 1, 3, BLOCK_SIZE).unwrap()
+                compare_blocks::<half::bf16>(key_caches_refs[layer], 1, 3, BLOCK_SIZE).unwrap()
             );
 
             assert!(
-                compare_blocks::<half::bf16>(&value_caches_refs[layer], 0, 2, BLOCK_SIZE).unwrap()
+                compare_blocks::<half::bf16>(value_caches_refs[layer], 0, 2, BLOCK_SIZE).unwrap()
             );
             assert!(
-                compare_blocks::<half::bf16>(&value_caches_refs[layer], 1, 3, BLOCK_SIZE).unwrap()
+                compare_blocks::<half::bf16>(value_caches_refs[layer], 1, 3, BLOCK_SIZE).unwrap()
             );
 
             // Check that untouched blocks remain the same
@@ -461,8 +451,8 @@ mod copy_blocks {
     #[should_panic(expected = "key_caches and value_caches must have the same length")]
     fn test_copy_blocks_unequal_lengths() {
         let device = Device::new_cuda(0).unwrap();
-        let mut key_caches = vec![create_test_tensor(&device, DType::F16)];
-        let mut value_caches = vec![
+        let mut key_caches = [create_test_tensor(&device, DType::F16)];
+        let mut value_caches = [
             create_test_tensor(&device, DType::F16),
             create_test_tensor(&device, DType::F16),
         ];
@@ -471,78 +461,65 @@ mod copy_blocks {
         let key_caches_refs: Vec<_> = key_caches.iter_mut().collect();
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
-        unsafe {
-            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
-                .unwrap();
-        }
+        atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "device must be a cuda device")]
+    #[should_panic(expected = "key_caches and value_caches must be CUDA tensors")]
     fn test_copy_blocks_non_cuda_device() {
         let device = Device::Cpu;
-        let mut key_caches = vec![create_test_tensor(&device, DType::F16)];
-        let mut value_caches = vec![create_test_tensor(&device, DType::F16)];
+        let mut key_caches = [create_test_tensor(&device, DType::F16)];
+        let mut value_caches = [create_test_tensor(&device, DType::F16)];
         let block_mapping = Tensor::from_slice(&[0i64, 1], (1, 2), &device).unwrap();
 
         let key_caches_refs: Vec<_> = key_caches.iter_mut().collect();
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
-        unsafe {
-            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
-                .unwrap();
-        }
+        atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "Only support f16/bf16 dtypes and src and dst must have same dtype")]
+    #[should_panic(
+        expected = "key_caches and value_caches must have the same dtype and CUDA device"
+    )]
     fn test_copy_blocks_different_dtypes() {
         let device = Device::new_cuda(0).unwrap();
-        let mut key_caches = vec![create_test_tensor(&device, DType::F16)];
-        let mut value_caches = vec![create_test_tensor(&device, DType::BF16)];
+        let mut key_caches = [create_test_tensor(&device, DType::F16)];
+        let mut value_caches = [create_test_tensor(&device, DType::BF16)];
         let block_mapping = Tensor::from_slice(&[0i64, 1], (1, 2), &device).unwrap();
 
         let key_caches_refs: Vec<_> = key_caches.iter_mut().collect();
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
-        unsafe {
-            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
-                .unwrap();
-        }
+        atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "Only support f16/bf16 dtypes and src and dst must have same dtype")]
+    #[should_panic(expected = "copy_blocks only supports f16/bf16 caches, got F32")]
     fn test_copy_blocks_invalid_dtype() {
         let device = Device::new_cuda(0).unwrap();
-        let mut key_caches = vec![create_test_tensor(&device, DType::F32)];
-        let mut value_caches = vec![create_test_tensor(&device, DType::F32)];
+        let mut key_caches = [create_test_tensor(&device, DType::F32)];
+        let mut value_caches = [create_test_tensor(&device, DType::F32)];
         let block_mapping = Tensor::from_slice(&[0i64, 1], (1, 2), &device).unwrap();
 
         let key_caches_refs: Vec<_> = key_caches.iter_mut().collect();
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
-        unsafe {
-            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
-                .unwrap();
-        }
+        atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
     }
 
     #[test]
     #[should_panic(expected = "block_mapping must have shape [num_pairs, 2]")]
     fn test_copy_blocks_invalid_block_mapping_shape() {
         let device = Device::new_cuda(0).unwrap();
-        let mut key_caches = vec![create_test_tensor(&device, DType::F16)];
-        let mut value_caches = vec![create_test_tensor(&device, DType::F16)];
+        let mut key_caches = [create_test_tensor(&device, DType::F16)];
+        let mut value_caches = [create_test_tensor(&device, DType::F16)];
         let block_mapping = Tensor::from_slice(&[0i64, 1, 2], (1, 3), &device).unwrap(); // Invalid shape
 
         let key_caches_refs: Vec<_> = key_caches.iter_mut().collect();
         let value_caches_refs: Vec<_> = value_caches.iter_mut().collect();
 
-        unsafe {
-            atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping)
-                .unwrap();
-        }
+        atoma_kernels::copy_blocks(&key_caches_refs, &value_caches_refs, block_mapping).unwrap();
     }
 }
 

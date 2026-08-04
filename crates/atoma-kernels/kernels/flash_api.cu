@@ -78,7 +78,9 @@ extern "C" void run_mha(
     bool force_split_kernel,
 
     void *softmax_lseaccum_ptr,
-    void *oaccum_ptr
+    void *oaccum_ptr,
+
+    cudaStream_t stream
 ) {
     Flash_fwd_params params;
     // Reset the parameters
@@ -154,6 +156,5 @@ extern "C" void run_mha(
     params.softmax_lseaccum_ptr = softmax_lseaccum_ptr;
     params.oaccum_ptr = oaccum_ptr;
 
-    cudaStream_t stream = 0; // Use the default stream.
     run_mha_fwd(params, stream, force_split_kernel);
 }

@@ -162,7 +162,6 @@ dependencies = [
  "bindgen_cuda",
  "candle-core",
  "candle-nn",
- "cuda-runtime-sys",
  "half",
  "serial_test",
 ]

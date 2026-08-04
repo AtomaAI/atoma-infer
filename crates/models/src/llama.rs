@@ -1051,14 +1051,14 @@ mod tests {
             std::io::stdout().flush()?;
         }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // decoding loop
         for _ in 1..sample_len {
             if tokens.len() % 16 == 1 {
-                let mut num = rng.gen_range(0..100);
+                let mut num = rng.random_range(0..100);
                 while allocated_blocks.contains(&num) {
-                    num = rng.gen_range(0..100);
+                    num = rng.random_range(0..100);
                 }
                 allocated_blocks.push(num);
             }
@@ -1072,7 +1072,7 @@ mod tests {
             let last_allocated_block = *allocated_blocks.last().unwrap();
             let slot_mapping = Tensor::new(
                 &[(last_allocated_block as i64) * (block_size as i64)
-                    + ((tokens.len() - 1) % block_size as usize) as i64],
+                    + ((tokens.len() - 1) % block_size) as i64],
                 &device,
             )?;
             let query_start_locations = Tensor::new(&[0u32, 1], &device)?;
@@ -1080,9 +1080,9 @@ mod tests {
             let sequence_lengths = Tensor::new(&[tokens.len() as u32], &device)?;
 
             let block_tables =
-                Tensor::from_vec(allocated_blocks.clone(), (1, num_blocks as usize), &device)?
+                Tensor::from_vec(allocated_blocks.clone(), (1, num_blocks), &device)?
                     .to_dtype(DType::U32)?
-                    .reshape((1, num_blocks as usize))?;
+                    .reshape((1, num_blocks))?;
 
             let num_prefill_tokens = 0;
             let num_decoding_tokens = 1;
@@ -1153,6 +1153,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[ignore = "downloads gated meta-llama weights; requires HF_API_KEY. Run with `cargo test --features cuda -- --ignored`"]
     fn test_llama_model_llama3_2_1b() -> Result<()> {
         let prompt = "The History of France starts in ".to_string();
 
@@ -1296,14 +1297,14 @@ mod tests {
             std::io::stdout().flush()?;
         }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // decoding loop
         for _ in 1..sample_len {
             if tokens.len() % 16 == 1 {
-                let mut num = rng.gen_range(0..100);
+                let mut num = rng.random_range(0..100);
                 while allocated_blocks.contains(&num) {
-                    num = rng.gen_range(0..100);
+                    num = rng.random_range(0..100);
                 }
                 allocated_blocks.push(num);
             }
@@ -1317,7 +1318,7 @@ mod tests {
             let last_allocated_block = *allocated_blocks.last().unwrap();
             let slot_mapping = Tensor::new(
                 &[(last_allocated_block as i64) * (block_size as i64)
-                    + ((tokens.len() - 1) % block_size as usize) as i64],
+                    + ((tokens.len() - 1) % block_size) as i64],
                 &device,
             )?;
             let query_start_locations = Tensor::new(&[0u32, 1], &device)?;
@@ -1325,9 +1326,9 @@ mod tests {
             let sequence_lengths = Tensor::new(&[tokens.len() as u32], &device)?;
 
             let block_tables =
-                Tensor::from_vec(allocated_blocks.clone(), (1, num_blocks as usize), &device)?
+                Tensor::from_vec(allocated_blocks.clone(), (1, num_blocks), &device)?
                     .to_dtype(DType::U32)?
-                    .reshape((1, num_blocks as usize))?;
+                    .reshape((1, num_blocks))?;
 
             let num_prefill_tokens = 0;
             let num_decoding_tokens = 1;
@@ -1508,7 +1509,7 @@ mod tests {
         let input_positions = Tensor::from_vec(
             tokens
                 .iter()
-                .flat_map(|ts| (0..(ts.len() as i64)))
+                .flat_map(|ts| 0..(ts.len() as i64))
                 .collect::<Vec<_>>(),
             (1, num_prefill_tokens),
             &device,
@@ -1619,8 +1620,7 @@ mod tests {
         token_generated += batch_size;
 
         // round division
-        let total_num_blocks_per_sequence =
-            ((token_size_allocation + block_size - 1) / block_size) as i64;
+        let total_num_blocks_per_sequence = token_size_allocation.div_ceil(block_size) as i64;
 
         let mut finished_sequences = Vec::with_capacity(batch_size);
         let mut active_indices: Vec<usize> = (0..batch_size).collect();

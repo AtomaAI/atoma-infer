@@ -4,11 +4,16 @@
 
 #pragma once
 
-// Disable dropout, softcap, local and uneven K for now
+// Disable dropout, softcap and local for now.
+//
+// Uneven K stays enabled: `HEADDIM_SWITCH` rounds a head dim up to the next compiled kernel, so
+// pinning `Is_even_K` to true makes those kernels read and write `kHeadDim` columns per row on
+// narrower tensors. Every head dim that is not already a multiple of 32 -- including the 80 and 112
+// that `models::FlashAttention::supported_head_sizes` advertises -- then returns silently wrong
+// attention output. The cost is roughly twice as many kernel instantiations to compile.
 #define FLASHATTENTION_DISABLE_DROPOUT
 #define FLASHATTENTION_DISABLE_SOFTCAP
 #define FLASHATTENTION_DISABLE_LOCAL
-#define FLASHATTENTION_DISABLE_UNEVEN_K
 
 /// @param COND       - a boolean expression to switch by
 /// @param CONST_NAME - a name given for the constexpr bool variable.

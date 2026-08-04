@@ -1,6 +1,7 @@
 use crate::{
     llm_service::LlmService,
     models::llama_nccl::LlamaModel,
+    request::ServiceRequest,
     types::{GenerateParameters, GenerateRequest},
 };
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -31,7 +32,7 @@ async fn test_llama_nccl_model() {
         llm_service.run().await.expect("Fail to run llm service");
     });
 
-    let prompts = vec!["The capital of France is ".to_string()];
+    let prompts = ["The capital of France is ".to_string()];
 
     let start = Instant::now();
     let mut futures = FuturesUnordered::new();
@@ -39,7 +40,7 @@ async fn test_llama_nccl_model() {
         let request_id = format!("{}", i);
         let (sender, receiver) = tokio::sync::oneshot::channel();
         service_request_sender
-            .send((
+            .send(ServiceRequest::GenerateRequest(
                 GenerateRequest {
                     request_id,
                     inputs: prompt.clone(),

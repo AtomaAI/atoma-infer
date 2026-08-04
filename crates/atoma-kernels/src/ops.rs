@@ -1,12 +1,6 @@
 use candle_core::{
     backend::BackendStorage,
-    cuda::{
-        cudarc::driver::{
-            result::{memcpy_dtoh_async, memcpy_htod_async},
-            CudaView, DevicePtr, DeviceSlice,
-        },
-        CudaStorageSlice,
-    },
+    cuda::{cudarc::driver::CudaView, CudaStorageSlice},
     CudaDevice, CudaStorage, InplaceOp1, InplaceOp2, Layout, Result,
 };
 use half::{bf16, f16};
@@ -91,9 +85,7 @@ impl InplaceOp2 for SwapBlockOp {
             let mut dst_block =
                 dst_bytes.slice_mut(self.dst_offset..self.dst_offset + self.block_size_in_bytes);
 
-            dst_device
-                .dtod_copy(&src_block, &mut dst_block)
-                .map_err(|e| candle_core::Error::Cuda(e.to_string().into()))?;
+            dst_device.memcpy_dtod(&src_block, &mut dst_block)?;
 
             Ok(())
         };
@@ -153,15 +145,14 @@ impl<'a> InplaceOp1 for SwapBlockCpuToGpuOp<'a> {
         // NOTE: We need to do the conversion here, as we cast the slice to u8,
         // but the layout is still in the original dtype.
         let mut dst_c = dst_c.slice_mut(dst_l.start_offset() * t_size_in_bytes..);
-        let dst_c = dst_c.slice_mut(self.dst_offset..self.dst_offset + self.block_size_in_bytes);
+        let mut dst_c =
+            dst_c.slice_mut(self.dst_offset..self.dst_offset + self.block_size_in_bytes);
 
-        let stream = dst_device
-            .fork_default_stream()
+        // The caller's stream orders this write against the surrounding device work.
+        dst_device
+            .cuda_stream()
+            .memcpy_htod(self.src_slice, &mut dst_c)
             .map_err(|e| candle_core::Error::Cuda(e.into()))?;
-        unsafe {
-            memcpy_htod_async(*dst_c.device_ptr(), self.src_slice, stream.stream)
-                .map_err(|e| candle_core::Error::Cuda(e.into()))?;
-        }
 
         Ok(())
     }
@@ -202,18 +193,23 @@ impl<'a> InplaceOp1 for SwapBlockGpuToCpuOp<'a> {
             }
         };
 
-        let stream = self
-            .cuda_device
-            .fork_default_stream()
-            .map_err(|e| candle_core::Error::Cuda(e.into()))?;
-        unsafe {
-            memcpy_dtoh_async(
+        let stream = self.cuda_device.cuda_stream();
+
+        // The caller's stream orders this copy after the device-side writes that produced
+        // `src_slice`; on any other stream it could read the block before those writes land.
+        stream
+            .memcpy_dtoh(
+                &self.src_slice,
                 &mut dst_s[self.dst_offset..self.dst_offset + self.block_size_in_bytes],
-                *self.src_slice.device_ptr(),
-                stream.stream,
             )
             .map_err(|e| candle_core::Error::Cuda(e.into()))?;
-        }
+
+        // `dst_s` is pageable host memory, which the caller reads as soon as this returns.
+        // Synchronize so the copy has completed rather than relying on the driver's
+        // pageable-transfer semantics.
+        stream
+            .synchronize()
+            .map_err(|e| candle_core::Error::Cuda(e.into()))?;
 
         Ok(())
     }

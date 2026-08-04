@@ -1,4 +1,5 @@
-exclude = [ ".git/**" ]
+# cutlass is a vendored submodule; formatting its TOML would leave the submodule dirty.
+exclude = [ ".git/**", "crates/atoma-kernels/cutlass/**" ]
 
 [formatting]
 align_comments        = true

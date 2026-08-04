@@ -61,41 +61,28 @@ extern "C" {
 
         softmax_lseaccum_ptr: *const c_void,
         oaccum_ptr: *const c_void,
+
+        stream: *mut c_void,
     );
 
-    pub(crate) fn copy_blocks_f16(
-        key_cache_ptrs: *const c_void,
-        value_cache_ptrs: *const c_void,
+    pub(crate) fn copy_blocks_cache(
+        cache: *mut c_void,
         block_mapping: *const c_void,
-        num_layers: i64,
         num_pairs: i64,
         numel_per_block: i64,
         stream: *mut c_void,
     );
 
-    pub(crate) fn copy_blocks_bf16(
-        key_cache_ptrs: *const c_void,
-        value_cache_ptrs: *const c_void,
-        block_mapping: *const c_void,
-        num_layers: i64,
-        num_pairs: i64,
-        numel_per_block: i64,
-        stream: *mut c_void,
-    );
-
-    pub(crate) fn reshape_and_cache_flash(
-        key: *const c_void,
-        value: *const c_void,
-        key_cache: *const c_void,
-        value_cache: *const c_void,
+    pub(crate) fn reshape_and_cache_flash_cache(
+        source: *const c_void,
+        cache: *mut c_void,
         slot_mapping: *const i64,
         block_stride: i64,
         num_tokens: i64,
         num_heads: i64,
         head_size: i64,
         block_size: i64,
-        key_stride: i64,
-        value_stride: i64,
+        source_stride: i64,
         dtype: u32,
         stream: *mut c_void,
     );

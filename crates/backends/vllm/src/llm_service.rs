@@ -6,10 +6,7 @@ use crate::{
     config::{CacheConfig, ModelConfig, SchedulerConfig, ValidationConfig},
     error::LlmServiceError,
     llm_engine::LlmEngine,
-    model_executor::{
-        Config, ConfigError, ModelExecutor, ModelLoaderError, ModelThreadDispatcher,
-        ModelThreadError,
-    },
+    model_executor::{Config, ModelExecutor, ModelThreadDispatcher},
     request::{EngineRequest, ServiceRequest},
     scheduler::Scheduler,
     sequence::{Sequence, SequenceGroup},

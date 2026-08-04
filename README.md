@@ -35,6 +35,32 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 Install [prek](https://prek.j178.dev/), then install and run the repository hooks with `prek install` and `prek run --all-files`.
 
+## CUDA builds
+
+The `cuda` feature compiles the flash-attention and cache-manager kernels in `crates/atoma-kernels`, which include CUTLASS headers. CUTLASS is a Git submodule at `crates/atoma-kernels/cutlass` and is not part of a plain `git clone`. Step 5 of the contributor setup checks it out; in an existing checkout, or in CI that clones without submodules, fetch it with:
+
+```shell
+git submodule update --init --depth 1 crates/atoma-kernels/cutlass
+```
+
+The build fails with missing `cutlass/...` headers if the submodule directory is empty.
+
+Building the `cuda` feature requires a CUDA toolkit providing `nvcc`, but not a GPU — `cargo check --workspace --features cuda` succeeds on a machine with no NVIDIA device. Without a visible GPU the build script cannot probe the compute capability, so set it explicitly for the target architecture:
+
+```shell
+CUDA_COMPUTE_CAP=80 cargo check --workspace --features cuda
+```
+
+The toolkit must be CUDA 13.0 or older. `candle-core 0.11` pulls in `cudarc 0.17`, which supports up to CUDA 13.0, and the build resolves against that lower ceiling even though the workspace's own `cudarc 0.19` supports up to 13.3. NVIDIA's `cuda-toolkit` metapackage currently installs 13.3, so request a specific version instead — for example `cuda-toolkit-12-9` on Ubuntu 24.04. A newer toolkit fails inside `cudarc`'s build script, not in this workspace.
+
+Compiling the kernels takes considerably longer than the Rust build. Set `ATOMA_FLASH_ATTN_BUILD_DIR` to an absolute path outside `target/` to cache the compiled kernel archive across builds:
+
+```shell
+export ATOMA_FLASH_ATTN_BUILD_DIR="$HOME/.cache/atoma-flash-attn-build"
+```
+
+Multi-GPU builds additionally enable `nccl`, which is compile-checked with `cargo check --workspace --features cuda,nccl`. Running tensor-parallel inference is not verified in this checkout.
+
 ## Configuration and running
 
 Copy the example configuration and provide the Hugging Face API key, model, cache path, and GPU device IDs for your environment:
