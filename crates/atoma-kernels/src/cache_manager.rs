@@ -4,7 +4,7 @@ use candle_core::CpuStorage;
 use candle_core::{
     backend::BackendStorage,
     cuda::{
-        cudarc::driver::{DevicePtr, DevicePtrMut, DeviceRepr},
+        cudarc::driver::{DevicePtrMut, DeviceRepr},
         CudaStorageSlice,
     },
     cuda_backend::CudaDType,
@@ -428,10 +428,10 @@ pub fn reshape_and_cache_flash(
     if key_cache.rank() != 4 || value_cache.rank() != 4 {
         candle_core::bail!("key_cache and value_cache tensors must have rank 4")
     }
-    let [num_tokens, num_heads, head_size] = key.dims() else {
+    let &[num_tokens, num_heads, head_size] = key.dims() else {
         unreachable!("key rank was checked above")
     };
-    let [num_blocks, block_size, cache_heads, cache_head_size] = key_cache.dims() else {
+    let &[num_blocks, block_size, cache_heads, cache_head_size] = key_cache.dims() else {
         unreachable!("key_cache rank was checked above")
     };
     if value.dims() != [num_tokens, num_heads, head_size]
