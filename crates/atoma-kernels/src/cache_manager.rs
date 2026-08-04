@@ -193,25 +193,54 @@ unsafe fn copy_blocks_t<
 
     let stream = cuda_device.cuda_stream();
 
+    // Computed before the storage locks below are taken, so nothing re-enters a cache tensor's
+    // lock while this function holds it.
+    let numel_per_block = key_caches[0]
+        .i(0)?
+        .shape()
+        .dims()
+        .iter()
+        .product::<usize>()
+        .try_into()
+        .unwrap();
+
+    // The storage locks and the pointer guards must both outlive the launch, so they are collected
+    // here. Binding them per iteration would drop each layer's guard before the kernel that writes
+    // that layer has even been enqueued.
+    let cache_storages: Vec<_> = key_caches
+        .iter()
+        .zip(value_caches.iter())
+        .map(|(key_cache, value_cache)| {
+            (
+                key_cache.storage_and_layout(),
+                value_cache.storage_and_layout(),
+            )
+        })
+        .collect();
+
     let mut key_cache_ptrs = Vec::with_capacity(num_layers);
     let mut value_cache_ptrs = Vec::with_capacity(num_layers);
-    for (key_cache, value_cache) in key_caches.iter().zip(value_caches.iter()) {
-        let (key_cache_storage, key_cache_layout) = key_cache.storage_and_layout();
-        let (value_cache_storage, value_cache_layout) = value_cache.storage_and_layout();
-        let (key_cache_ptr, _key_guard) = crate::utils::device_ptr::<T>(
-            &key_cache_storage,
+    let mut cache_guards = Vec::with_capacity(2 * num_layers);
+    for ((key_cache_storage, key_cache_layout), (value_cache_storage, value_cache_layout)) in
+        &cache_storages
+    {
+        // Both caches are written by `copy_blocks_kernel`.
+        let (key_cache_ptr, key_cache_guard) = crate::utils::device_ptr_write_target::<T>(
+            key_cache_storage,
             key_cache_layout,
             &stream,
             "key_cache",
         )?;
-        let (value_cache_ptr, _value_guard) = crate::utils::device_ptr::<T>(
-            &value_cache_storage,
+        let (value_cache_ptr, value_cache_guard) = crate::utils::device_ptr_write_target::<T>(
+            value_cache_storage,
             value_cache_layout,
             &stream,
             "value_cache",
         )?;
         key_cache_ptrs.push(key_cache_ptr as i64);
         value_cache_ptrs.push(value_cache_ptr as i64);
+        cache_guards.push(key_cache_guard);
+        cache_guards.push(value_cache_guard);
     }
 
     let key_cache_ptrs = Tensor::from_vec(key_cache_ptrs, (num_layers,), device)?;
@@ -244,15 +273,6 @@ unsafe fn copy_blocks_t<
         "block_mapping",
     )?;
 
-    let numel_per_block = key_caches[0]
-        .i(0)?
-        .shape()
-        .dims()
-        .iter()
-        .product::<usize>()
-        .try_into()
-        .unwrap();
-
     match dtype {
         DType::F16 => unsafe {
             ffi::copy_blocks_f16(
@@ -280,6 +300,10 @@ unsafe fn copy_blocks_t<
             candle_core::bail!("Only support f16/bf16 dtypes and src and dst must have same dtype")
         }
     }
+
+    // Dropped only now that the launch is enqueued: each guard records its cache access against
+    // `stream`, which is meaningless if it happens before the kernel is submitted.
+    drop(cache_guards);
 
     Ok(())
 }
@@ -449,8 +473,11 @@ fn reshape_and_cache_flash_t<
 
     let (k_ptr, _k_guard) = crate::utils::device_ptr::<T>(&k, k_l, &stream, "key")?;
     let (v_ptr, _v_guard) = crate::utils::device_ptr::<T>(&v, v_l, &stream, "value")?;
-    let (kc_ptr, _kc_guard) = crate::utils::device_ptr::<T>(&kc, kc_l, &stream, "key_cache")?;
-    let (vc_ptr, _vc_guard) = crate::utils::device_ptr::<T>(&vc, vc_l, &stream, "value_cache")?;
+    // `reshape_and_cache_flash_kernel` reads key/value/slot_mapping and writes both caches.
+    let (kc_ptr, _kc_guard) =
+        crate::utils::device_ptr_write_target::<T>(&kc, kc_l, &stream, "key_cache")?;
+    let (vc_ptr, _vc_guard) =
+        crate::utils::device_ptr_write_target::<T>(&vc, vc_l, &stream, "value_cache")?;
     let (slot_mapping_ptr, _slot_mapping_guard) =
         crate::utils::device_ptr::<i64>(&slot_mapping, slot_mapping_l, &stream, "slot_mapping")?;
 
