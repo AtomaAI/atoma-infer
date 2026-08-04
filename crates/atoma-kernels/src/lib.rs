@@ -5,8 +5,6 @@ mod ffi;
 pub mod ops;
 pub use cache_manager::{copy_blocks, reshape_and_cache_flash, swap_blocks};
 
-use std::mem::MaybeUninit;
-
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
 use candle_core::cuda_backend::WrapErr;
@@ -47,7 +45,7 @@ impl FlashAttention {
         let device = q.device();
         let stream = device.cuda_stream();
 
-        utils::check_gpu_compatibility(utils::device_ordinal(device))?;
+        utils::check_gpu_compatibility(device)?;
 
         if q.dtype() != k.dtype() {
             candle_core::bail!("query and key must have the same dtype");
@@ -245,14 +243,8 @@ impl FlashAttention {
             window_size_right = seqlen_k as i32;
         }
 
-        let num_splits = utils::compute_num_splits(
-            b_sz,
-            num_heads,
-            head_size,
-            seqlen_k,
-            seqlen_q,
-            utils::device_ordinal(device),
-        )?;
+        let num_splits =
+            utils::compute_num_splits(b_sz, num_heads, head_size, seqlen_k, seqlen_q, device)?;
 
         // The split-KV accumulators must stay alive until the kernel that writes them has been
         // enqueued, so they are bound here rather than inside the launch block.
@@ -662,7 +654,7 @@ impl FlashAttentionVarLen {
         let stream = dev.cuda_stream();
 
         // Check GPU device compatibility
-        utils::check_gpu_compatibility(utils::device_ordinal(dev))?;
+        utils::check_gpu_compatibility(dev)?;
 
         if q.dtype() != k.dtype() {
             candle_core::bail!("query and key must have the same dtype");
@@ -1027,7 +1019,7 @@ impl FlashAttentionVarLen {
                 head_size,
                 self.max_seqlen_k,
                 max_seqlen_q,
-                utils::device_ordinal(dev),
+                dev,
             )?
         } else {
             0
@@ -1624,7 +1616,7 @@ impl FlashAttentionKvCache {
         let stream = dev.cuda_stream();
 
         // Check GPU device compatibility
-        utils::check_gpu_compatibility(utils::device_ordinal(dev))?;
+        utils::check_gpu_compatibility(dev)?;
 
         if q.dtype() != kc.dtype() {
             candle_core::bail!("query and key must have the same dtype");
@@ -1827,14 +1819,8 @@ impl FlashAttentionKvCache {
 
         let is_bf16 = if is_bf16 { 1 } else { 0 };
 
-        let num_splits = utils::compute_num_splits(
-            batch_size,
-            num_heads,
-            head_size,
-            seqlen_k,
-            seqlen_q,
-            utils::device_ordinal(dev),
-        )?;
+        let num_splits =
+            utils::compute_num_splits(batch_size, num_heads, head_size, seqlen_k, seqlen_q, dev)?;
 
         // The split-KV accumulators must stay alive until the kernel that writes them has been
         // enqueued, so they are bound here rather than inside the launch block.
@@ -2236,8 +2222,10 @@ pub fn flash_attn_kv_cache_full(
 
 pub(crate) mod utils {
 
-    use candle_core::cuda_backend::cudarc::driver::{sys::CUdeviceptr, CudaStream, SyncOnDrop};
-    use cuda_runtime_sys::*;
+    use candle_core::cuda_backend::cudarc::driver::{
+        sys::{CUdevice_attribute, CUdeviceptr},
+        CudaStream, SyncOnDrop,
+    };
 
     use super::*;
     pub(crate) fn round_multiple(x: usize, m: usize) -> usize {
@@ -2342,7 +2330,7 @@ pub(crate) mod utils {
         head_size: usize,
         max_seqlen_k: usize,
         max_seqlen_q: usize,
-        device_ordinal: usize,
+        device: &candle_core::CudaDevice,
     ) -> Result<u32> {
         let block_n = if head_size <= 64 {
             256
@@ -2355,7 +2343,7 @@ pub(crate) mod utils {
         // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
         // In any case we don't expect seqlen_q to be larger than 64 for inference.
         let num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
-        let cuda_multiprocessor_count = get_multiprocessor_count(device_ordinal)?;
+        let cuda_multiprocessor_count = get_multiprocessor_count(device)?;
         let num_splits = num_splits_heuristic(
             batch_size * num_heads * num_m_blocks,
             cuda_multiprocessor_count * 2,
@@ -2368,36 +2356,33 @@ pub(crate) mod utils {
         Ok(num_splits as u32)
     }
 
-    pub(crate) fn get_multiprocessor_count(device_index: usize) -> Result<usize> {
-        unsafe {
-            let mut count = MaybeUninit::uninit();
-            let error = cudaDeviceGetAttribute(
-                count.as_mut_ptr(),
-                cudaDeviceAttr::cudaDevAttrMultiProcessorCount,
-                device_index as i32,
-            );
-            if error != cudaError::cudaSuccess {
-                candle_core::bail!("CUDA error: {:?}", error)
-            }
-            Ok(count.assume_init() as usize)
-        }
+    /// Returns the number of streaming multiprocessors on `device`.
+    pub(crate) fn get_multiprocessor_count(device: &candle_core::CudaDevice) -> Result<usize> {
+        let count = device
+            .cuda_stream()
+            .context()
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .w()?;
+        Ok(count as usize)
     }
 
-    pub(crate) fn check_gpu_compatibility(device_index: usize) -> Result<()> {
-        use core::ffi::c_int;
-        let mut props = cudaDeviceProp::default();
-        unsafe {
-            let error =
-                cudaGetDeviceProperties(&mut props as *mut cudaDeviceProp, device_index as c_int);
-            if error != cudaError::cudaSuccess {
-                candle_core::bail!("CUDA error: {:?}", error)
-            }
-            let is_sm8x = props.major == 8 && props.minor >= 0;
-            let is_sm90 = props.major == 9 && props.minor == 0;
-
-            if !(is_sm90 || is_sm8x) {
-                candle_core::bail!("FlashAttention only supports Ampere GPUs or newer.")
-            }
+    /// Rejects devices the vendored flash-attention kernels were not compiled for.
+    ///
+    /// Only Ampere/Ada (`sm_8x`) and Hopper (`sm_90`) are accepted, matching the `sm80` kernel
+    /// sources; anything else is turned away with a typed error instead of a launch failure.
+    ///
+    /// The compute capability is read through the driver API rather than the runtime API's
+    /// `cudaGetDeviceProperties`: the `cudaDeviceProp` layout has grown across CUDA releases, so
+    /// bindings generated for one toolkit overflow the caller's buffer when the process links a
+    /// newer `libcudart`.
+    pub(crate) fn check_gpu_compatibility(device: &candle_core::CudaDevice) -> Result<()> {
+        let (major, minor) = device.cuda_stream().context().compute_capability().w()?;
+        let is_sm8x = major == 8;
+        let is_sm90 = major == 9 && minor == 0;
+        if !(is_sm8x || is_sm90) {
+            candle_core::bail!(
+                "FlashAttention only supports Ampere GPUs or newer, got compute capability {major}.{minor}"
+            )
         }
         Ok(())
     }
