@@ -133,19 +133,27 @@ impl CacheConfig {
             .expect("Failed to generated config file");
 
         let dtype = DType::from_str(&this.cache_dtype)?;
-        if this.swap_space_bytes.is_none() {
-            assert!(this.swap_space_fraction.is_some());
-            let swap_space_fraction = this.swap_space_fraction.unwrap();
-            this.swap_space_bytes = Some(utils::calculate_swap_space(swap_space_fraction)?);
-            this.num_cpu_blocks = Some(utils::calculate_num_cpu_blocks(
-                this.block_size,
-                dtype,
-                num_hidden_layers,
-                num_kv_heads,
-                hidden_dim,
-                this.swap_space_bytes.unwrap(),
-            )?);
-        }
+        let swap_space_bytes = match this.swap_space_bytes {
+            Some(swap_space_bytes) => swap_space_bytes,
+            None => {
+                let swap_space_fraction = this.swap_space_fraction.ok_or_else(|| {
+                    CacheConfigError::InvalidSwapSpace(
+                        "Cannot leave unspecified both `swap_space_fraction` and `swap_space_bytes`"
+                            .to_string(),
+                    )
+                })?;
+                utils::calculate_swap_space(swap_space_fraction)?
+            }
+        };
+        this.swap_space_bytes = Some(swap_space_bytes);
+        this.num_cpu_blocks = Some(utils::calculate_num_cpu_blocks(
+            this.block_size,
+            dtype,
+            num_hidden_layers,
+            num_kv_heads,
+            hidden_dim,
+            swap_space_bytes,
+        )?);
 
         if let Some(num_gpu_blocks_override) = this.num_gpu_blocks_override {
             this.num_gpu_blocks = Some(num_gpu_blocks_override);
