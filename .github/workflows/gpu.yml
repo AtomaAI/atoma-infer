@@ -37,3 +37,8 @@ jobs:
 
       - name: Run CUDA workspace tests
         run: cargo test --workspace --features cuda --locked
+
+      # The nccl-gated code has its own tests — tensor-parallel divisibility among them — which the
+      # cuda-only run above never compiles.
+      - name: Run NCCL workspace tests
+        run: cargo test --workspace --features cuda,nccl --locked
