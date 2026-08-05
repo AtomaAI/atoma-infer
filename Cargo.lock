@@ -164,6 +164,7 @@ dependencies = [
  "candle-nn",
  "half",
  "serial_test",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

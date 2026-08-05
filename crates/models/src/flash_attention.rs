@@ -1,6 +1,6 @@
 use atoma_kernels::{
     copy_blocks, flash_attn_kv_cache_full, flash_attn_varlen, flash_attn_varlen_with_block_table,
-    reshape_and_cache_flash, swap_blocks,
+    reshape_and_cache_flash, swap_blocks, Capability, KernelError,
 };
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use std::collections::HashMap;
@@ -185,9 +185,6 @@ pub struct FlashAttention {
     pub softmax_scale: f32,
     /// Alibi slopes,
     pub alibi_slopes: Option<Tensor>,
-    /// Sliding window, for local attention,
-    /// only supports causal sliding window
-    pub sliding_window: Option<usize>,
     /// Key and value cache dtype
     pub kv_cache_dtype: DType,
     /// Device, in most cases it should be
@@ -196,7 +193,11 @@ pub struct FlashAttention {
 }
 
 impl FlashAttention {
-    /// Constructor
+    /// Constructor.
+    ///
+    /// A `sliding_window` is rejected here rather than on the first prefix-cached prefill, which
+    /// is the only forward path that would otherwise carry it into the kernels: every other path
+    /// drops it, so an accepted window would produce full attention without saying so.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_heads: usize,
@@ -216,6 +217,9 @@ impl FlashAttention {
         if !Self::supported_head_sizes().contains(&(head_dim as u32)) {
             candle_core::bail!("head_dim {head_dim} is not supported")
         }
+        if sliding_window.is_some() {
+            return Err(KernelError::unsupported(Capability::SlidingWindow).into());
+        }
         Ok(Self {
             num_heads,
             num_kv_heads,
@@ -223,7 +227,6 @@ impl FlashAttention {
             head_dim,
             softmax_scale,
             alibi_slopes,
-            sliding_window,
             kv_cache_dtype,
             device,
         })
@@ -442,8 +445,8 @@ impl FlashAttention {
                     prefill_metadata.max_prefill_sequence_length,
                     max_sequence_length_k,
                     self.softmax_scale,
-                    self.sliding_window,
-                    None,
+                    /* window_size_left */ None,
+                    /* window_size_right */ None,
                     prefill_metadata.block_tables.as_ref(),
                 )?;
                 output.slice_set(&out, 0, 0)?;
@@ -506,6 +509,17 @@ mod tests {
     }
 
     #[test]
+    fn test_new_rejects_sliding_window() {
+        let device = Device::Cpu;
+        let result = FlashAttention::new(8, 4, 64, 1.0, None, Some(4096), DType::F32, device);
+        let error = result
+            .err()
+            .expect("a sliding window must be rejected, not silently ignored")
+            .to_string();
+        assert!(error.contains("sliding-window attention"), "{error}");
+    }
+
+    #[test]
     fn test_supported_head_sizes() {
         let sizes = FlashAttention::supported_head_sizes();
         assert_eq!(sizes, vec![64, 80, 96, 112, 128, 192, 256]);
@@ -555,7 +569,6 @@ mod tests {
             head_dim: 32,
             softmax_scale: 1.0,
             alibi_slopes: None,
-            sliding_window: None,
             kv_cache_dtype: DType::BF16,
             device: device.clone(),
         };
@@ -649,7 +662,6 @@ mod tests {
             head_dim: 8,
             softmax_scale: 0.5,
             alibi_slopes: None,
-            sliding_window: None,
             kv_cache_dtype: DType::F16,
             device: device.clone(),
         };

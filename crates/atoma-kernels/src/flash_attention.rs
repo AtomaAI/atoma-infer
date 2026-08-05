@@ -1,0 +1,2426 @@
+use crate::error::check_supported_capabilities;
+use crate::ffi;
+use candle_core::backend::BackendStorage;
+use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+use candle_core::cuda_backend::WrapErr;
+use candle_core::{CpuStorage, DType, Layout, Result, Shape, Tensor};
+use half::{bf16, f16};
+
+/// Flash-attention v2 layer.
+pub struct FlashAttention {
+    /// Softmax scale
+    pub softmax_scale: f32,
+    /// Alibi slopes,
+    /// see https://nn.labml.ai/transformers/alibi/index.html
+    pub alibi_slopes: Option<Tensor>,
+    /// Window size for left sided local attention
+    pub window_size_left: Option<usize>,
+    /// Window size for right sided local attention
+    pub window_size_right: Option<usize>,
+    /// Softcap parameter, used in Grok and Gemma2 models
+    pub softcap: Option<f32>,
+}
+
+impl FlashAttention {
+    #[allow(clippy::too_many_arguments)]
+    fn cuda_fwd_t<
+        T: candle_core::cuda_backend::CudaDType
+            + candle_core::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        q: &candle_core::CudaStorage,
+        q_l: &Layout,
+        k: &candle_core::CudaStorage,
+        k_l: &Layout,
+        v: &candle_core::CudaStorage,
+        v_l: &Layout,
+        is_bf16: bool,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        // https://github.com/Dao-AILab/flash-attention/blob/7551202cb2dd245432bc878447e19015c0af3c22/csrc/flash_attn/flash_api.cpp#L341
+        check_supported_capabilities(self.softcap, self.window_size_left, self.window_size_right)?;
+
+        let device = q.device();
+        let stream = device.cuda_stream();
+
+        utils::check_gpu_compatibility(device)?;
+
+        if q.dtype() != k.dtype() {
+            candle_core::bail!("query and key must have the same dtype");
+        }
+
+        if q.dtype() != v.dtype() {
+            candle_core::bail!("query and value must have the same dtype");
+        }
+
+        // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d)
+        // in this case
+        let q = q.as_cuda_slice::<T>()?;
+        let k = k.as_cuda_slice::<T>()?;
+        let v = v.as_cuda_slice::<T>()?;
+        let q = q.slice(q_l.start_offset()..);
+        let k = k.slice(k_l.start_offset()..);
+        let v = v.slice(v_l.start_offset()..);
+
+        let (b_sz, seqlen_q, num_heads, head_size_og) = q_l.shape().dims4()?;
+        let (_b_sz, seqlen_k, num_heads_k, _head_size_og) = k_l.shape().dims4()?;
+
+        let seqlenq_ngroups_swapped = seqlen_q == 1
+            && num_heads > num_heads_k
+            && self.window_size_left.is_none()
+            && self.window_size_right.is_none()
+            && head_size_og % 8 == 0
+            && self.alibi_slopes.is_none();
+        // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d)
+        // in this case
+        let (q_l, out_l, out_shape, seqlen_q, num_heads) = if seqlenq_ngroups_swapped {
+            let ngroups = num_heads / num_heads_k;
+            let new_shape = Shape::from((b_sz, ngroups, num_heads_k, head_size_og));
+
+            // Create new layout for q, maintaining the original start_offset
+            let new_q_l = Layout::contiguous_with_offset(&new_shape, q_l.start_offset());
+
+            (
+                new_q_l,
+                Layout::contiguous(&new_shape),
+                new_shape,
+                ngroups,
+                num_heads_k,
+            )
+        } else {
+            let out_shape = q_l.shape().clone();
+            (
+                q_l.clone(),
+                Layout::contiguous(&out_shape),
+                out_shape,
+                seqlen_q,
+                num_heads,
+            )
+        };
+
+        let q_stride = q_l.stride();
+        let k_stride = k_l.stride();
+        let v_stride = v_l.stride();
+        let o_stride = out_l.stride();
+
+        let q_rank = q_stride.len();
+        let k_rank = k_stride.len();
+        let v_rank = v_stride.len();
+        let o_rank = o_stride.len();
+
+        if q_rank != 4 || k_rank != 4 || v_rank != 4 {
+            candle_core::bail!(
+                "flash-attn expects input tensors of rank 4 (q: {q_rank}, k: {k_rank}, v: {v_rank})"
+            )
+        }
+
+        if q_stride[q_rank - 1] != 1 {
+            candle_core::bail!("the last dim of q must be contiguous {q_stride:?}")
+        }
+        if k_stride[k_rank - 1] != 1 {
+            candle_core::bail!("the last dim of k must be contiguous {k_stride:?}")
+        }
+        if v_stride[v_rank - 1] != 1 {
+            candle_core::bail!("the last dim of v must be contiguous {v_stride:?}")
+        }
+
+        let expected_kv = (b_sz, seqlen_k, num_heads_k, head_size_og);
+
+        if expected_kv != k_l.shape().dims4()? {
+            candle_core::bail!("shape mismatch q {:?} and k {:?}", q_l.shape(), k_l.shape())
+        }
+        if expected_kv != v_l.shape().dims4()? {
+            candle_core::bail!("shape mismatch q {:?} and v {:?}", q_l.shape(), v_l.shape())
+        }
+        if head_size_og > 256 {
+            candle_core::bail!("only supports head dimension at most 256 (got {head_size_og})")
+        }
+        if head_size_og % 8 != 0 {
+            // TODO: Handle head sizes that are not a multiple of 8 via some padding.
+            candle_core::bail!(
+                "only supports head sizes that are a multiple of 8 (got {head_size_og})"
+            )
+        }
+        if num_heads % num_heads_k != 0 {
+            candle_core::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
+        }
+
+        // Bound outside the block below so the read guard produced by `device_ptr` outlives the
+        // kernel launch that consumes the pointer.
+        let alibi_slopes_storage = self
+            .alibi_slopes
+            .as_ref()
+            .map(|alibi_slopes| alibi_slopes.storage_and_layout());
+
+        let (alibi_slopes_ptr, alibi_slopes_batch_stride, _alibi_slopes_guard) =
+            if let (Some(alibi_slopes), Some((alibi_slopes_storage, alibi_slopes_layout))) =
+                (&self.alibi_slopes, &alibi_slopes_storage)
+            {
+                if alibi_slopes.dtype() != DType::F32 {
+                    candle_core::bail!(
+                        "DType mismatch alibi_slopes {:?}, expected {:?}",
+                        alibi_slopes.dtype(),
+                        DType::F32
+                    );
+                }
+
+                let alibi_slopes_batch_stride = if alibi_slopes.dims().len() == 2 {
+                    alibi_slopes.stride()[0]
+                } else {
+                    0
+                };
+
+                if num_heads != alibi_slopes_layout.shape().dims1()? {
+                    candle_core::bail!(
+                        "shape mismatch alibi_slopes {:?}, expected {:?}",
+                        alibi_slopes_layout.shape(),
+                        (num_heads)
+                    );
+                }
+
+                // Unlike the varlen and kv-cache paths, this one takes the pointer at the
+                // allocation base without applying the layout's start offset. That predates this
+                // port, and #155 is a mechanical port that preserves existing behavior, so the
+                // difference is kept rather than silently changing attention numerics. It belongs
+                // with the kernel-defect fixes in #156.
+                let alibi_slopes_slice = match &**alibi_slopes_storage {
+                    candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                    _ => candle_core::bail!("alibi_slopes must be a cuda tensor"),
+                };
+                let (alibi_slopes_ptr, alibi_slopes_guard) = alibi_slopes_slice.device_ptr(&stream);
+
+                (
+                    alibi_slopes_ptr as *const core::ffi::c_void,
+                    alibi_slopes_batch_stride,
+                    Some(alibi_slopes_guard),
+                )
+            } else {
+                (std::ptr::null(), 0, None)
+            };
+
+        // if window_size_left > self.max_seqlen_k or None => -1
+        let mut window_size_left = self
+            .window_size_left
+            .filter(|v| v <= &seqlen_k)
+            .map(|v| v as i32)
+            .unwrap_or(-1);
+
+        // if window_size_right > self.max_seqlen_k or None => -1
+        let mut window_size_right = self
+            .window_size_right
+            .filter(|v| v <= &seqlen_k)
+            .map(|v| v as i32)
+            .unwrap_or(-1);
+
+        let mut is_causal = if window_size_left < 0 && window_size_right == 0 {
+            1
+        } else {
+            0
+        };
+        if seqlen_q == 1 && self.alibi_slopes.is_none() {
+            is_causal = 0;
+        }
+
+        let head_size = utils::round_multiple(head_size_og, 8);
+        let head_size_rounded = utils::round_multiple(head_size, 32);
+        let seqlen_q_rounded = utils::round_multiple(seqlen_q, 128);
+        let seqlen_k_rounded = utils::round_multiple(seqlen_k, 128);
+
+        let elem_count = out_shape.elem_count();
+        let mut dst = unsafe { stream.alloc::<T>(elem_count) }.w()?;
+        // The kernels write the LSE as `[b, h, seqlen_q]` whenever `unpadded_lse` is false, which
+        // is what this path passes.
+        let mut softmax_lse = stream.alloc_zeros::<f32>(b_sz * num_heads * seqlen_q).w()?;
+
+        let is_bf16 = if is_bf16 { 1 } else { 0 };
+
+        if window_size_left < 0 && window_size_right >= 0 {
+            window_size_left = seqlen_k as i32;
+        }
+        if window_size_left >= 0 && window_size_right < 0 {
+            window_size_right = seqlen_k as i32;
+        }
+
+        let num_splits =
+            utils::compute_num_splits(b_sz, num_heads, head_size, seqlen_k, seqlen_q, device)?;
+
+        // The split-KV accumulators must stay alive until the kernel that writes them has been
+        // enqueued, so they are bound here rather than inside the launch block.
+        let mut split_accumulators = if num_splits > 1 {
+            Some((
+                stream
+                    .alloc_zeros::<f32>(num_splits as usize * b_sz * num_heads * seqlen_q)
+                    .w()?,
+                stream
+                    .alloc_zeros::<f32>(
+                        num_splits as usize * b_sz * num_heads * seqlen_q * head_size_rounded,
+                    )
+                    .w()?,
+            ))
+        } else {
+            None
+        };
+
+        // Softcap is rejected at entry, so the kernel always runs with the caller's scale.
+        let scale_softmax_log2 = self.softmax_scale * std::f32::consts::LOG2_E;
+
+        unsafe {
+            let (q_ptr, _q_guard) = q.device_ptr(&stream);
+            let (k_ptr, _k_guard) = k.device_ptr(&stream);
+            let (v_ptr, _v_guard) = v.device_ptr(&stream);
+            let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&stream);
+            let (softmax_lse_ptr, _softmax_lse_guard) = softmax_lse.device_ptr_mut(&stream);
+            let q_ptr = q_ptr as *const core::ffi::c_void;
+            let k_ptr = k_ptr as *const core::ffi::c_void;
+            let v_ptr = v_ptr as *const core::ffi::c_void;
+            let dst_ptr = dst_ptr as *const core::ffi::c_void;
+            let softmax_lse_ptr = softmax_lse_ptr as *const core::ffi::c_void;
+            let (q_batch_stride, o_batch_stride) = if !seqlenq_ngroups_swapped {
+                (q_stride[0] as u32, o_stride[0] as u32)
+            } else {
+                (
+                    (q_stride[0] * seqlen_q) as u32,
+                    (o_stride[0] * seqlen_q) as u32,
+                )
+            };
+            let (softmax_lseaccum_ptr, oaccum_ptr, _split_guards) = match &mut split_accumulators {
+                Some((softmax_lseaccum, oaccum)) => {
+                    let (softmax_lseaccum_ptr, softmax_lseaccum_guard) =
+                        softmax_lseaccum.device_ptr_mut(&stream);
+                    let (oaccum_ptr, oaccum_guard) = oaccum.device_ptr_mut(&stream);
+                    (
+                        softmax_lseaccum_ptr as *const core::ffi::c_void,
+                        oaccum_ptr as *const core::ffi::c_void,
+                        Some((softmax_lseaccum_guard, oaccum_guard)),
+                    )
+                }
+                None => (std::ptr::null(), std::ptr::null(), None),
+            };
+            ffi::run_mha(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                dst_ptr,
+                softmax_lse_ptr,
+                /* alibi_slopes_ptr */ alibi_slopes_ptr,
+                /* cu_seqlens_q_ptr */ std::ptr::null(),
+                /* cu_seqlens_k_ptr */ std::ptr::null(),
+                /* is_seqlens_k_cumulative */ true,
+                /* q_batch_stride */ q_batch_stride,
+                /* k_batch_stride */ k_stride[0] as u32,
+                /* v_batch_stride */ v_stride[0] as u32,
+                /* o_batch_stride */ o_batch_stride,
+                /* alibi_slopes_batch_stride */ alibi_slopes_batch_stride as u32,
+                /* q_row_stride */ q_stride[q_rank - 3] as u32,
+                /* k_row_stride */ k_stride[k_rank - 3] as u32,
+                /* v_row_stride */ v_stride[v_rank - 3] as u32,
+                /* o_row_stride */ o_stride[o_rank - 3] as u32,
+                /* q_head_stride */ q_stride[q_rank - 2] as u32,
+                /* k_head_stride */ k_stride[k_rank - 2] as u32,
+                /* v_head_stride */ v_stride[v_rank - 2] as u32,
+                /* o_head_stride */ o_stride[o_rank - 2] as u32,
+                /* num_splits */ num_splits,
+                /* b */ b_sz as u32,
+                /* h */ num_heads as u32,
+                /* h_k */ num_heads_k as u32,
+                /* d */ head_size as u32,
+                /* d_rounded */ head_size_rounded as u32,
+                /* softmax_scale */ self.softmax_scale,
+                /* scale_softmax_log2 */ scale_softmax_log2,
+                /* block_table */ std::ptr::null(),
+                /* block_table_batch_stride */ 0,
+                /* page_block_size */ 0,
+                /* seqused_k */ std::ptr::null(),
+                /* seqlen_q */ seqlen_q as u32,
+                /* seqlen_k */ seqlen_k as u32,
+                /* total_q */ (b_sz * seqlen_q) as u32,
+                /* seqlen_q_rounded */ seqlen_q_rounded as u32,
+                /* seqlen_k_rounded */ seqlen_k_rounded as u32,
+                /* is_bf16 */ is_bf16,
+                /* is_causal */ is_causal,
+                /* window_size_left */ window_size_left,
+                /* window_size_right */ window_size_right,
+                /* softcap */ 0.0,
+                /* unpadded_lse */ false,
+                /* force_split_kernel */ false,
+                /* softmax_lseaccum_ptr */ softmax_lseaccum_ptr,
+                /* oaccum_ptr */ oaccum_ptr,
+                /* stream */ stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        }
+        ffi::check_launch("run_mha", unsafe { ffi::flash_last_error() })?;
+
+        let out_shape = if seqlenq_ngroups_swapped {
+            Shape::from((b_sz, 1, num_heads_k * seqlen_q, head_size_og))
+        } else {
+            out_shape
+        };
+
+        let dst = candle_core::CudaStorage::wrap_cuda_slice(dst, device.clone());
+        Ok((dst, out_shape))
+    }
+}
+
+impl candle_core::CustomOp3 for FlashAttention {
+    fn name(&self) -> &'static str {
+        "flash-attn"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("no cpu support for flash-attn")
+    }
+
+    fn cuda_fwd(
+        &self,
+        q: &candle_core::CudaStorage,
+        q_l: &Layout,
+        k: &candle_core::CudaStorage,
+        k_l: &Layout,
+        v: &candle_core::CudaStorage,
+        v_l: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        match q.dtype() {
+            candle_core::DType::F16 => self.cuda_fwd_t::<f16>(q, q_l, k, k_l, v, v_l, false),
+            candle_core::DType::BF16 => self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true),
+            dt => candle_core::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
+        }
+    }
+}
+
+/// Flash-attention v2 layer.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(batch, seq_len_q, num_heads_q, head_size)`.
+/// * `k` - Key tensor with shape `(batch, seq_len_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(batch, seq_len_kv, num_heads_kv, head_size)`.
+///
+/// The resulting tensor has dimensions `(batch, seq_len_q, num_heads_q, head_size)`.
+pub fn flash_attn(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    let window_size_left = None;
+    let window_size_right = if causal { Some(0) } else { None };
+
+    let op = FlashAttention {
+        softmax_scale,
+        alibi_slopes: None,
+        window_size_left,
+        window_size_right,
+        softcap: None,
+    };
+    q.apply_op3(k, v, op)
+}
+
+/// Flash-attention v2 layer.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(batch, seq_len_q, num_heads_q, head_size)`.
+/// * `k` - Key tensor with shape `(batch, seq_len_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(batch, seq_len_kv, num_heads_kv, head_size)`.
+/// * `window_size_left` - Limit left attention to value tokens.
+/// * `window_size_right` - Limit right attention to value tokens.
+///
+/// # Causal mask
+///
+/// `window_size_left=None` with `window_size_right=Some(0)` applies a causal mask to the result of
+/// `Q @ K^T`. Any other window requests sliding-window attention, which the compiled kernels drop;
+/// it is rejected with
+/// [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
+///
+/// The resulting tensor has dimensions `(batch, seq_len_q, num_heads_q, head_size)`.
+pub fn flash_attn_windowed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+) -> Result<Tensor> {
+    let op = FlashAttention {
+        softmax_scale,
+        alibi_slopes: None,
+        window_size_left,
+        window_size_right,
+        softcap: None,
+    };
+    q.apply_op3(k, v, op)
+}
+
+/// Flash-attention v2 layer.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(batch, seq_len_q, num_heads_q, head_size)`.
+/// * `k` - Key tensor with shape `(batch, seq_len_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(batch, seq_len_kv, num_heads_kv, head_size)`.
+/// * `alibi_slopes` - Alibi slopes tensor with shape `(num_heads_q)`.
+///
+/// The resulting tensor has dimensions `(batch, seq_len_q, num_heads_q, head_size)`.
+pub fn flash_attn_alibi(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alibi_slopes: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    let window_size_left = None;
+    let window_size_right = if causal { Some(0) } else { None };
+
+    let op = FlashAttention {
+        softmax_scale,
+        alibi_slopes: Some(alibi_slopes.clone()),
+        window_size_left,
+        window_size_right,
+        softcap: None,
+    };
+    q.apply_op3(k, v, op)
+}
+
+/// Flash-attention v2 layer.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(batch, seq_len_q, num_heads_q, head_size)`.
+/// * `k` - Key tensor with shape `(batch, seq_len_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(batch, seq_len_kv, num_heads_kv, head_size)`.
+/// * `alibi_slopes` - Alibi slopes tensor with shape `(num_heads_q)`.
+/// * `window_size_left` - Limit left attention to value tokens.
+/// * `window_size_right` - Limit right attention to value tokens.
+///
+/// # Causal mask
+///
+/// `window_size_left=None` with `window_size_right=Some(0)` applies a causal mask to the result of
+/// `Q @ K^T`. Any other window requests sliding-window attention, which the compiled kernels drop;
+/// it is rejected with
+/// [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
+///
+/// The resulting tensor has dimensions `(batch, seq_len_q, num_heads_q, head_size)`.
+pub fn flash_attn_alibi_windowed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alibi_slopes: &Tensor,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+) -> Result<Tensor> {
+    let op = FlashAttention {
+        softmax_scale,
+        alibi_slopes: Some(alibi_slopes.clone()),
+        window_size_left,
+        window_size_right,
+        softcap: None,
+    };
+    q.apply_op3(k, v, op)
+}
+
+/// Flash-attention v2 layer.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(batch, seq_len_q, num_heads_q, head_size)`.
+/// * `k` - Key tensor with shape `(batch, seq_len_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(batch, seq_len_kv, num_heads_kv, head_size)`.
+/// * `alibi_slopes` - Alibi slopes tensor with shape `(num_heads_q)`.
+/// * `window_size_left` - Limit left attention to value tokens.
+/// * `window_size_right` - Limit right attention to value tokens.
+///
+/// # Causal mask
+///
+/// `window_size_left=None` with `window_size_right=Some(0)` applies a causal mask to the result of
+/// `Q @ K^T`. Any other window requests sliding-window attention, which the compiled kernels drop;
+/// it is rejected with
+/// [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
+///
+/// # Softcap
+///
+/// Softcap, used by Grok and Gemma 2, is dropped by the compiled kernels; any positive value is
+/// rejected with [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
+///
+/// The resulting tensor has dimensions `(batch, seq_len_q, num_heads_q, head_size)`.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_alibi_windowed_with_softcap(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alibi_slopes: &Tensor,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+    softcap: Option<f32>,
+) -> Result<Tensor> {
+    let op = FlashAttention {
+        softmax_scale,
+        alibi_slopes: Some(alibi_slopes.clone()),
+        window_size_left,
+        window_size_right,
+        softcap,
+    };
+    q.apply_op3(k, v, op)
+}
+
+/// Flash-attention v2 layer, with variable sequence lengths.
+struct FlashAttentionVarLen {
+    /// Softmax scale
+    pub softmax_scale: f32,
+    /// Maximum sequence length of Query tensor
+    pub max_seqlen_q: usize,
+    /// Maximum sequence length of Key tensor
+    pub max_seqlen_k: usize,
+    /// Cumulative sequence lengths for the query tensor,
+    /// of shape `[batch_size + 1, ]`
+    pub seqlens_q: Tensor,
+    /// Cumulative sequence lengths for the key tensor,
+    /// of shape `[batch_size + 1, ]`
+    pub seqlens_k: Tensor,
+    /// The sequence used for keys tensor. If given,
+    /// only this many elements of each batch element's keys are used,
+    /// of shape `[batch_size, ]`
+    pub seqused_k: Option<Tensor>,
+    /// Block table, used for paged attention algorithm
+    /// of shape [batch_size, max_num_block_per_sequence]
+    pub block_table: Option<Tensor>,
+    /// Alibi slopes, see https://nn.labml.ai/transformers/alibi/index.html,
+    /// of shape `[num_heads, ]` or `[batch_size, num_heads]`
+    pub alibi_slopes: Option<Tensor>,
+    /// Window size for left sided local attention
+    pub window_size_left: Option<usize>,
+    /// Window size for right sided local attention
+    pub window_size_right: Option<usize>,
+    /// Softcap parameter, used in Grok and Gemma2 models
+    pub softcap: Option<f32>,
+}
+
+impl FlashAttentionVarLen {
+    #[allow(clippy::too_many_arguments)]
+    fn cuda_fwd_t<
+        T: candle_core::cuda_backend::CudaDType
+            + candle_core::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        q: &candle_core::CudaStorage,
+        q_l: &Layout, // shape: `[total_q,  num_heads, head_size]`, total_q := \sum_{i=0}^{b} s_i
+        k: &candle_core::CudaStorage,
+        k_l: &Layout, /* shape: `[total_k, num_heads_k, head_size]`, total_k := \sum_{i=0}^{b}
+                       * s_i or `[num_blocks, page_block_size, num_heads_k, head_size]` if
+                       * `self.block_table.is_some()`. */
+        v: &candle_core::CudaStorage,
+        v_l: &Layout, /* shape: `[total_k, num_heads_k, head_size]`, total_k := \sum_{i=0}^{b}
+                       * s_i or `[num_blocks, page_block_size, num_heads_k, head_size]` if
+                       * `self.block_table.is_some()`. */
+        is_bf16: bool,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        // https://github.com/Dao-AILab/flash-attention/blob/7551202cb2dd245432bc878447e19015c0af3c22/csrc/flash_attn/flash_api.cpp#L528
+        check_supported_capabilities(self.softcap, self.window_size_left, self.window_size_right)?;
+
+        let dev = q.device();
+        let stream = dev.cuda_stream();
+
+        // Check GPU device compatibility
+        utils::check_gpu_compatibility(dev)?;
+
+        if q.dtype() != k.dtype() {
+            candle_core::bail!("query and key must have the same dtype");
+        }
+
+        if q.dtype() != v.dtype() {
+            candle_core::bail!("query and value must have the same dtype");
+        }
+
+        utils::check_index_tensor(&self.seqlens_q, "seqlens_q")?;
+        utils::check_index_tensor(&self.seqlens_k, "seqlens_k")?;
+
+        let (seqlens_q, seqlens_q_layout) = self.seqlens_q.storage_and_layout();
+        let seqlens_q = match &*seqlens_q {
+            candle_core::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle_core::bail!("seqlens_q must be a cuda tensor"),
+        };
+        let seqlens_q = match seqlens_q_layout.contiguous_offsets() {
+            Some((o1, o2)) => seqlens_q.slice(o1..o2),
+            None => candle_core::bail!("seqlens_q has to be contiguous"),
+        };
+
+        let (seqlens_k, seqlens_k_layout) = self.seqlens_k.storage_and_layout();
+        let seqlens_k = match &*seqlens_k {
+            candle_core::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
+            _ => candle_core::bail!("seqlens_k must be a cuda tensor"),
+        };
+        let seqlens_k = match seqlens_k_layout.contiguous_offsets() {
+            Some((o1, o2)) => seqlens_k.slice(o1..o2),
+            None => candle_core::bail!("seqlens_k has to be contiguous"),
+        };
+
+        let q = q.as_cuda_slice::<T>()?;
+        let k = k.as_cuda_slice::<T>()?;
+        let v = v.as_cuda_slice::<T>()?;
+        let q = q.slice(q_l.start_offset()..);
+        let k = k.slice(k_l.start_offset()..);
+        let v = v.slice(v_l.start_offset()..);
+
+        let nseqlens_q = seqlens_q_layout.shape().dims1()?;
+        let batch_size = nseqlens_q - 1;
+        let (total_q, num_heads, head_size_og) = q_l.shape().dims3()?;
+
+        // Bound outside the block below so the read guard outlives the kernel launch.
+        let block_table_storage = self
+            .block_table
+            .as_ref()
+            .map(|block_table| block_table.storage_and_layout());
+
+        let (block_table_ptr, block_table_layout, _block_table_guard) =
+            if let (Some(block_table), Some((block_table_storage, block_table_layout))) =
+                (&self.block_table, &block_table_storage)
+            {
+                utils::check_index_tensor(block_table, "block_table")?;
+                let block_table_stride = block_table_layout.stride();
+                let block_table_rank = block_table_stride.len();
+                if block_table_stride[block_table_rank - 1] != 1 {
+                    candle_core::bail!("block_table must be contiguous")
+                }
+                let (block_table_ptr, block_table_guard) = utils::device_ptr::<u32>(
+                    block_table_storage,
+                    block_table_layout,
+                    &stream,
+                    "block_table",
+                )?;
+                (
+                    block_table_ptr as *const i32,
+                    Some(*block_table_layout),
+                    Some(block_table_guard),
+                )
+            } else {
+                (std::ptr::null(), None, None)
+            };
+
+        let (num_blocks, total_k, num_heads_k, head_size_og) = if !block_table_ptr.is_null() {
+            k_l.shape().dims4()?
+        } else {
+            let (total_k, num_heads_k, _head_size_og) = k_l.shape().dims3()?;
+            (0, total_k, num_heads_k, head_size_og)
+        };
+
+        let seqlenq_ngroups_swapped = self.max_seqlen_q == 1
+            && num_heads > num_heads_k
+            && self.window_size_left.is_none()
+            && self.window_size_right.is_none()
+            && head_size_og % 8 == 0
+            && self.alibi_slopes.is_none();
+        // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d)
+        // in this case
+        let (q_l, out_l, out_shape, max_seqlen_q, num_heads) = if seqlenq_ngroups_swapped {
+            let ngroups = num_heads / num_heads_k;
+            let new_shape = Shape::from((batch_size, ngroups, num_heads_k, head_size_og));
+
+            // Create new layout for q, maintaining the original start_offset
+            let new_q_l = Layout::contiguous_with_offset(&new_shape, q_l.start_offset());
+            // TODO: use `Layout` reshape
+            (
+                new_q_l,
+                Layout::contiguous(&new_shape),
+                new_shape,
+                ngroups,
+                num_heads_k,
+            )
+        } else {
+            let out_shape = q_l.shape().clone();
+            (
+                q_l.clone(),
+                Layout::contiguous(&out_shape),
+                out_shape,
+                self.max_seqlen_q,
+                num_heads,
+            )
+        };
+
+        let q_stride = q_l.stride();
+        let k_stride = k_l.stride();
+        let v_stride = v_l.stride();
+        let o_stride = out_l.stride();
+
+        let q_rank = q_stride.len();
+        let k_rank = k_stride.len();
+        let v_rank = v_stride.len();
+        let o_rank = o_stride.len();
+
+        if block_table_ptr.is_null() && (q_rank != 3 || k_rank != 3 || v_rank != 3) {
+            candle_core::bail!(
+                "flash-attn-varlen expects input tensors of rank 3 (q: {q_rank}, k: {k_rank}, v: {v_rank}"
+            )
+        } else if !block_table_ptr.is_null() && (q_rank != 3 || k_rank != 4 || v_rank != 4) {
+            candle_core::bail!(
+                "flash-attn-varlen expects input tensors of rank 4 (q: {q_rank}, k: {k_rank}, v: {v_rank}"
+            )
+        }
+        if q_stride[q_rank - 1] != 1 {
+            candle_core::bail!("the last dim of q must be contiguous {q_stride:?}")
+        }
+        if k_stride[k_rank - 1] != 1 {
+            candle_core::bail!("the last dim of k must be contiguous {k_stride:?}")
+        }
+        if v_stride[v_rank - 1] != 1 {
+            candle_core::bail!("the last dim of v must be contiguous {v_stride:?}")
+        }
+
+        let max_num_blocks_per_sequence = if let Some(layout) = block_table_layout {
+            let (b_sz, max_num_blocks_per_sequence) = layout.shape().dims2()?;
+            if b_sz != batch_size {
+                candle_core::bail!(
+                    "shape mismatch of block_table (got {:?}) expected {:?})",
+                    layout.shape(),
+                    (batch_size, max_num_blocks_per_sequence)
+                )
+            }
+            max_num_blocks_per_sequence
+        } else {
+            0
+        };
+
+        let page_block_size = if block_table_layout.is_some() {
+            total_k
+        } else {
+            1
+        };
+
+        if !block_table_ptr.is_null() && page_block_size % 16 != 0 {
+            // NOTE: We are following the vLLM flash attention fork, where the paged
+            // block size must be divisible by 16. In the actual flash attention
+            // repository, the paged block size must be divisible by 256, instead.
+            // TODO: benchmark the performance of block sizes such as
+            // [16, 32, 64, 128, 256]
+            candle_core::bail!("page_block_size must be a multiple of 16, got {page_block_size}")
+        }
+
+        if batch_size == 0 {
+            candle_core::bail!("batch_size must be > 0")
+        }
+        if head_size_og > 256 {
+            candle_core::bail!("only supports head dimension at most 256 (got {head_size_og})")
+        }
+        if head_size_og % 8 != 0 {
+            // TODO: Handle head sizes that are not a multiple of 8 via some padding.
+            candle_core::bail!(
+                "only supports head sizes that are a multiple of 8 (got {head_size_og})"
+            )
+        }
+        if num_heads % num_heads_k != 0 {
+            candle_core::bail!("number of k/v heads {num_heads_k} must divide number of heads in query {num_heads}")
+        }
+
+        if let Some(layout) = block_table_layout {
+            if k_l.shape().dims4()? != (num_blocks, page_block_size, num_heads_k, head_size_og) {
+                candle_core::bail!(
+                    "shape mismatch of k (got {:?}) expected {:?})",
+                    k_l.shape(),
+                    (num_blocks, page_block_size, num_heads_k, head_size_og)
+                )
+            }
+            if v_l.shape().dims4()? != (num_blocks, page_block_size, num_heads_k, head_size_og) {
+                candle_core::bail!(
+                    "shape mismatch of v (got {:?}) expected {:?})",
+                    v_l.shape(),
+                    (num_blocks, page_block_size, num_heads_k, head_size_og)
+                )
+            }
+            if layout.shape().dims2()? != (batch_size, max_num_blocks_per_sequence) {
+                candle_core::bail!(
+                    "shape mismatch of block_table (got {:?}) expected {:?})",
+                    layout.shape(),
+                    (batch_size, max_num_blocks_per_sequence)
+                )
+            }
+        } else {
+            if k_l.shape().dims3()? != (total_k, num_heads_k, head_size_og) {
+                candle_core::bail!(
+                    "shape mismatch of k (got {:?}) expected {:?})",
+                    k_l.shape(),
+                    (total_k, num_heads_k, head_size_og)
+                )
+            }
+            if v_l.shape().dims3()? != (total_k, num_heads_k, head_size_og) {
+                candle_core::bail!(
+                    "shape mismatch of v (got {:?}) expected {:?})",
+                    v_l.shape(),
+                    (total_k, num_heads_k, head_size_og)
+                )
+            }
+        }
+
+        if seqlens_k_layout.shape().dims1()? != batch_size + 1 {
+            candle_core::bail!(
+                "shape mismatch of seqlens_k (got {:?}) expected {:?})",
+                seqlens_k_layout.shape(),
+                (batch_size + 1)
+            )
+        }
+        if seqlens_q_layout.shape().dims1()? != batch_size + 1 {
+            candle_core::bail!(
+                "shape mismatch of seqlens_q (got {:?}) expected {:?})",
+                seqlens_q_layout.shape(),
+                (batch_size + 1)
+            )
+        }
+
+        if nseqlens_q < 2 {
+            candle_core::bail!("seqlens_q should have a len >= 2 {nseqlens_q}")
+        }
+        let nseqlens_k = seqlens_k_layout.shape().dims1()?;
+        if nseqlens_k != nseqlens_q {
+            candle_core::bail!("seqlens_q and seqlens_k should have the same number of elements {nseqlens_q} <> {nseqlens_k}")
+        }
+
+        // Bound outside the block below so the read guard produced by `device_ptr` outlives the
+        // kernel launch that consumes the pointer.
+        let alibi_slopes_storage = self
+            .alibi_slopes
+            .as_ref()
+            .map(|alibi_slopes| alibi_slopes.storage_and_layout());
+
+        let (alibi_slopes_ptr, alibi_slopes_batch_stride, _alibi_slopes_guard) =
+            if let (Some(alibi_slopes), Some((alibi_slopes_storage, alibi_slopes_layout))) =
+                (&self.alibi_slopes, &alibi_slopes_storage)
+            {
+                if alibi_slopes.dtype() != DType::F32 {
+                    candle_core::bail!(
+                        "DType mismatch alibi_slopes {:?}, expected {:?}",
+                        alibi_slopes.dtype(),
+                        DType::F32
+                    );
+                }
+
+                let alibi_slopes_batch_stride = if alibi_slopes.dims().len() == 2 {
+                    alibi_slopes.stride()[0]
+                } else {
+                    0
+                };
+
+                if num_heads != alibi_slopes_layout.shape().dims1()? {
+                    candle_core::bail!(
+                        "shape mismatch alibi_slopes {:?}, expected {:?}",
+                        alibi_slopes_layout.shape(),
+                        (num_heads)
+                    );
+                }
+
+                let (alibi_slopes_ptr, alibi_slopes_guard) = utils::device_ptr::<f32>(
+                    alibi_slopes_storage,
+                    alibi_slopes_layout,
+                    &stream,
+                    "alibi_slopes",
+                )?;
+
+                (
+                    alibi_slopes_ptr as *const core::ffi::c_void,
+                    alibi_slopes_batch_stride,
+                    Some(alibi_slopes_guard),
+                )
+            } else {
+                (std::ptr::null(), 0, None)
+            };
+
+        // Bound outside the block below so the read guard outlives the kernel launch.
+        let seqused_k_storage = self
+            .seqused_k
+            .as_ref()
+            .map(|seqused_k| seqused_k.storage_and_layout());
+
+        let (seqused_k, _seqused_k_guard) =
+            if let (Some(seqused_k), Some((seqused_k_storage, seqused_k_layout))) =
+                (&self.seqused_k, &seqused_k_storage)
+            {
+                utils::check_index_tensor(seqused_k, "seqused_k")?;
+                let seqused_k_stride = seqused_k_layout.stride();
+                let seqused_k_rank = seqused_k_stride.len();
+                if seqused_k_stride[seqused_k_rank - 1] != 1 {
+                    candle_core::bail!("seqused_k must be contiguous")
+                }
+                let (seqused_k_ptr, seqused_k_guard) = utils::device_ptr::<u32>(
+                    seqused_k_storage,
+                    seqused_k_layout,
+                    &stream,
+                    "seqused_k",
+                )?;
+                (seqused_k_ptr as *const i32, Some(seqused_k_guard))
+            } else {
+                (std::ptr::null(), None)
+            };
+
+        // if window_size_left > self.max_seqlen_k or None => -1
+        let mut window_size_left = self
+            .window_size_left
+            .filter(|v| v <= &self.max_seqlen_k)
+            .map(|v| v as i32)
+            .unwrap_or(-1);
+
+        // if window_size_right > self.max_seqlen_k or None => -1
+        let mut window_size_right = self
+            .window_size_right
+            .filter(|v| v <= &self.max_seqlen_k)
+            .map(|v| v as i32)
+            .unwrap_or(-1);
+
+        let head_size = utils::round_multiple(head_size_og, 8);
+        let head_size_rounded = utils::round_multiple(head_size, 32);
+        let seqlen_q_rounded = utils::round_multiple(self.max_seqlen_q, 128);
+        let seqlen_k_rounded = utils::round_multiple(self.max_seqlen_k, 128);
+
+        let elem_count = out_shape.elem_count();
+        let mut dst = unsafe { stream.alloc::<T>(elem_count) }.w()?;
+        // With `unpadded_lse` the kernels write the LSE as `[h, total_q]`, indexed through
+        // `params.total_q`.
+        let mut softmax_lse = stream.alloc_zeros::<f32>(total_q * num_heads).w()?;
+
+        let is_bf16 = if is_bf16 { 1 } else { 0 };
+
+        // Causal is the special case where window_size_right == 0 and window_size_left < 0.
+        // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
+        let is_causal = if window_size_left < 0 && window_size_right == 0 {
+            1
+        } else {
+            0
+        };
+        if window_size_left < 0 && window_size_right >= 0 {
+            window_size_left = self.max_seqlen_k as i32;
+        }
+        if window_size_left >= 0 && window_size_right < 0 {
+            window_size_right = self.max_seqlen_k as i32;
+        }
+
+        let num_splits = if seqlenq_ngroups_swapped {
+            // Only apply split-k for decoding
+            utils::compute_num_splits(
+                batch_size,
+                num_heads,
+                head_size,
+                self.max_seqlen_k,
+                max_seqlen_q,
+                dev,
+            )?
+        } else {
+            0
+        };
+
+        // The split-KV accumulators must stay alive until the kernel that writes them has been
+        // enqueued, so they are bound here rather than inside the launch block.
+        let mut split_accumulators = if num_splits > 1 {
+            Some((
+                unsafe {
+                    stream.alloc::<f32>(num_splits as usize * batch_size * num_heads * max_seqlen_q)
+                }
+                .w()?,
+                unsafe {
+                    stream.alloc::<f32>(
+                        num_splits as usize
+                            * batch_size
+                            * num_heads
+                            * max_seqlen_q
+                            * head_size_rounded,
+                    )
+                }
+                .w()?,
+            ))
+        } else {
+            None
+        };
+
+        // Softcap is rejected at entry, so the kernel always runs with the caller's scale.
+        let scale_softmax_log2 = self.softmax_scale * std::f32::consts::LOG2_E;
+
+        unsafe {
+            let (q_ptr, _q_guard) = q.device_ptr(&stream);
+            let (k_ptr, _k_guard) = k.device_ptr(&stream);
+            let (v_ptr, _v_guard) = v.device_ptr(&stream);
+            let q_ptr = q_ptr as *const core::ffi::c_void;
+            let k_ptr = k_ptr as *const core::ffi::c_void;
+            let v_ptr = v_ptr as *const core::ffi::c_void;
+            let block_table_batch_stride = if let Some(layout) = block_table_layout {
+                layout.stride()[0] as u32
+            } else {
+                0
+            };
+            let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&stream);
+            let (softmax_lse_ptr, _softmax_lse_guard) = softmax_lse.device_ptr_mut(&stream);
+            let dst_ptr = dst_ptr as *const core::ffi::c_void;
+            let softmax_lse_ptr = softmax_lse_ptr as *const core::ffi::c_void;
+            let (seqlens_q_ptr, _seqlens_q_guard) = if !seqlenq_ngroups_swapped {
+                let (ptr, guard) = seqlens_q.device_ptr(&stream);
+                (ptr as *const core::ffi::c_int, Some(guard))
+            } else {
+                (std::ptr::null(), None)
+            };
+            let (seqlens_k_ptr, _seqlens_k_guard) = seqlens_k.device_ptr(&stream);
+            let seqlens_k_ptr = seqlens_k_ptr as *const core::ffi::c_int;
+            let (q_batch_stride, o_batch_stride) =
+                match (seqlens_q_ptr.is_null(), seqlenq_ngroups_swapped) {
+                    (false, _) => (0, 0),
+                    (true, true) => (
+                        (q_stride[0] * max_seqlen_q) as u32,
+                        (o_stride[0] * max_seqlen_q) as u32,
+                    ),
+                    (true, false) => (q_stride[0] as u32, o_stride[0] as u32),
+                };
+            let (k_batch_stride, v_batch_stride) = block_table_layout
+                .as_ref()
+                .map(|_| (k_stride[0] as u32, v_stride[0] as u32))
+                .unwrap_or((0, 0));
+            // TODO: handle case where max_seqlen_q == 0, separately
+            let (softmax_lseaccum_ptr, oaccum_ptr, _split_guards) = match &mut split_accumulators {
+                Some((softmax_lseaccum, oaccum)) => {
+                    let (softmax_lseaccum_ptr, softmax_lseaccum_guard) =
+                        softmax_lseaccum.device_ptr_mut(&stream);
+                    let (oaccum_ptr, oaccum_guard) = oaccum.device_ptr_mut(&stream);
+                    (
+                        softmax_lseaccum_ptr as *const core::ffi::c_void,
+                        oaccum_ptr as *const core::ffi::c_void,
+                        Some((softmax_lseaccum_guard, oaccum_guard)),
+                    )
+                }
+                None => (std::ptr::null(), std::ptr::null(), None),
+            };
+            ffi::run_mha(
+                /* q_ptr */ q_ptr,
+                /* k_ptr */ k_ptr,
+                /* v_ptr */ v_ptr,
+                /* o_ptr */ dst_ptr,
+                /* softmax_lse_ptr */ softmax_lse_ptr,
+                /* alibi_slopes_ptr */ alibi_slopes_ptr,
+                /* cu_seqlens_q_ptr */ seqlens_q_ptr,
+                /* cu_seqlens_k_ptr */ seqlens_k_ptr,
+                /* is_seqlens_k_cumulative */ true,
+                /* q_batch_stride */ q_batch_stride,
+                /* k_batch_stride */ k_batch_stride,
+                /* v_batch_stride */ v_batch_stride,
+                /* o_batch_stride */ o_batch_stride,
+                /* alibi_slopes_batch_stride */ alibi_slopes_batch_stride as u32,
+                /* q_row_stride */ q_stride[q_rank - 3] as u32,
+                /* k_row_stride */ k_stride[k_rank - 3] as u32,
+                /* v_row_stride */ v_stride[v_rank - 3] as u32,
+                /* o_row_stride */ o_stride[o_rank - 3] as u32,
+                /* q_head_stride */ q_stride[q_rank - 2] as u32,
+                /* k_head_stride */ k_stride[k_rank - 2] as u32,
+                /* v_head_stride */ v_stride[v_rank - 2] as u32,
+                /* o_head_stride */ o_stride[o_rank - 2] as u32,
+                /* num_splits */ num_splits,
+                /* b */ batch_size as u32,
+                /* h */ num_heads as u32,
+                /* h_k */ num_heads_k as u32,
+                /* d */ head_size as u32,
+                /* d_rounded */ head_size_rounded as u32,
+                /* softmax_scale */ self.softmax_scale,
+                /* scale_softmax_log2 */ scale_softmax_log2,
+                /* block_table */ block_table_ptr,
+                /* block_table_batch_stride */ block_table_batch_stride,
+                /* page_block_size */ page_block_size as i32,
+                /* seqused_k */ seqused_k,
+                /* seqlen_q */ self.max_seqlen_q as u32,
+                /* seqlen_k */ self.max_seqlen_k as u32,
+                /* total_q */ total_q as u32,
+                /* seqlen_q_rounded */ seqlen_q_rounded as u32,
+                /* seqlen_k_rounded */ seqlen_k_rounded as u32,
+                /* is_bf16 */ is_bf16,
+                /* is_causal */ is_causal,
+                /* window_size_left */ window_size_left,
+                /* window_size_right */ window_size_right,
+                /* softcap */ 0.0,
+                /* unpadded_lse */ true,
+                /* force_split_kernel */ !block_table_ptr.is_null(),
+                /* softmax_lseaccum_ptr */ softmax_lseaccum_ptr,
+                /* oaccum_ptr */ oaccum_ptr,
+                /* stream */ stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        }
+        ffi::check_launch("run_mha", unsafe { ffi::flash_last_error() })?;
+
+        let out_shape = if seqlenq_ngroups_swapped {
+            Shape::from((batch_size, 1, num_heads_k * max_seqlen_q, head_size_og))
+        } else {
+            out_shape
+        };
+
+        let dst = candle_core::CudaStorage::wrap_cuda_slice(dst, dev.clone());
+        Ok((dst, out_shape))
+    }
+}
+
+impl candle_core::CustomOp3 for FlashAttentionVarLen {
+    fn name(&self) -> &'static str {
+        "flash-attn-varlen"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("no cpu support for flash-attn")
+    }
+
+    fn cuda_fwd(
+        &self,
+        q: &candle_core::CudaStorage,
+        q_l: &Layout,
+        k: &candle_core::CudaStorage,
+        k_l: &Layout,
+        v: &candle_core::CudaStorage,
+        v_l: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        match q.dtype() {
+            candle_core::DType::F16 => self.cuda_fwd_t::<f16>(q, q_l, k, k_l, v, v_l, false),
+            candle_core::DType::BF16 => self.cuda_fwd_t::<bf16>(q, q_l, k, k_l, v, v_l, true),
+            dt => candle_core::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Flash-attention v2 layer with variable-length batching.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(total_q, num_heads_q, head_size)`.
+/// * `k` - Key tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `seqlens_q` - The cumulative lengths of the sequences in the batch, used to index in q.
+/// * `seqlens_k` - The cumulative lengths of the sequences in the batch, used to index in k and v.
+/// * `max_seqlen_q` - The maximum query sequence length for q in the batch.
+/// * `max_seqlen_k` - The maximum query sequence length for k and v in the batch.
+///
+/// `seqlens_q` and `seqlens_k` contain `batch_size + 1` elements, typically `0`, `seqlen_1`,
+/// `seqlen_1 + seqlen_2`, etc.
+///
+/// The resulting tensor has dimensions `(total_q, num_heads_q, head_size)`.
+pub fn flash_attn_varlen(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seqlens_q: &Tensor,
+    seqlens_k: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    let window_size_left = None;
+    let window_size_right = if causal { Some(0) } else { None };
+
+    let op = FlashAttentionVarLen {
+        softmax_scale,
+        max_seqlen_q,
+        max_seqlen_k,
+        seqlens_q: seqlens_q.clone(),
+        seqlens_k: seqlens_k.clone(),
+        alibi_slopes: None,
+        window_size_left,
+        window_size_right,
+        softcap: None,
+        block_table: None,
+        seqused_k: None,
+    };
+    q.apply_op3(k, v, op)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Flash-attention v2 layer with variable-length batching.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(total_q, num_heads_q, head_size)`.
+/// * `k` - Key tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `seqlens_q` - The cumulative lengths of the sequences in the batch, used to index in q.
+/// * `seqlens_k` - The cumulative lengths of the sequences in the batch, used to index in k and v.
+/// * `max_seqlen_q` - The maximum query sequence length for q in the batch.
+/// * `max_seqlen_k` - The maximum query sequence length for k and v in the batch.
+/// * `window_size_left` - Limit left attention to value tokens.
+/// * `window_size_right` - Limit right attention to value tokens.
+///
+/// `seqlens_q` and `seqlens_k` contain `batch_size + 1` elements, typically `0`, `seqlen_1`,
+/// `seqlen_1 + seqlen_2`, etc.
+///
+/// The resulting tensor has dimensions `(total_q, num_heads_q, head_size)`.
+///
+/// # Causal mask
+///
+/// `window_size_left=None` with `window_size_right=Some(0)` applies a causal mask to the result of
+/// `Q @ K^T`. Any other window requests sliding-window attention, which the compiled kernels drop;
+/// it is rejected with
+/// [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
+pub fn flash_attn_varlen_windowed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seqlens_q: &Tensor,
+    seqlens_k: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+) -> Result<Tensor> {
+    let op = FlashAttentionVarLen {
+        softmax_scale,
+        max_seqlen_q,
+        max_seqlen_k,
+        seqlens_q: seqlens_q.clone(),
+        seqlens_k: seqlens_k.clone(),
+        alibi_slopes: None,
+        window_size_left,
+        window_size_right,
+        softcap: None,
+        block_table: None,
+        seqused_k: None,
+    };
+    q.apply_op3(k, v, op)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Flash-attention v2 layer with variable-length batching.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(total_q, num_heads_q, head_size)`.
+/// * `k` - Key tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `alibi_slopes` - Alibi slopes tensor with shape `(num_heads_q)`.
+/// * `seqlens_q` - The cumulative lengths of the sequences in the batch, used to index in q.
+/// * `seqlens_k` - The cumulative lengths of the sequences in the batch, used to index in k and v.
+/// * `max_seqlen_q` - The maximum query sequence length for q in the batch.
+/// * `max_seqlen_k` - The maximum query sequence length for k and v in the batch.
+///
+/// `seqlens_q` and `seqlens_k` contain `batch_size + 1` elements, typically `0`, `seqlen_1`,
+/// `seqlen_1 + seqlen_2`, etc.
+///
+/// The resulting tensor has dimensions `(total_q, num_heads_q, head_size)`.
+pub fn flash_attn_varlen_alibi(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alibi_slopes: &Tensor,
+    seqlens_q: &Tensor,
+    seqlens_k: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    let window_size_left = None;
+    let window_size_right = if causal { Some(0) } else { None };
+
+    let op = FlashAttentionVarLen {
+        softmax_scale,
+        max_seqlen_q,
+        max_seqlen_k,
+        seqlens_q: seqlens_q.clone(),
+        seqlens_k: seqlens_k.clone(),
+        alibi_slopes: Some(alibi_slopes.clone()),
+        window_size_left,
+        window_size_right,
+        softcap: None,
+        block_table: None,
+        seqused_k: None,
+    };
+    q.apply_op3(k, v, op)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Flash-attention v2 layer with variable-length batching.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(total_q, num_heads_q, head_size)`.
+/// * `k` - Key tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `alibi_slopes` - Alibi slopes tensor with shape `(num_heads_q)`.
+/// * `seqlens_q` - The cumulative lengths of the sequences in the batch, used to index in q.
+/// * `seqlens_k` - The cumulative lengths of the sequences in the batch, used to index in k and v.
+/// * `max_seqlen_q` - The maximum query sequence length for q in the batch.
+/// * `max_seqlen_k` - The maximum query sequence length for k and v in the batch.
+/// * `window_size_left` - Limit left attention to value tokens.
+/// * `window_size_right` - Limit right attention to value tokens.
+///
+/// `seqlens_q` and `seqlens_k` contain `batch_size + 1` elements, typically `0`, `seqlen_1`,
+/// `seqlen_1 + seqlen_2`, etc.
+///
+/// The resulting tensor has dimensions `(total_q, num_heads_q, head_size)`.
+///
+/// # Causal mask
+///
+/// `window_size_left=None` with `window_size_right=Some(0)` applies a causal mask to the result of
+/// `Q @ K^T`. Any other window requests sliding-window attention, which the compiled kernels drop;
+/// it is rejected with
+/// [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
+pub fn flash_attn_varlen_alibi_windowed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alibi_slopes: &Tensor,
+    seqlens_q: &Tensor,
+    seqlens_k: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+) -> Result<Tensor> {
+    let op = FlashAttentionVarLen {
+        softmax_scale,
+        max_seqlen_q,
+        max_seqlen_k,
+        seqlens_q: seqlens_q.clone(),
+        seqlens_k: seqlens_k.clone(),
+        alibi_slopes: Some(alibi_slopes.clone()),
+        window_size_left,
+        window_size_right,
+        block_table: None,
+        seqused_k: None,
+        softcap: None,
+    };
+    q.apply_op3(k, v, op)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Flash-attention v2 layer with variable-length batching.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(total_q, num_heads_q, head_size)`.
+/// * `k` - Key tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `alibi_slopes` - Alibi slopes tensor with shape `(num_heads_q)`.
+/// * `seqlens_q` - The cumulative lengths of the sequences in the batch, used to index in q.
+/// * `seqlens_k` - The cumulative lengths of the sequences in the batch, used to index in k and v.
+/// * `max_seqlen_q` - The maximum query sequence length for q in the batch.
+/// * `max_seqlen_k` - The maximum query sequence length for k and v in the batch.
+/// * `window_size_left` - Limit left attention to value tokens.
+/// * `window_size_right` - Limit right attention to value tokens.
+///
+/// `seqlens_q` and `seqlens_k` contain `batch_size + 1` elements, typically `0`, `seqlen_1`,
+/// `seqlen_1 + seqlen_2`, etc.
+///
+/// The resulting tensor has dimensions `(total_q, num_heads_q, head_size)`.
+///
+/// # Causal mask
+///
+/// `window_size_left=None` with `window_size_right=Some(0)` applies a causal mask to the result of
+/// `Q @ K^T`. Any other window requests sliding-window attention, which the compiled kernels drop;
+/// it is rejected with
+/// [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
+///
+/// # Block table
+///
+/// Enables the paged attention algorithm. The block table is a tensor of shape `[batch_size,
+/// max_num_block_per_sequence]` that contains the block table for each sequence in the batch. The
+/// block table is used to determine the the number of blocks per sequence.
+pub fn flash_attn_varlen_with_block_table(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alibi_slopes: Option<&Tensor>,
+    seqlens_q: &Tensor,
+    seqlens_k: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+    block_table: Option<&Tensor>,
+) -> Result<Tensor> {
+    let op = FlashAttentionVarLen {
+        softmax_scale,
+        max_seqlen_q,
+        max_seqlen_k,
+        seqlens_q: seqlens_q.clone(),
+        seqlens_k: seqlens_k.clone(),
+        alibi_slopes: alibi_slopes.cloned(),
+        window_size_left,
+        window_size_right,
+        block_table: block_table.cloned(),
+        seqused_k: None,
+        softcap: None,
+    };
+    q.apply_op3(k, v, op)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Flash-attention v2 layer with variable-length batching.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `(total_q, num_heads_q, head_size)`.
+/// * `k` - Key tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `v` - Value tensor with shape `(total_kv, num_heads_kv, head_size)`.
+/// * `alibi_slopes` - Alibi slopes tensor with shape `(num_heads_q)`.
+/// * `seqlens_q` - The cumulative lengths of the sequences in the batch, used to index in q.
+/// * `seqlens_k` - The cumulative lengths of the sequences in the batch, used to index in k and v.
+/// * `max_seqlen_q` - The maximum query sequence length for q in the batch.
+/// * `max_seqlen_k` - The maximum query sequence length for k and v in the batch.
+/// * `window_size_left` - Limit left attention to value tokens.
+/// * `window_size_right` - Limit right attention to value tokens.
+///
+/// `seqlens_q` and `seqlens_k` contain `batch_size + 1` elements, typically `0`, `seqlen_1`,
+/// `seqlen_1 + seqlen_2`, etc.
+///
+/// The resulting tensor has dimensions `(total_q, num_heads_q, head_size)`.
+///
+/// # Causal mask
+///
+/// `window_size_left=None` with `window_size_right=Some(0)` applies a causal mask to the result of
+/// `Q @ K^T`. Any other window requests sliding-window attention, which the compiled kernels drop;
+/// it is rejected with
+/// [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
+///
+/// # Block table
+///
+/// Enables the paged attention algorithm. The block table is a tensor of shape `[batch_size,
+/// max_num_block_per_sequence]` that contains the block table for each sequence in the batch. The
+/// block table is used to determine the the number of blocks per sequence.
+///
+/// # Softcap
+///
+/// Softcap, used by Grok and Gemma 2, is dropped by the compiled kernels; any positive value is
+/// rejected with [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
+///
+/// The resulting tensor has dimensions `(batch, seq_len_q, num_heads_q, head_size)`.
+pub fn flash_attn_varlen_full(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alibi_slopes: Option<&Tensor>,
+    seqlens_q: &Tensor,
+    seqlens_k: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+    block_table: Option<&Tensor>,
+    seqused_k: Option<&Tensor>,
+    softcap: Option<f32>,
+) -> Result<Tensor> {
+    let op = FlashAttentionVarLen {
+        softmax_scale,
+        max_seqlen_q,
+        max_seqlen_k,
+        seqlens_q: seqlens_q.clone(),
+        seqlens_k: seqlens_k.clone(),
+        alibi_slopes: alibi_slopes.cloned(),
+        window_size_left,
+        window_size_right,
+        block_table: block_table.cloned(),
+        seqused_k: seqused_k.cloned(),
+        softcap,
+    };
+    q.apply_op3(k, v, op)
+}
+
+/// Flash-attention v2 layer, with Key-Value cache.
+///
+/// NOTE: We are not passing in each Key and Value tensor for the decoding phase. This is
+/// because we plan to use paged attention with flash attention.
+/// In that case, the key and value tensors at each decoding phase are stored within the
+/// kv cache tensor, separately. So we don't need to pass the key and value tensors to the
+/// flash attention kernel, directly.
+struct FlashAttentionKvCache {
+    /// Softmax scale
+    pub softmax_scale: f32,
+    /// Block table, used for paged attention algorithm
+    /// of shape [batch_size, max_num_block_per_sequence]
+    pub block_table: Option<Tensor>,
+    /// Alibi slopes, see https://nn.labml.ai/transformers/alibi/index.html,
+    /// of shape `[num_heads, ]` or `[batch_size, num_heads]`
+    pub alibi_slopes: Option<Tensor>,
+    /// Window size for left sided slicing attention
+    pub window_size_left: Option<usize>,
+    /// Window size for right sided slicing attention
+    pub window_size_right: Option<usize>,
+    /// Sequence lengths for the key tensor,
+    /// of shape `[batch_size, ]`
+    pub seqlens_k: Option<Tensor>,
+}
+
+impl FlashAttentionKvCache {
+    #[allow(clippy::too_many_arguments)]
+    fn cuda_fwd_t<
+        T: candle_core::cuda_backend::CudaDType
+            + candle_core::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        q: &candle_core::CudaStorage,
+        q_l: &Layout, /* shape: `[batch_size, seqlen_q, num_heads, head_size]`, total_q :=
+                       * \sum_{i=0}^{b} s_i */
+        kc: &candle_core::CudaStorage,
+        kc_l: &Layout, /* shape: `[batch_size_cache, seqlen_k, num_heads_k, head_size]`, or
+                        * `[num_blocks, page_block_size, num_heads_k, head_size]` if
+                        * `self.block_table.is_some()`. */
+        vc: &candle_core::CudaStorage,
+        vc_l: &Layout, /* shape: `[batch_size_cache, seqlen_k, num_heads_k, head_size]`, or
+                        * `[num_blocks, page_block_size, num_heads_k, head_size]` if
+                        * `self.block_table.is_some()`. */
+        is_bf16: bool,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        // https://github.com/Dao-AILab/flash-attention/blob/7551202cb2dd245432bc878447e19015c0af3c22/csrc/flash_attn/flash_api.cpp#L1284
+        // This path has no softcap parameter, so only the window sizes can request an
+        // unsupported capability.
+        check_supported_capabilities(None, self.window_size_left, self.window_size_right)?;
+
+        let dev = q.device();
+        let stream = dev.cuda_stream();
+
+        // Check GPU device compatibility
+        utils::check_gpu_compatibility(dev)?;
+
+        if q.dtype() != kc.dtype() {
+            candle_core::bail!("query and key must have the same dtype");
+        }
+
+        if q.dtype() != vc.dtype() {
+            candle_core::bail!("query and value must have the same dtype");
+        }
+
+        // Bound outside the block below so the read guard outlives the kernel launch.
+        let block_table_storage = self
+            .block_table
+            .as_ref()
+            .map(|block_table| block_table.storage_and_layout());
+
+        let (block_table_ptr, block_table_layout, _block_table_guard) =
+            if let (Some(block_table), Some((block_table_storage, block_table_layout))) =
+                (&self.block_table, &block_table_storage)
+            {
+                utils::check_index_tensor(block_table, "block_table")?;
+                let block_table_stride = block_table_layout.stride();
+                let block_table_rank = block_table_stride.len();
+                if block_table_stride[block_table_rank - 1] != 1 {
+                    candle_core::bail!("block_table must be contiguous")
+                }
+                let (block_table_ptr, block_table_guard) = utils::device_ptr::<u32>(
+                    block_table_storage,
+                    block_table_layout,
+                    &stream,
+                    "block_table",
+                )?;
+                (
+                    block_table_ptr as *const i32,
+                    Some(*block_table_layout),
+                    Some(block_table_guard),
+                )
+            } else {
+                (std::ptr::null(), None, None)
+            };
+
+        let (batch_size, seqlen_q, num_heads, head_size_og) = q_l.shape().dims4()?;
+        let max_num_blocks_per_sequence = if let Some(layout) = block_table_layout {
+            let (b_sz, max_num_blocks_per_sequence) = layout.shape().dims2()?;
+            if b_sz != batch_size {
+                candle_core::bail!(
+                    "shape mismatch of block_table (got {:?}) expected {:?})",
+                    layout.shape(),
+                    (batch_size, max_num_blocks_per_sequence)
+                )
+            }
+            max_num_blocks_per_sequence
+        } else {
+            0
+        };
+
+        let (_num_blocks, page_block_size, seqlen_k, num_heads_k) = if !block_table_ptr.is_null() {
+            let (num_blocks, page_block_size, num_heads_k, _head_size) = kc_l.shape().dims4()?;
+            (
+                num_blocks,
+                page_block_size,
+                max_num_blocks_per_sequence * page_block_size,
+                num_heads_k,
+            )
+        } else {
+            let (_b_sz_c, seqlen_k, num_heads_k, _head_size) = kc_l.shape().dims4()?;
+            (0, 1, seqlen_k, num_heads_k)
+        };
+
+        if !block_table_ptr.is_null() && page_block_size % 16 != 0 {
+            candle_core::bail!(
+                "page_block_size must be a multiple of 16 when block_table is provided"
+            )
+        }
+
+        let mut window_size_left = self.window_size_left.map(|i| i as i32);
+        let mut window_size_right = self.window_size_right.map(|i| i as i32);
+
+        if let Some(w) = window_size_left {
+            if w >= seqlen_k as i32 {
+                window_size_left = Some(-1);
+            }
+        }
+        if let Some(w) = window_size_right {
+            if w >= seqlen_k as i32 {
+                window_size_right = Some(-1);
+            }
+        }
+
+        let mut window_size_left = window_size_left.unwrap_or(-1);
+        let mut window_size_right = window_size_right.unwrap_or(-1);
+
+        let mut is_causal = window_size_left < 0 && window_size_right == 0;
+        // causal=true is the same as causal=false in this case
+        if seqlen_q == 1 && self.alibi_slopes.is_none() {
+            is_causal = false;
+        }
+        if is_causal {
+            window_size_right = 0;
+        }
+
+        if window_size_left < 0 && window_size_right >= 0 {
+            window_size_left = seqlen_k as i32;
+        }
+        if window_size_right < 0 && window_size_left >= 0 {
+            window_size_right = seqlen_k as i32;
+        }
+
+        let out_shape = q_l.shape().clone();
+        let out_l = Layout::contiguous(&out_shape);
+
+        let q = q.as_cuda_slice::<T>()?;
+        let kc = kc.as_cuda_slice::<T>()?;
+        let vc = vc.as_cuda_slice::<T>()?;
+        let q = q.slice(q_l.start_offset()..);
+        let kc = kc.slice(kc_l.start_offset()..);
+        let vc = vc.slice(vc_l.start_offset()..);
+
+        let q_stride = q_l.stride();
+        let kc_stride = kc_l.stride();
+        let vc_stride = vc_l.stride();
+        let o_stride = out_l.stride();
+
+        let q_rank = q_stride.len();
+        let kc_rank = kc_stride.len();
+        let vc_rank = vc_stride.len();
+        let o_rank = o_stride.len();
+
+        if q_rank != 4 || kc_rank != 4 || vc_rank != 4 {
+            candle_core::bail!(
+                "flash-attn expects input tensors of rank 4 (q: {q_rank}, k: {kc_rank}, v: {vc_rank})"
+            )
+        }
+
+        if q_stride[q_rank - 1] != 1 {
+            candle_core::bail!("the last dim of q must be contiguous {q_stride:?}")
+        }
+        if kc_stride[kc_rank - 1] != 1 {
+            candle_core::bail!("the last dim of k must be contiguous {kc_stride:?}")
+        }
+        if vc_stride[vc_rank - 1] != 1 {
+            candle_core::bail!("the last dim of v must be contiguous {vc_stride:?}")
+        }
+
+        // Bound outside the block below so the read guard produced by `device_ptr` outlives the
+        // kernel launch that consumes the pointer.
+        let alibi_slopes_storage = self
+            .alibi_slopes
+            .as_ref()
+            .map(|alibi_slopes| alibi_slopes.storage_and_layout());
+
+        let (alibi_slopes_ptr, alibi_slopes_batch_stride, _alibi_slopes_guard) =
+            if let (Some(alibi_slopes), Some((alibi_slopes_storage, alibi_slopes_layout))) =
+                (&self.alibi_slopes, &alibi_slopes_storage)
+            {
+                if alibi_slopes.dtype() != DType::F32 {
+                    candle_core::bail!(
+                        "DType mismatch alibi_slopes {:?}, expected {:?}",
+                        alibi_slopes.dtype(),
+                        DType::F32
+                    );
+                }
+
+                let alibi_slopes_batch_stride = if alibi_slopes.dims().len() == 2 {
+                    alibi_slopes.stride()[0]
+                } else {
+                    0
+                };
+
+                if num_heads != alibi_slopes_layout.shape().dims1()? {
+                    candle_core::bail!(
+                        "shape mismatch alibi_slopes {:?}, expected {:?}",
+                        alibi_slopes_layout.shape(),
+                        (num_heads)
+                    );
+                }
+
+                let (alibi_slopes_ptr, alibi_slopes_guard) = utils::device_ptr::<f32>(
+                    alibi_slopes_storage,
+                    alibi_slopes_layout,
+                    &stream,
+                    "alibi_slopes",
+                )?;
+
+                (
+                    alibi_slopes_ptr as *const core::ffi::c_void,
+                    alibi_slopes_batch_stride,
+                    Some(alibi_slopes_guard),
+                )
+            } else {
+                (std::ptr::null(), 0, None)
+            };
+
+        let head_size = utils::round_multiple(head_size_og, 8);
+        let head_size_rounded = utils::round_multiple(head_size, 32);
+        let seqlen_q_rounded = utils::round_multiple(seqlen_q, 128);
+        let seqlen_k_rounded = utils::round_multiple(seqlen_k, 128);
+
+        let elem_count = out_shape.elem_count();
+        let mut dst = unsafe { stream.alloc::<T>(elem_count) }.w()?;
+        let mut softmax_lse = stream
+            .alloc_zeros::<f32>(batch_size * num_heads * seqlen_q)
+            .w()?;
+
+        let is_bf16 = if is_bf16 { 1 } else { 0 };
+
+        let num_splits =
+            utils::compute_num_splits(batch_size, num_heads, head_size, seqlen_k, seqlen_q, dev)?;
+
+        // The split-KV accumulators must stay alive until the kernel that writes them has been
+        // enqueued, so they are bound here rather than inside the launch block.
+        let mut split_accumulators = if num_splits > 1 {
+            Some((
+                stream
+                    .alloc_zeros::<f32>(num_splits as usize * batch_size * num_heads * seqlen_q)
+                    .w()?,
+                stream
+                    .alloc_zeros::<f32>(
+                        num_splits as usize * batch_size * num_heads * seqlen_q * head_size_rounded,
+                    )
+                    .w()?,
+            ))
+        } else {
+            None
+        };
+
+        // Bound outside the launch block so the read guard outlives the launch.
+        let seqlens_k_storage = self
+            .seqlens_k
+            .as_ref()
+            .map(|seqlens_k| seqlens_k.storage_and_layout());
+
+        unsafe {
+            let (q_ptr, _q_guard) = q.device_ptr(&stream);
+            let (kc_ptr, _kc_guard) = kc.device_ptr(&stream);
+            let (vc_ptr, _vc_guard) = vc.device_ptr(&stream);
+            let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&stream);
+            let (softmax_lse_ptr, _softmax_lse_guard) = softmax_lse.device_ptr_mut(&stream);
+            let q_ptr = q_ptr as *const core::ffi::c_void;
+            let kc_ptr = kc_ptr as *const core::ffi::c_void;
+            let vc_ptr = vc_ptr as *const core::ffi::c_void;
+            let dst_ptr = dst_ptr as *const core::ffi::c_void;
+            let softmax_lse_ptr = softmax_lse_ptr as *const core::ffi::c_void;
+            let (cu_seqlens_k_ptr, _cu_seqlens_k_guard) =
+                if let (Some(seqlens_k), Some((seqlens_k_storage, seqlens_k_layout))) =
+                    (&self.seqlens_k, &seqlens_k_storage)
+                {
+                    if seqlens_k.dims() != [batch_size] {
+                        candle_core::bail!(
+                            "shape mismatch of seqlens_k (got {:?}) expected {:?})",
+                            seqlens_k.dims(),
+                            [batch_size]
+                        )
+                    }
+                    utils::check_index_tensor(seqlens_k, "seqlens_k")?;
+                    let seqlens_k_stride = seqlens_k_layout.stride();
+                    let seqlens_k_rank = seqlens_k_stride.len();
+                    if seqlens_k_stride[seqlens_k_rank - 1] != 1 {
+                        candle_core::bail!(
+                            "the last dim of seqlens_k must be contiguous {seqlens_k_stride:?}"
+                        )
+                    }
+                    let (seqlens_k_ptr, seqlens_k_guard) = utils::device_ptr::<u32>(
+                        seqlens_k_storage,
+                        seqlens_k_layout,
+                        &stream,
+                        "seqlens_k",
+                    )?;
+                    (
+                        seqlens_k_ptr as *const core::ffi::c_int,
+                        Some(seqlens_k_guard),
+                    )
+                } else {
+                    (std::ptr::null(), None)
+                };
+            let is_seqlens_k_cumulative = self.seqlens_k.is_none();
+            let block_table_batch_stride = if let Some(layout) = block_table_layout {
+                layout.stride()[0] as u32
+            } else {
+                0
+            };
+            let (softmax_lseaccum_ptr, oaccum_ptr, _split_guards) = match &mut split_accumulators {
+                Some((softmax_lseaccum, oaccum)) => {
+                    let (softmax_lseaccum_ptr, softmax_lseaccum_guard) =
+                        softmax_lseaccum.device_ptr_mut(&stream);
+                    let (oaccum_ptr, oaccum_guard) = oaccum.device_ptr_mut(&stream);
+                    (
+                        softmax_lseaccum_ptr as *const core::ffi::c_void,
+                        oaccum_ptr as *const core::ffi::c_void,
+                        Some((softmax_lseaccum_guard, oaccum_guard)),
+                    )
+                }
+                None => (std::ptr::null(), std::ptr::null(), None),
+            };
+            ffi::run_mha(
+                /* q_ptr */ q_ptr,
+                /* k_ptr */ kc_ptr,
+                /* v_ptr */ vc_ptr,
+                /* o_ptr */ dst_ptr,
+                /* softmax_lse_ptr */ softmax_lse_ptr,
+                /* alibi_slopes_ptr */ alibi_slopes_ptr,
+                /* cu_seqlens_q_ptr */ std::ptr::null(),
+                /* cu_seqlens_k_ptr */ cu_seqlens_k_ptr,
+                /* is_seqlens_k_cumulative */ is_seqlens_k_cumulative,
+                /* q_batch_stride */ q_stride[0] as u32,
+                /* k_batch_stride */ kc_stride[0] as u32,
+                /* v_batch_stride */ vc_stride[0] as u32,
+                /* o_batch_stride */ o_stride[0] as u32,
+                /* alibi_slopes_batch_stride */ alibi_slopes_batch_stride as u32,
+                /* q_row_stride */ q_stride[q_rank - 3] as u32,
+                /* k_row_stride */ kc_stride[kc_rank - 3] as u32,
+                /* v_row_stride */ vc_stride[vc_rank - 3] as u32,
+                /* o_row_stride */ o_stride[o_rank - 3] as u32,
+                /* q_head_stride */ q_stride[q_rank - 2] as u32,
+                /* k_head_stride */ kc_stride[kc_rank - 2] as u32,
+                /* v_head_stride */ vc_stride[vc_rank - 2] as u32,
+                /* o_head_stride */ o_stride[o_rank - 2] as u32,
+                /* num_splits */ num_splits,
+                /* b */ batch_size as u32,
+                /* h */ num_heads as u32,
+                /* h_k */ num_heads_k as u32,
+                /* d */ head_size as u32,
+                /* d_rounded */ head_size_rounded as u32,
+                /* softmax_scale */ self.softmax_scale,
+                /* scale_softmax_log2 */ self.softmax_scale * std::f32::consts::LOG2_E,
+                /* block_table */ block_table_ptr,
+                /* block_table_batch_stride */ block_table_batch_stride,
+                /* page_block_size */ page_block_size as i32,
+                /* seqused_k */ std::ptr::null(),
+                /* seqlen_q */ seqlen_q as u32,
+                /* seqlen_k */ seqlen_k as u32,
+                /* total_q */ (batch_size * seqlen_q) as u32,
+                /* seqlen_q_rounded */ seqlen_q_rounded as u32,
+                /* seqlen_k_rounded */ seqlen_k_rounded as u32,
+                /* is_bf16 */ is_bf16,
+                /* is_causal */ is_causal as i32,
+                /* window_size_left */ window_size_left,
+                /* window_size_right */ window_size_right,
+                /* softcap */ 0.0,
+                /* unpadded_lse */ false,
+                /* force_split_kernel */ self.block_table.is_some(),
+                /* softmax_lseaccum_ptr */ softmax_lseaccum_ptr,
+                /* oaccum_ptr */ oaccum_ptr,
+                /* stream */ stream.cu_stream() as *mut core::ffi::c_void,
+            )
+        }
+        ffi::check_launch("run_mha", unsafe { ffi::flash_last_error() })?;
+
+        let dst = candle_core::CudaStorage::wrap_cuda_slice(dst, dev.clone());
+        Ok((dst, out_shape))
+    }
+}
+
+impl candle_core::CustomOp3 for FlashAttentionKvCache {
+    fn name(&self) -> &'static str {
+        "flash-attn"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("no cpu support for flash-attn")
+    }
+
+    fn cuda_fwd(
+        &self,
+        q: &candle_core::CudaStorage,
+        q_l: &Layout,
+        kc: &candle_core::CudaStorage,
+        kc_l: &Layout,
+        vc: &candle_core::CudaStorage,
+        vc_l: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        match q.dtype() {
+            candle_core::DType::F16 => self.cuda_fwd_t::<f16>(q, q_l, kc, kc_l, vc, vc_l, false),
+            candle_core::DType::BF16 => self.cuda_fwd_t::<bf16>(q, q_l, kc, kc_l, vc, vc_l, true),
+            dt => candle_core::bail!("flash-attn is only supported for f16/bf16 ({dt:?})"),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Flash-attention v2 layer with key and value tensors cached.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `[batch_size, seqlen_q, num_heads, head_size]`.
+/// * `k` - Key tensor with shape `[batch_size_cache, seqlen_k, num_heads_k, head_size]` or
+///   `[num_blocks, page_block_size, num_heads_k, head_size]` if block_table.is_some().
+/// * `v` - Value tensor with shape `[batch_size_cache, seqlen_k, num_heads_k, head_size]` or
+///   `[num_blocks, page_block_size, num_heads_k, head_size]` if block_table.is_some().
+///
+/// The resulting tensor has dimensions `[batch_size, seqlen_q, num_heads, head_size]`.
+pub fn flash_attn_kv_cache(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    let window_size_left = None;
+    let window_size_right = if causal { Some(0) } else { None };
+
+    let op = FlashAttentionKvCache {
+        softmax_scale,
+        alibi_slopes: None,
+        window_size_left,
+        window_size_right,
+        block_table: None,
+        seqlens_k: None,
+    };
+    q.apply_op3(k, v, op)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Flash-attention v2 layer with key and value tensors cached.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `[batch_size, seqlen_q, num_heads, head_size]`.
+/// * `k` - Key tensor with shape `[batch_size_cache, seqlen_k, num_heads_k, head_size]` or
+///   `[num_blocks, page_block_size, num_heads_k, head_size]` if block_table.is_some().
+/// * `v` - Value tensor with shape `[batch_size_cache, seqlen_k, num_heads_k, head_size]` or
+///   `[num_blocks, page_block_size, num_heads_k, head_size]` if block_table.is_some().
+///
+/// The resulting tensor has dimensions `[batch_size, seqlen_q, num_heads, head_size]`.
+///
+/// # Causal mask
+///
+/// `window_size_left=None` with `window_size_right=Some(0)` applies a causal mask to the result of
+/// `Q @ K^T`. Any other window requests sliding-window attention, which the compiled kernels drop;
+/// it is rejected with
+/// [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
+pub fn flash_attn_kv_cache_windowed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seqlens_k: Option<&Tensor>,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+) -> Result<Tensor> {
+    let op = FlashAttentionKvCache {
+        softmax_scale,
+        alibi_slopes: None,
+        window_size_left,
+        window_size_right,
+        block_table: None,
+        seqlens_k: seqlens_k.cloned(),
+    };
+    q.apply_op3(k, v, op)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Flash-attention v2 layer with key and value tensors cached.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `[batch_size, seqlen_q, num_heads, head_size]`.
+/// * `k` - Key tensor with shape `[batch_size_cache, seqlen_k, num_heads_k, head_size]` or
+///   `[num_blocks, page_block_size, num_heads_k, head_size]` if block_table.is_some().
+/// * `v` - Value tensor with shape `[batch_size_cache, seqlen_k, num_heads_k, head_size]` or
+///   `[num_blocks, page_block_size, num_heads_k, head_size]` if block_table.is_some().
+/// * `alibi_slopes` - Alibi slopes tensor with shape `(num_heads_q)`.
+///
+/// `seqlens_q` and `seqlens_k` contain `batch_size + 1` elements, typically `0`, `seqlen_1`,
+/// `seqlen_1 + seqlen_2`, etc.
+///
+/// The resulting tensor has dimensions `(total_q, num_heads_q, head_size)`.
+pub fn flash_attn_kv_cache_alibi(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alibi_slopes: &Tensor,
+    seqlens_k: Option<&Tensor>,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    let window_size_left = None;
+    let window_size_right = if causal { Some(0) } else { None };
+
+    let op = FlashAttentionKvCache {
+        softmax_scale,
+        alibi_slopes: Some(alibi_slopes.clone()),
+        window_size_left,
+        window_size_right,
+        block_table: None,
+        seqlens_k: seqlens_k.cloned(),
+    };
+    q.apply_op3(k, v, op)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Flash-attention v2 layer with key and value tensors cached.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `[batch_size, seqlen_q, num_heads, head_size]`.
+/// * `k` - Key tensor with shape `[batch_size_cache, seqlen_k, num_heads_k, head_size]` or
+///   `[num_blocks, page_block_size, num_heads_k, head_size]` if block_table.is_some().
+/// * `v` - Value tensor with shape `[batch_size_cache, seqlen_k, num_heads_k, head_size]` or
+///   `[num_blocks, page_block_size, num_heads_k, head_size]` if block_table.is_some().
+/// * `alibi_slopes` - Alibi slopes tensor with shape `(num_heads_q)`.
+/// * `window_size_left` - Limit left attention to value tokens.
+/// * `window_size_right` - Limit right attention to value tokens.
+///
+/// The resulting tensor has dimensions `(total_q, num_heads_q, head_size)`.
+///
+/// # Causal mask
+///
+/// `window_size_left=None` with `window_size_right=Some(0)` applies a causal mask to the result of
+/// `Q @ K^T`. Any other window requests sliding-window attention, which the compiled kernels drop;
+/// it is rejected with
+/// [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
+pub fn flash_attn_kv_cache_alibi_windowed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alibi_slopes: &Tensor,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+) -> Result<Tensor> {
+    let op = FlashAttentionKvCache {
+        softmax_scale,
+        alibi_slopes: Some(alibi_slopes.clone()),
+        window_size_left,
+        window_size_right,
+        block_table: None,
+        seqlens_k: None,
+    };
+    q.apply_op3(k, v, op)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Flash-attention v2 layer with key and value tensors cached.
+///
+/// This implements scaled dot-product attention, `softmax(Q @ K^T . softmax_scale) @ V`.
+/// Multi-query and grouped-query attention are supported by using tensors k and v with fewer heads
+/// than q, the number of heads in k and v has to be divisible by the number of heads in q.
+///
+/// # Arguments
+///
+/// * `q` - Query tensor with shape `[batch_size, seqlen_q, num_heads, head_size]`.
+/// * `k` - Key tensor with shape `[batch_size_cache, seqlen_k, num_heads_k, head_size]` or
+///   `[num_blocks, page_block_size, num_heads_k, head_size]` if block_table.is_some().
+/// * `v` - Value tensor with shape `[batch_size_cache, seqlen_k, num_heads_k, head_size]` or
+///   `[num_blocks, page_block_size, num_heads_k, head_size]` if block_table.is_some().
+/// * `alibi_slopes` - Alibi slopes tensor with shape `(num_heads_q)`.
+/// * `softmax_scale` - Scale applied to `Q @ K^T` before the softmax.
+/// * `block_table` - Block table tensor with shape `[batch_size, max_num_block_per_sequence]`.
+/// * `seqlens_k` - The cumulative lengths of the sequences in the batch, used to index in k and v.
+/// * `causal` - Whether to apply a causal mask.
+///
+/// The resulting tensor has dimensions `(total_q, num_heads_q, head_size)`.
+///
+/// # Causal mask
+///
+/// `causal` selects between full attention and a causal mask on `Q @ K^T`. This entry point
+/// exposes neither a window nor a softcap, because the compiled kernels drop both; the paths that
+/// do take them reject any request with
+/// [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
+pub fn flash_attn_kv_cache_full(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alibi_slopes: Option<&Tensor>,
+    softmax_scale: f32,
+    block_table: Option<&Tensor>,
+    seqlens_k: Option<&Tensor>,
+    causal: bool,
+) -> Result<Tensor> {
+    let window_size_left = None;
+    let window_size_right = if causal { Some(0) } else { None };
+
+    let op = FlashAttentionKvCache {
+        softmax_scale,
+        alibi_slopes: alibi_slopes.cloned(),
+        window_size_left,
+        window_size_right,
+        block_table: block_table.cloned(),
+        seqlens_k: seqlens_k.cloned(),
+    };
+    q.apply_op3(k, v, op)
+}
+
+pub(crate) mod utils {
+
+    use candle_core::cuda_backend::cudarc::driver::{
+        sys::{CUdevice_attribute, CUdeviceptr},
+        CudaStream, SyncOnDrop,
+    };
+
+    use super::*;
+    pub(crate) fn round_multiple(x: usize, m: usize) -> usize {
+        x.div_ceil(m) * m
+    }
+
+    /// Validates an index tensor that the kernels read as `int32_t`.
+    ///
+    /// Candle has no signed 32-bit dtype, so index tensors are stored as `u32` and the kernels
+    /// reinterpret the same bits. That is value-preserving for every offset below `i32::MAX`,
+    /// which a batch of tokens or cache blocks does not reach.
+    ///
+    /// # Arguments
+    ///
+    /// * `tensor` - The index tensor to validate.
+    /// * `name` - Tensor name, used to build an actionable error.
+    pub(crate) fn check_index_tensor(tensor: &Tensor, name: &str) -> Result<()> {
+        if tensor.dtype() != DType::U32 {
+            candle_core::bail!(
+                "{name} must have dtype {:?} because the kernels read it as i32, got {:?}",
+                DType::U32,
+                tensor.dtype()
+            )
+        }
+        Ok(())
+    }
+
+    /// Returns the ordinal of the cuda device backing `device`.
+    ///
+    /// cudarc 0.19 moved device identity onto the context, which candle exposes through its stream.
+    pub(crate) fn device_ordinal(device: &candle_core::CudaDevice) -> usize {
+        device.cuda_stream().context().ordinal()
+    }
+
+    /// Resolves the device pointer of a cuda tensor's storage, offset by its layout.
+    ///
+    /// cudarc 0.19 hands out device pointers against an explicit stream so it can order the access
+    /// against prior writes. The returned guard records the read on `stream` when dropped, so
+    /// callers must hold it until the launch consuming the pointer has been enqueued.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - Storage of the tensor whose pointer is needed; must be cuda storage.
+    /// * `layout` - Layout supplying the tensor's start offset, in elements of `T`.
+    /// * `stream` - The caller's stream, which the access is ordered against.
+    /// * `name` - Tensor name, used to build an actionable error when `storage` is not on cuda.
+    pub(crate) fn device_ptr<'a, T>(
+        storage: &'a candle_core::Storage,
+        layout: &Layout,
+        stream: &'a CudaStream,
+        name: &str,
+    ) -> Result<(CUdeviceptr, SyncOnDrop<'a>)>
+    where
+        T: candle_core::cuda_backend::CudaDType
+            + candle_core::cuda_backend::cudarc::driver::DeviceRepr
+            + 'a,
+    {
+        match storage {
+            candle_core::Storage::Cuda(c) => Ok(c
+                .as_cuda_slice::<T>()?
+                .slice(layout.start_offset()..)
+                .view_ptr(stream)),
+            _ => candle_core::bail!("{name} must be a cuda tensor"),
+        }
+    }
+
+    /// Find the number of splits that maximizes the occupancy. For example, if we have
+    /// batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
+    /// better than having 3 splits (efficiency = 0.67). However, we also don't want too many
+    /// splits as that would incur more HBM reads/writes.
+    /// So we find the best efficiency, then find the smallest number of splits that gets 85%
+    /// of the best efficiency.
+    pub(crate) fn num_splits_heuristic(
+        batch_nheads_mblocks: usize,
+        num_sms: usize,
+        num_n_blocks: usize,
+        max_splits: usize,
+    ) -> usize {
+        // If we have enough to almost fill the SMs, then just use 1 split
+        if (batch_nheads_mblocks as f32) >= 0.8 * (num_sms as f32) {
+            return 1;
+        }
+
+        let max_splits = max_splits.min(num_sms).min(num_n_blocks);
+        let mut max_efficiency = 0.0;
+        let mut efficiency = Vec::with_capacity(max_splits);
+
+        let ceil_div = |a: usize, b: usize| -> usize { a.div_ceil(b) };
+
+        let is_split_eligible = |num_splits: usize| -> bool {
+            num_splits == 1
+                || ceil_div(num_n_blocks, num_splits) != ceil_div(num_n_blocks, num_splits - 1)
+        };
+
+        for num_splits in 1..=max_splits {
+            if !is_split_eligible(num_splits) {
+                efficiency.push(0.0);
+            } else {
+                let n_waves = (batch_nheads_mblocks * num_splits) as f32 / num_sms as f32;
+                let eff = n_waves / n_waves.ceil();
+                if eff > max_efficiency {
+                    max_efficiency = eff;
+                }
+                efficiency.push(eff);
+            }
+        }
+
+        for num_splits in 1..=max_splits {
+            if !is_split_eligible(num_splits) {
+                continue;
+            }
+            if efficiency[num_splits - 1] >= 0.85 * max_efficiency {
+                return num_splits;
+            }
+        }
+
+        1
+    }
+
+    pub(crate) fn compute_num_splits(
+        batch_size: usize,
+        num_heads: usize,
+        head_size: usize,
+        max_seqlen_k: usize,
+        max_seqlen_q: usize,
+        device: &candle_core::CudaDevice,
+    ) -> Result<u32> {
+        let block_n = if head_size <= 64 {
+            256
+        } else if head_size <= 128 {
+            128
+        } else {
+            64
+        };
+        let num_n_blocks = max_seqlen_k.div_ceil(block_n);
+        // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
+        // In any case we don't expect seqlen_q to be larger than 64 for inference.
+        let num_m_blocks = max_seqlen_q.div_ceil(64);
+        let cuda_multiprocessor_count = get_multiprocessor_count(device)?;
+        let num_splits = num_splits_heuristic(
+            batch_size * num_heads * num_m_blocks,
+            cuda_multiprocessor_count * 2,
+            num_n_blocks,
+            128,
+        );
+        if num_splits > 128 {
+            candle_core::bail!("num_splits > 128 not supported")
+        }
+        Ok(num_splits as u32)
+    }
+
+    /// Returns the number of streaming multiprocessors on `device`.
+    pub(crate) fn get_multiprocessor_count(device: &candle_core::CudaDevice) -> Result<usize> {
+        let count = device
+            .cuda_stream()
+            .context()
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .w()?;
+        Ok(count as usize)
+    }
+
+    /// Rejects devices the vendored flash-attention kernels were not compiled for.
+    ///
+    /// Only Ampere/Ada (`sm_8x`) and Hopper (`sm_90`) are accepted, matching the `sm80` kernel
+    /// sources; anything else is turned away with a typed error instead of a launch failure.
+    ///
+    /// The compute capability is read through the driver API rather than the runtime API's
+    /// `cudaGetDeviceProperties`: the `cudaDeviceProp` layout has grown across CUDA releases, so
+    /// bindings generated for one toolkit overflow the caller's buffer when the process links a
+    /// newer `libcudart`.
+    pub(crate) fn check_gpu_compatibility(device: &candle_core::CudaDevice) -> Result<()> {
+        let (major, minor) = device.cuda_stream().context().compute_capability().w()?;
+        let is_sm8x = major == 8;
+        let is_sm90 = major == 9 && minor == 0;
+        if !(is_sm8x || is_sm90) {
+            candle_core::bail!(
+                "FlashAttention only supports Ampere GPUs or newer, got compute capability {major}.{minor}"
+            )
+        }
+        Ok(())
+    }
+}

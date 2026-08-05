@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include "static_switch.h"
+#include "flash_error.h"
 #include "flash.h"
 #include "flash_fwd_kernel.h"
 
@@ -25,7 +26,7 @@
 inline void checkCudaErrors(cudaError_t code, const char *file, int line) {
     if (code != cudaSuccess) {
         fprintf(stderr, "CUDA Error: %s %s %d\n", cudaGetErrorString(code), file, line);
-        exit(code);
+        flash_record_error(code);
     }
 }
 #define CUDA_CHECK(ans) { checkCudaErrors((ans), __FILE__, __LINE__); }

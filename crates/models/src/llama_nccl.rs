@@ -28,6 +28,35 @@ fn silu(xs: &Tensor) -> Result<Tensor> {
     xs / (xs.neg()?.exp()? + 1.0)?
 }
 
+/// Validates that the checkpoint's dimensions shard evenly across `world_size` ranks.
+///
+/// The tensor-parallel loaders divide these counts by the world size, so an uneven division would
+/// silently drop attention heads or MLP columns on every rank.
+fn check_tensor_parallel_divisibility(cfg: &Config, world_size: usize) -> Result<()> {
+    if world_size == 0 {
+        candle_core::bail!("tensor-parallel world size must be greater than 0")
+    }
+    for (name, value) in [
+        ("num_attention_heads", cfg.num_attention_heads),
+        ("num_key_value_heads", cfg.num_key_value_heads),
+        ("intermediate_size", cfg.intermediate_size),
+    ] {
+        if !value.is_multiple_of(world_size) {
+            candle_core::bail!(
+                "{name} {value} must be divisible by the tensor-parallel world size {world_size}"
+            )
+        }
+    }
+    if !cfg.hidden_size.is_multiple_of(cfg.num_attention_heads) {
+        candle_core::bail!(
+            "hidden_size {} must be divisible by num_attention_heads {}",
+            cfg.hidden_size,
+            cfg.num_attention_heads
+        )
+    }
+    Ok(())
+}
+
 struct CausalSelfAttention {
     q_proj: TensorParallelColumnLinear,
     k_proj: TensorParallelColumnLinear,
@@ -317,9 +346,10 @@ impl Llama {
         dtype: DType,
         device: &Device,
     ) -> Result<Self> {
+        check_tensor_parallel_divisibility(cfg, comm.world_size())?;
         let wte = embedding(cfg, vb.pp("model.embed_tokens"))?;
         let lm_head = linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
-        let ln_f = rms_norm(cfg.hidden_size, 1e-5, vb.pp("model.norm"))?;
+        let ln_f = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)
             .map(|i| {
                 Block::load(
@@ -354,6 +384,79 @@ mod tests {
     use tokenizers::Tokenizer;
 
     const EOS_TOKEN: &str = "</s>";
+
+    /// A config whose attention heads, kv heads and MLP width all shard by 8.
+    fn divisible_config() -> Config {
+        Config {
+            hidden_size: 4096,
+            intermediate_size: 11008,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            ..Config::config_7b_v2()
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_divisibility_accepts_an_even_split() {
+        for world_size in [1, 2, 4, 8] {
+            assert!(
+                check_tensor_parallel_divisibility(&divisible_config(), world_size).is_ok(),
+                "world size {world_size} divides every sharded dimension"
+            );
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_divisibility_rejects_uneven_attention_heads() {
+        let error = check_tensor_parallel_divisibility(&divisible_config(), 3)
+            .expect_err("32 attention heads do not shard across 3 ranks")
+            .to_string();
+        assert!(error.contains("num_attention_heads"), "{error}");
+    }
+
+    #[test]
+    fn tensor_parallel_divisibility_rejects_uneven_key_value_heads() {
+        let cfg = Config {
+            num_key_value_heads: 6,
+            ..divisible_config()
+        };
+        let error = check_tensor_parallel_divisibility(&cfg, 4)
+            .expect_err("6 kv heads do not shard across 4 ranks")
+            .to_string();
+        assert!(error.contains("num_key_value_heads"), "{error}");
+    }
+
+    #[test]
+    fn tensor_parallel_divisibility_rejects_an_uneven_mlp_width() {
+        let cfg = Config {
+            intermediate_size: 11007,
+            ..divisible_config()
+        };
+        let error = check_tensor_parallel_divisibility(&cfg, 2)
+            .expect_err("an odd intermediate size does not shard across 2 ranks")
+            .to_string();
+        assert!(error.contains("intermediate_size"), "{error}");
+    }
+
+    #[test]
+    fn tensor_parallel_divisibility_rejects_a_head_dim_that_is_not_whole() {
+        let cfg = Config {
+            hidden_size: 4095,
+            ..divisible_config()
+        };
+        let error = check_tensor_parallel_divisibility(&cfg, 1)
+            .expect_err("a hidden size that is not a multiple of the head count has no head dim")
+            .to_string();
+        assert!(error.contains("hidden_size"), "{error}");
+    }
+
+    #[test]
+    fn tensor_parallel_divisibility_rejects_an_empty_world() {
+        let error = check_tensor_parallel_divisibility(&divisible_config(), 0)
+            .expect_err("a world size of 0 has no ranks to shard onto")
+            .to_string();
+        assert!(error.contains("world size"), "{error}");
+    }
 
     #[test]
     #[serial]
