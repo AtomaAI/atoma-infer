@@ -9,6 +9,7 @@ use std::{path::PathBuf, time::Instant};
 use tracing::info;
 
 #[tokio::test]
+#[ignore = "requires 2 GPUs (test_config_nccl.toml sets device_ids = [0, 1]); hangs indefinitely on a single-GPU host. Run with `cargo test --features cuda,nccl -- --ignored`"]
 async fn test_llama_nccl_model() {
     crate::tests::init_tracing();
 
