@@ -2199,19 +2199,18 @@ pub fn flash_attn_kv_cache_alibi_windowed(
 /// * `v` - Value tensor with shape `[batch_size_cache, seqlen_k, num_heads_k, head_size]` or
 ///   `[num_blocks, page_block_size, num_heads_k, head_size]` if block_table.is_some().
 /// * `alibi_slopes` - Alibi slopes tensor with shape `(num_heads_q)`.
-/// * `window_size_left` - Limit left attention to value tokens.
-/// * `window_size_right` - Limit right attention to value tokens.
+/// * `softmax_scale` - Scale applied to `Q @ K^T` before the softmax.
 /// * `block_table` - Block table tensor with shape `[batch_size, max_num_block_per_sequence]`.
-/// * `softcap` - Softcap parameter, used in Grok and Gemma2 models.
 /// * `seqlens_k` - The cumulative lengths of the sequences in the batch, used to index in k and v.
+/// * `causal` - Whether to apply a causal mask.
 ///
 /// The resulting tensor has dimensions `(total_q, num_heads_q, head_size)`.
 ///
 /// # Causal mask
 ///
-/// `window_size_left=None` with `window_size_right=Some(0)` applies a causal mask to the result of
-/// `Q @ K^T`. Any other window requests sliding-window attention, which the compiled kernels drop;
-/// it is rejected with
+/// `causal` selects between full attention and a causal mask on `Q @ K^T`. This entry point
+/// exposes neither a window nor a softcap, because the compiled kernels drop both; the paths that
+/// do take them reject any request with
 /// [`KernelError::UnsupportedCapability`](crate::KernelError::UnsupportedCapability).
 pub fn flash_attn_kv_cache_full(
     q: &Tensor,
