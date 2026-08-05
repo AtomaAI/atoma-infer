@@ -11,16 +11,18 @@
 
 use std::path::{Path, PathBuf};
 
-/// The FFI entry points that launch a kernel, with the label passed to `check_launch`.
-const LAUNCHERS: [&str; 3] = [
-    "run_mha",
-    "copy_blocks_cache",
-    "reshape_and_cache_flash_cache",
-];
+/// The FFI entry points that do not launch a kernel, and so have no launch status to check.
+///
+/// Every other declaration in the `extern` block is treated as a launcher, so adding one without
+/// checking its status fails [`every_launch_site_has_its_status_checked`].
+const NON_LAUNCHING_FFI: [&str; 2] = ["flash_last_error", "flash_cuda_error_string"];
 
 /// The launchers we own, which return their status directly.
 const STATUS_RETURNING_LAUNCHERS: [&str; 2] =
     ["copy_blocks_cache", "reshape_and_cache_flash_cache"];
+
+/// The modules that call into the FFI. Every launch site lives in one of these.
+const CALLER_SOURCES: [&str; 2] = ["src/flash_attention.rs", "src/cache_manager.rs"];
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -29,6 +31,31 @@ fn crate_root() -> PathBuf {
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+/// The body of the `extern "C"` block in `src/ffi.rs`.
+fn extern_block(ffi: &str) -> &str {
+    ffi.split_once("extern \"C\" {")
+        .expect("src/ffi.rs must declare an extern block")
+        .1
+        .split_once("\n}")
+        .expect("the extern block must be closed")
+        .0
+}
+
+/// The FFI entry points that launch a kernel, read from the `extern` block rather than listed here
+/// so that a newly declared launcher is covered without anyone remembering to add it.
+fn declared_launchers(ffi: &str) -> Vec<&str> {
+    extern_block(ffi)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("pub(crate) fn ")
+                .or_else(|| line.strip_prefix("fn "))
+        })
+        .filter_map(|declaration| declaration.split_once('(').map(|(name, _)| name))
+        .filter(|name| !NON_LAUNCHING_FFI.contains(name))
+        .collect()
 }
 
 /// Collects every kernel source and header. The vendored CUTLASS submodule sits outside this
@@ -81,17 +108,35 @@ fn the_vendored_dispatch_records_failures_for_rust_to_read() {
 }
 
 #[test]
-fn every_launcher_has_its_status_checked() {
+fn every_launch_site_has_its_status_checked() {
     let ffi = read(&crate_root().join("src/ffi.rs"));
-    let sources: String = ["src/flash_attention.rs", "src/cache_manager.rs"]
+    let launchers = declared_launchers(&ffi);
+    assert!(
+        !launchers.is_empty(),
+        "src/ffi.rs declares no launchers, so this test would hold vacuously"
+    );
+
+    let sources: String = CALLER_SOURCES
         .iter()
         .map(|relative| read(&crate_root().join(relative)))
         .collect();
 
-    for launcher in LAUNCHERS {
+    for launcher in launchers {
+        // Counted rather than merely found: one checked launch must not vouch for the others.
+        let launches = sources.matches(&format!("ffi::{launcher}(")).count();
+        let checks = sources
+            .matches(&format!("check_launch(\"{launcher}\""))
+            .count();
         assert!(
-            sources.contains(&format!("check_launch(\"{launcher}\"")),
-            "every {launcher} launch must have its status checked with check_launch"
+            launches > 0,
+            "{launcher} is declared in src/ffi.rs but never called as `ffi::{launcher}(` in \
+             {CALLER_SOURCES:?}; if it moved or is now called through an import, this test can no \
+             longer see its launch sites"
+        );
+        assert_eq!(
+            launches, checks,
+            "{launcher} is launched {launches} times but only {checks} of those launches have \
+             their status checked with check_launch"
         );
     }
 
