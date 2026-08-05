@@ -263,7 +263,7 @@ impl FlashAttention {
         // Softcap is rejected at entry, so the kernel always runs with the caller's scale.
         let scale_softmax_log2 = self.softmax_scale * std::f32::consts::LOG2_E;
 
-        let status = unsafe {
+        unsafe {
             let (q_ptr, _q_guard) = q.device_ptr(&stream);
             let (k_ptr, _k_guard) = k.device_ptr(&stream);
             let (v_ptr, _v_guard) = v.device_ptr(&stream);
@@ -346,8 +346,8 @@ impl FlashAttention {
                 /* oaccum_ptr */ oaccum_ptr,
                 /* stream */ stream.cu_stream() as *mut core::ffi::c_void,
             )
-        };
-        ffi::check_launch("run_mha", status)?;
+        }
+        ffi::check_launch("run_mha", unsafe { ffi::flash_last_error() })?;
 
         let out_shape = if seqlenq_ngroups_swapped {
             Shape::from((b_sz, 1, num_heads_k * seqlen_q, head_size_og))
@@ -1059,7 +1059,7 @@ impl FlashAttentionVarLen {
         // Softcap is rejected at entry, so the kernel always runs with the caller's scale.
         let scale_softmax_log2 = self.softmax_scale * std::f32::consts::LOG2_E;
 
-        let status = unsafe {
+        unsafe {
             let (q_ptr, _q_guard) = q.device_ptr(&stream);
             let (k_ptr, _k_guard) = k.device_ptr(&stream);
             let (v_ptr, _v_guard) = v.device_ptr(&stream);
@@ -1161,8 +1161,8 @@ impl FlashAttentionVarLen {
                 /* oaccum_ptr */ oaccum_ptr,
                 /* stream */ stream.cu_stream() as *mut core::ffi::c_void,
             )
-        };
-        ffi::check_launch("run_mha", status)?;
+        }
+        ffi::check_launch("run_mha", unsafe { ffi::flash_last_error() })?;
 
         let out_shape = if seqlenq_ngroups_swapped {
             Shape::from((batch_size, 1, num_heads_k * max_seqlen_q, head_size_og))
@@ -1860,7 +1860,7 @@ impl FlashAttentionKvCache {
             .as_ref()
             .map(|seqlens_k| seqlens_k.storage_and_layout());
 
-        let status = unsafe {
+        unsafe {
             let (q_ptr, _q_guard) = q.device_ptr(&stream);
             let (kc_ptr, _kc_guard) = kc.device_ptr(&stream);
             let (vc_ptr, _vc_guard) = vc.device_ptr(&stream);
@@ -1973,8 +1973,8 @@ impl FlashAttentionKvCache {
                 /* oaccum_ptr */ oaccum_ptr,
                 /* stream */ stream.cu_stream() as *mut core::ffi::c_void,
             )
-        };
-        ffi::check_launch("run_mha", status)?;
+        }
+        ffi::check_launch("run_mha", unsafe { ffi::flash_last_error() })?;
 
         let dst = candle_core::CudaStorage::wrap_cuda_slice(dst, dev.clone());
         Ok((dst, out_shape))

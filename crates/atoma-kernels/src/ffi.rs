@@ -3,7 +3,9 @@ use core::ffi::{c_char, c_int, c_void};
 use std::ffi::CStr;
 
 extern "C" {
-    /// Returns the `cudaError_t` of the launch, or of the setup call that failed before it.
+    /// Records any failure for [`flash_last_error`] rather than returning it: the vendored dispatch
+    /// templates this walks return nothing, and threading a status through them would fork all 66
+    /// kernel instantiation files.
     pub(crate) fn run_mha(
         q_ptr: *const c_void,
         k_ptr: *const c_void,
@@ -67,7 +69,10 @@ extern "C" {
         oaccum_ptr: *const c_void,
 
         stream: *mut c_void,
-    ) -> c_int;
+    );
+
+    /// The `cudaError_t` recorded during the most recent [`run_mha`].
+    pub(crate) fn flash_last_error() -> c_int;
 
     /// Returns the `cudaError_t` of the launch.
     pub(crate) fn copy_blocks_cache(

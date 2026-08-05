@@ -97,8 +97,8 @@ fn flash_attention_entry_point_takes_a_stream() {
     let source = read(&crate_root().join("kernels/flash_api.cu"));
 
     let run_mha = source
-        .split_once("extern \"C\" cudaError_t run_mha(")
-        .expect("flash_api.cu must declare `extern \"C\" cudaError_t run_mha(`")
+        .split_once("extern \"C\" void run_mha(")
+        .expect("flash_api.cu must declare `extern \"C\" void run_mha(`")
         .1;
     let params = run_mha
         .split_once(')')

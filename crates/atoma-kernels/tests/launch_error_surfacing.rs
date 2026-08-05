@@ -1,9 +1,13 @@
-//! Guards the launch-error invariant: a failing CUDA call returns a status that Rust turns into a
-//! typed error, and never terminates the process.
+//! Guards the launch-error invariant: a failing CUDA call reaches Rust as a typed error, and never
+//! terminates the process.
 //!
 //! Like `stream_explicitness.rs`, these checks read the sources rather than running kernels, so
 //! they hold in CPU CI where no CUDA toolkit or GPU exists. On a rig the invariant is only
 //! observable when a launch actually fails, which no ordinary test run reaches.
+//!
+//! Two mechanisms carry a failure, because the sources have two owners. `cache_manager.cu` is ours
+//! and returns a status directly. The flash-attention dispatch is vendored, so its launchers record
+//! into `flash_error.h` and Rust reads the result through `flash_last_error`.
 
 use std::path::{Path, PathBuf};
 
@@ -13,6 +17,10 @@ const LAUNCHERS: [&str; 3] = [
     "copy_blocks_cache",
     "reshape_and_cache_flash_cache",
 ];
+
+/// The launchers we own, which return their status directly.
+const STATUS_RETURNING_LAUNCHERS: [&str; 2] =
+    ["copy_blocks_cache", "reshape_and_cache_flash_cache"];
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -47,47 +55,33 @@ fn no_kernel_source_terminates_the_process_on_a_cuda_error() {
 
     assert!(
         offenders.is_empty(),
-        "these kernel sources end the process on a CUDA failure instead of returning a status the \
-         caller can surface: {offenders:?}"
+        "these kernel sources end the process on a CUDA failure instead of leaving it for the \
+         caller to surface: {offenders:?}"
     );
 }
 
 #[test]
-fn every_kernel_entry_point_returns_a_status() {
-    // `flash_cuda_error_string` resolves a status rather than producing one, so it is the single
-    // entry point allowed a different return type.
-    const RESOLVER: &str = "extern \"C\" const char *flash_cuda_error_string(";
-
-    let offenders: Vec<_> = kernel_sources()
-        .into_iter()
-        .flat_map(|path| {
-            let source = read(&path).replace(RESOLVER, "");
-            source
-                .match_indices("extern \"C\"")
-                .filter(|(index, _)| {
-                    let tail = source[*index..]
-                        .trim_start_matches("extern \"C\"")
-                        .trim_start();
-                    // `extern "C" {` opens a block whose members are declared on their own lines.
-                    !tail.starts_with('{') && !tail.starts_with("cudaError_t")
-                })
-                .map(|(index, _)| {
-                    let tail = &source[index..];
-                    format!("{}: {}", path.display(), &tail[..tail.len().min(60)])
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
+fn the_vendored_dispatch_records_failures_for_rust_to_read() {
+    let template = read(&crate_root().join("kernels/flash_fwd_launch_template.h"));
     assert!(
-        offenders.is_empty(),
-        "these kernel entry points do not return a `cudaError_t`, so a failure inside them cannot \
-         reach Rust: {offenders:#?}"
+        template.contains("flash_record_error("),
+        "the CUDA_CHECK the vendored launchers call must record the failure, or a failing launch \
+         is only printed and then forgotten"
+    );
+
+    let api = read(&crate_root().join("kernels/flash_api.cu"));
+    assert!(
+        api.contains("flash_clear_error()"),
+        "run_mha must clear the recorded failure on entry, or it reports an earlier call's error"
+    );
+    assert!(
+        api.contains(r#"extern "C" int flash_last_error()"#),
+        "flash_api.cu must export flash_last_error so Rust can read the recorded failure"
     );
 }
 
 #[test]
-fn every_launcher_declares_and_checks_a_status() {
+fn every_launcher_has_its_status_checked() {
     let ffi = read(&crate_root().join("src/ffi.rs"));
     let sources: String = ["src/flash_attention.rs", "src/cache_manager.rs"]
         .iter()
@@ -95,21 +89,23 @@ fn every_launcher_declares_and_checks_a_status() {
         .collect();
 
     for launcher in LAUNCHERS {
-        let declaration = ffi
+        assert!(
+            sources.contains(&format!("check_launch(\"{launcher}\"")),
+            "every {launcher} launch must have its status checked with check_launch"
+        );
+    }
+
+    for launcher in STATUS_RETURNING_LAUNCHERS {
+        let signature = ffi
             .split_once(&format!("fn {launcher}("))
             .unwrap_or_else(|| panic!("src/ffi.rs must declare {launcher}"))
-            .1;
-        let signature = declaration
+            .1
             .split_once(';')
             .expect("an extern declaration ends with a semicolon")
             .0;
         assert!(
             signature.contains("-> c_int"),
             "the {launcher} FFI declaration must return the CUDA status, got: {signature}"
-        );
-        assert!(
-            sources.contains(&format!("check_launch(\"{launcher}\"")),
-            "every {launcher} launch must have its status checked with check_launch"
         );
     }
 }
@@ -121,8 +117,8 @@ fn every_ffi_argument_label_names_a_real_parameter() {
         .split_once("pub(crate) fn run_mha(")
         .expect("src/ffi.rs must declare run_mha")
         .1
-        .split_once("\n    ) -> c_int;")
-        .expect("the run_mha declaration must end with its return type")
+        .split_once("\n    );")
+        .expect("the run_mha declaration must end with a semicolon")
         .0;
     let parameters: Vec<&str> = declaration
         .lines()

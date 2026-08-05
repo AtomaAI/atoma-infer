@@ -90,6 +90,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=kernels/flash_fwd_kernel.h");
     println!("cargo:rerun-if-changed=kernels/flash_fwd_launch_template.h");
     println!("cargo:rerun-if-changed=kernels/flash.h");
+    println!("cargo:rerun-if-changed=kernels/flash_error.h");
     println!("cargo:rerun-if-changed=kernels/philox.cuh");
     println!("cargo:rerun-if-changed=kernels/softmax.h");
     println!("cargo:rerun-if-changed=kernels/utils.h");
