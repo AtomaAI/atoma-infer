@@ -52,7 +52,7 @@ sys-info = "0.9.1"
 thiserror = "2"
 tokenizers = "0.22.0"
 tokio = "1.40.0"
-tower = { version = "0.5.3", features = [ "util" ] }
+tower = "0.5.3"
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
 utoipa = "5"

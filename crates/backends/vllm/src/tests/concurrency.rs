@@ -1,19 +1,25 @@
 //! Concurrency harness.
 //!
 //! Drives many requests at once through the path a request really takes on the host: admission
-//! (`build_sequence_group`), the scheduler, and the block manager. The model is stood in for by a
-//! KV pool that is written through the block tables the scheduler hands out, which is what makes a
-//! block table collision visible — a stubbed model would happily produce correct-looking output
-//! while two requests overwrote each other's cache.
+//! (`RequestAdmitter`), the scheduler, the block manager, and the client channels
+//! (`ResponseSenders`). The model is stood in for by a KV pool that is written through the block
+//! tables the scheduler hands out, which is what makes a block table collision visible — a stubbed
+//! model would happily produce correct-looking output while two requests overwrote each other's
+//! cache.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use crate::{
     config::{CacheConfig, SchedulerConfig},
-    llm_service::build_sequence_group,
+    egress::{ClientState, ResponseSenders},
+    llm_service::RequestAdmitter,
+    output::{GenerateStreamingOutput, StreamResponse},
     policy::FcfsPolicy,
     scheduler::Scheduler,
-    sequence::{LogProb, SequenceGroup, SequenceIdCounter, SequenceStatus},
+    sequence::{LogProb, SequenceGroup, SequenceStatus},
     tests::fixtures::{prompt_token_offset, valid_request},
     types::WriteLock,
 };
@@ -82,7 +88,8 @@ impl KvPool {
 /// The host side of the engine loop: admission, scheduling, and a KV pool in place of the model.
 struct Harness {
     scheduler: Scheduler<FcfsPolicy>,
-    sequence_id_counter: SequenceIdCounter,
+    request_admitter: RequestAdmitter,
+    response_senders: ResponseSenders,
     kv_pool: KvPool,
     /// The admitted requests, so their final state can be inspected after they leave the queues.
     admitted: HashMap<String, SequenceGroup>,
@@ -114,28 +121,31 @@ impl Harness {
         Self {
             scheduler: Scheduler::new(cache_config, scheduler_config)
                 .expect("Failed to generate `Scheduler`"),
-            sequence_id_counter: SequenceIdCounter::default(),
+            request_admitter: RequestAdmitter::new(BLOCK_SIZE),
+            response_senders: ResponseSenders::default(),
             kv_pool: KvPool::new(num_gpu_blocks),
             admitted: HashMap::new(),
             block_tables: HashMap::new(),
         }
     }
 
-    /// Admits a request the way `LlmService` does, and queues it.
-    fn admit(&mut self, request_id: &str) {
+    /// Admits a request the way `LlmService` does, queues it, and registers the streaming client
+    /// waiting for its output.
+    fn admit(&mut self, request_id: &str) -> flume::Receiver<StreamResponse> {
         let request = valid_request(request_id, PROMPT_LEN, MAX_NEW_TOKENS);
-        let sequence_group = build_sequence_group(
-            request_id.to_string(),
-            &request,
-            self.sequence_id_counter.next_id(),
-            BLOCK_SIZE,
-            std::time::Instant::now(),
-        )
-        .expect("Failed to build sequence group");
+        let sequence_group = self
+            .request_admitter
+            .admit(request_id.to_string(), &request, Instant::now())
+            .expect("Failed to admit request");
 
         self.admitted
             .insert(request_id.to_string(), sequence_group.clone());
         self.scheduler.add_sequence_group(sequence_group);
+
+        let (sender, receiver) = flume::unbounded();
+        self.response_senders
+            .register_stream(request_id.to_string(), sender);
+        receiver
     }
 
     /// Runs one engine step: schedule, write KV and sample one token per scheduled sequence, apply
@@ -143,6 +153,7 @@ impl Harness {
     fn step(&mut self) {
         let (sequence_groups_metadata, scheduler_outputs) =
             self.scheduler.schedule().expect("Failed to schedule");
+        let mut disconnected_requests = Vec::new();
 
         for (metadata, scheduled_sequence_group) in sequence_groups_metadata
             .iter()
@@ -187,6 +198,16 @@ impl Harness {
                 if sequence.get_output_len() >= max_new_tokens as usize {
                     sequence.set_sequence_status(SequenceStatus::FinishedLengthCapped);
                 }
+
+                // The engine streams every generated token, which is how it learns that a client
+                // has gone away.
+                if self
+                    .response_senders
+                    .send_chunk(&metadata.request_id, streamed_token(&metadata.request_id))
+                    == ClientState::Disconnected
+                {
+                    disconnected_requests.push(metadata.request_id.clone());
+                }
             }
         }
 
@@ -200,10 +221,15 @@ impl Harness {
         self.scheduler
             .remove_finished_sequences()
             .expect("Failed to remove finished sequences");
+
+        for request_id in disconnected_requests {
+            self.abort(&request_id);
+        }
     }
 
-    /// Aborts a request, as the engine does when its client disconnects.
+    /// Retires a request, as the engine does when its client disconnects.
     fn abort(&mut self, request_id: &str) {
+        self.response_senders.remove(request_id);
         self.scheduler
             .abort_sequence_group(request_id.to_string())
             .expect("Failed to abort sequence group");
@@ -247,6 +273,19 @@ fn generated_token_id(request_id: &str) -> u32 {
     prompt_token_offset(request_id) + 500
 }
 
+/// The message the engine streams to a client for one generated token.
+fn streamed_token(request_id: &str) -> StreamResponse {
+    StreamResponse::Chunk(GenerateStreamingOutput {
+        request_id: request_id.to_string(),
+        created: 0,
+        finish_reason: None,
+        logprobs: vec![],
+        num_prompt_tokens: PROMPT_LEN,
+        num_completion_tokens: 1,
+        output_text: format!("token of {request_id}"),
+    })
+}
+
 fn request_ids(count: usize) -> Vec<String> {
     (0..count).map(|i| format!("request-{i}")).collect()
 }
@@ -254,9 +293,10 @@ fn request_ids(count: usize) -> Vec<String> {
 #[test]
 fn test_concurrent_requests_get_disjoint_block_tables() {
     let mut harness = Harness::new(NUM_GPU_BLOCKS, NUM_REQUESTS);
-    for request_id in request_ids(NUM_REQUESTS) {
-        harness.admit(&request_id);
-    }
+    let _clients = request_ids(NUM_REQUESTS)
+        .iter()
+        .map(|request_id| harness.admit(request_id))
+        .collect::<Vec<_>>();
 
     let (sequence_groups_metadata, _) = harness
         .scheduler
@@ -302,9 +342,10 @@ fn test_free_blocks_return_to_baseline_once_every_request_finishes() {
     let mut harness = Harness::new(NUM_GPU_BLOCKS, NUM_REQUESTS);
     let baseline_free_blocks = harness.free_gpu_blocks();
 
-    for request_id in request_ids(NUM_REQUESTS) {
-        harness.admit(&request_id);
-    }
+    let _clients = request_ids(NUM_REQUESTS)
+        .iter()
+        .map(|request_id| harness.admit(request_id))
+        .collect::<Vec<_>>();
     harness.run_to_completion();
 
     assert!(!harness.scheduler.has_unfinished_sequences());
@@ -319,9 +360,10 @@ fn test_free_blocks_return_to_baseline_once_every_request_finishes() {
 fn test_concurrent_outputs_do_not_cross() {
     let mut harness = Harness::new(NUM_GPU_BLOCKS, NUM_REQUESTS);
     let request_ids = request_ids(NUM_REQUESTS);
-    for request_id in request_ids.iter() {
-        harness.admit(request_id);
-    }
+    let _clients = request_ids
+        .iter()
+        .map(|request_id| harness.admit(request_id))
+        .collect::<Vec<_>>();
 
     harness.run_to_completion();
 
@@ -341,41 +383,44 @@ fn test_concurrent_outputs_do_not_cross() {
 }
 
 /// One client dropping mid-generation retires that request only: the rest of the batch finishes,
-/// and the aborted request's blocks come back.
+/// and the dropped request's blocks come back.
 #[test]
-fn test_aborted_request_does_not_disturb_the_others() {
-    const ABORTED: &str = "request-7";
+fn test_a_disconnected_client_does_not_disturb_the_others() {
+    const DISCONNECTED: usize = 7;
 
     let mut harness = Harness::new(NUM_GPU_BLOCKS, NUM_REQUESTS);
     let baseline_free_blocks = harness.free_gpu_blocks();
     let request_ids = request_ids(NUM_REQUESTS);
-    for request_id in request_ids.iter() {
-        harness.admit(request_id);
-    }
+    let mut clients = request_ids
+        .iter()
+        .map(|request_id| harness.admit(request_id))
+        .collect::<Vec<_>>();
 
-    // Two steps in, the aborted request holds blocks and has generated part of its output.
+    // Two steps in, the request holds blocks and has generated part of its output; then its
+    // client hangs up, which the engine only finds out about on the next step.
     harness.step();
     harness.step();
     assert!(harness.kv_pool.live_blocks() > 0);
-    harness.abort(ABORTED);
+    drop(clients.remove(DISCONNECTED));
 
     harness.run_to_completion();
 
-    for request_id in request_ids.iter().filter(|id| id.as_str() != ABORTED) {
+    let disconnected_id = &request_ids[DISCONNECTED];
+    for request_id in request_ids.iter().filter(|id| *id != disconnected_id) {
         assert_eq!(
             harness.token_ids(request_id).len(),
             PROMPT_LEN + MAX_NEW_TOKENS as usize,
-            "{request_id} did not finish after {ABORTED} was aborted"
+            "{request_id} did not finish after {disconnected_id} disconnected"
         );
     }
     assert!(
-        harness.token_ids(ABORTED).len() < PROMPT_LEN + MAX_NEW_TOKENS as usize,
-        "the aborted request should have stopped generating"
+        harness.token_ids(disconnected_id).len() < PROMPT_LEN + MAX_NEW_TOKENS as usize,
+        "the disconnected request should have stopped generating"
     );
     assert_eq!(
         harness.free_gpu_blocks(),
         baseline_free_blocks,
-        "the aborted request's blocks must return to the pool"
+        "the disconnected request's blocks must return to the pool"
     );
 }
 
@@ -389,9 +434,10 @@ fn test_requests_keep_flowing_through_a_pool_smaller_than_the_batch() {
     let mut harness = Harness::new(NUM_SMALL_POOL_BLOCKS, 2);
     let baseline_free_blocks = harness.free_gpu_blocks();
     let request_ids = request_ids(NUM_STREAMED_REQUESTS);
-    for request_id in request_ids.iter() {
-        harness.admit(request_id);
-    }
+    let _clients = request_ids
+        .iter()
+        .map(|request_id| harness.admit(request_id))
+        .collect::<Vec<_>>();
 
     harness.run_to_completion();
 

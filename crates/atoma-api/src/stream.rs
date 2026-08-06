@@ -6,6 +6,9 @@ use futures::stream::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// What the client is told when the engine retires a request before streaming anything.
+const STREAM_CLOSED_BEFORE_OUTPUT: &str = "the engine closed the stream before any output";
+
 /// A structure for streaming chat completion chunks.
 ///
 /// `Streamer` manages the reception of `ChatCompletionChunk`s and tracks the current status
@@ -72,19 +75,30 @@ impl Stream for Streamer {
     type Item = Result<Event, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.status == StreamStatus::Completed {
+        // `Completed` and `Failed` are terminal: the request is over either way, and the client
+        // has already been told which it was.
+        if matches!(
+            self.status,
+            StreamStatus::Completed | StreamStatus::Failed { .. }
+        ) {
             return Poll::Ready(None);
         }
 
         match Pin::new(&mut self.responses).poll_next(cx) {
             Poll::Pending => Poll::Pending,
+            Poll::Ready(None) if self.status == StreamStatus::NotStarted => {
+                // The engine retired the request before it streamed anything — an aborted request,
+                // for instance. Saying so beats answering with an empty body.
+                self.status = StreamStatus::Failed {
+                    error: STREAM_CLOSED_BEFORE_OUTPUT.to_string(),
+                };
+                Poll::Ready(Some(Ok(Event::default().data(STREAM_CLOSED_BEFORE_OUTPUT))))
+            }
             Poll::Ready(None) => {
-                // The engine dropped the request's sender without finishing it.
-                if self.status == StreamStatus::Started {
-                    self.status = StreamStatus::Interrupted {
-                        reason: "Stream disconnected".to_string(),
-                    };
-                }
+                // The engine dropped the request's sender part-way through.
+                self.status = StreamStatus::Interrupted {
+                    reason: "Stream disconnected".to_string(),
+                };
                 Poll::Ready(None)
             }
             Poll::Ready(Some(StreamResponse::Chunk(chunk))) => {
@@ -218,6 +232,23 @@ mod tests {
         );
     }
 
+    /// A request the engine retired before it generated anything — an aborted request, say — has
+    /// to end the response with a reason rather than an empty body.
+    #[tokio::test]
+    async fn test_a_stream_closed_before_any_output_reports_why() {
+        let (sender, receiver) = flume::unbounded();
+        let mut streamer = Streamer::new(receiver, "model".to_string());
+        drop(sender);
+
+        let event = streamer
+            .next()
+            .await
+            .expect("Streamer ended without saying why")
+            .expect("Streamer yielded an error");
+        assert!(event_data(event).contains(STREAM_CLOSED_BEFORE_OUTPUT));
+        assert!(streamer.next().await.is_none());
+    }
+
     #[tokio::test]
     async fn test_engine_errors_are_forwarded_to_the_client() {
         let (sender, receiver) = flume::unbounded();
@@ -238,6 +269,10 @@ mod tests {
             StreamStatus::Failed {
                 error: "model failed".to_string()
             }
+        );
+        assert!(
+            streamer.next().await.is_none(),
+            "a failed request has nothing left to stream"
         );
     }
 }

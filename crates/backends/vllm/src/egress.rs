@@ -20,6 +20,16 @@ pub enum ClientState {
     Disconnected,
 }
 
+impl ClientState {
+    /// Combines two observations of the same client: one failed channel is enough to call it gone.
+    pub fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Connected, Self::Connected) => Self::Connected,
+            (Self::Disconnected, _) | (_, Self::Disconnected) => Self::Disconnected,
+        }
+    }
+}
+
 /// The client channels of the requests currently in flight, keyed by request id.
 #[derive(Debug, Default)]
 pub struct ResponseSenders {
@@ -81,19 +91,22 @@ impl ResponseSenders {
         ClientState::Connected
     }
 
+    /// Whether the client of a non-streaming request is still waiting for its output.
+    ///
+    /// Nothing is sent to such a client until its request finishes, so its channel is probed
+    /// instead: a request nobody is waiting for should not hold KV blocks for the rest of its
+    /// generation.
+    pub fn completion_client_state(&self, request_id: &str) -> ClientState {
+        match self.completions.get(request_id) {
+            Some(sender) if sender.is_closed() => ClientState::Disconnected,
+            Some(_) | None => ClientState::Connected,
+        }
+    }
+
     /// Drops every client channel of a request, without sending anything.
     pub fn remove(&mut self, request_id: &str) {
         self.completions.remove(request_id);
         self.streams.remove(request_id);
-    }
-
-    /// Number of requests that still hold at least one client channel.
-    pub fn len(&self) -> usize {
-        self.completions
-            .keys()
-            .chain(self.streams.keys())
-            .collect::<std::collections::HashSet<_>>()
-            .len()
     }
 
     /// Whether any request still holds a client channel.
@@ -249,17 +262,77 @@ mod tests {
         }
 
         assert_eq!(disconnected, vec![format!("request-{DROPPED}")]);
-        for (request_id, receiver) in receivers {
+        for (request_id, receiver) in receivers.iter() {
             assert!(
                 receiver.recv().is_ok(),
                 "{request_id} lost its chunk to another request's disconnect"
             );
         }
 
+        // Retiring the disconnected request leaves every other client streaming.
         for request_id in disconnected {
             senders.remove(&request_id);
         }
-        assert_eq!(senders.len(), NUM_REQUESTS - 1);
+        for (request_id, receiver) in receivers.iter() {
+            assert_eq!(
+                senders.send_chunk(request_id, streaming_output(request_id)),
+                ClientState::Connected
+            );
+            assert!(receiver.recv().is_ok());
+        }
+    }
+
+    #[test]
+    fn test_one_failed_channel_makes_the_client_disconnected() {
+        assert_eq!(
+            ClientState::Connected.and(ClientState::Connected),
+            ClientState::Connected
+        );
+        assert_eq!(
+            ClientState::Connected.and(ClientState::Disconnected),
+            ClientState::Disconnected
+        );
+        assert_eq!(
+            ClientState::Disconnected.and(ClientState::Connected),
+            ClientState::Disconnected
+        );
+    }
+
+    #[test]
+    fn test_a_waiting_completion_client_is_reported_as_connected() {
+        let mut senders = ResponseSenders::default();
+        let (sender, _receiver) = oneshot::channel();
+        senders.register_completion("request".to_string(), sender);
+
+        assert_eq!(
+            senders.completion_client_state("request"),
+            ClientState::Connected
+        );
+    }
+
+    /// A non-streaming client that hangs up mid-generation is visible before its output is ready,
+    /// which is what lets the engine retire the request instead of generating for nobody.
+    #[test]
+    fn test_a_dropped_completion_client_is_reported_before_its_output_is_ready() {
+        let mut senders = ResponseSenders::default();
+        let (sender, receiver) = oneshot::channel();
+        senders.register_completion("request".to_string(), sender);
+        drop(receiver);
+
+        assert_eq!(
+            senders.completion_client_state("request"),
+            ClientState::Disconnected
+        );
+    }
+
+    #[test]
+    fn test_an_unknown_request_has_no_completion_client_to_lose() {
+        let senders = ResponseSenders::default();
+
+        assert_eq!(
+            senders.completion_client_state("request"),
+            ClientState::Connected
+        );
     }
 
     #[test]
@@ -284,7 +357,7 @@ mod tests {
         let (stream_sender, stream_receiver) = flume::unbounded();
         senders.register_completion("request".to_string(), completion_sender);
         senders.register_stream("request".to_string(), stream_sender);
-        assert_eq!(senders.len(), 1);
+        assert!(!senders.is_empty());
 
         senders.remove("request");
 

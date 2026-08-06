@@ -2,8 +2,10 @@
 //! the concurrency it has to survive.
 //!
 //! The model is a mock, but its KV cache is not: `MockModel::forward` runs the real attention
-//! layer, which writes each token's key and value into the block the scheduler allocated for it.
-//! A request reading another request's blocks would attend over tokens it never saw.
+//! layer, which writes each token's key and value into the block the scheduler allocated for it
+//! and reads back over the blocks the scheduler says the sequence owns. A request whose block
+//! table overlapped another's would attend over tokens it never saw, and the KV cache would be the
+//! thing that noticed.
 
 #[cfg(feature = "nccl")]
 use cudarc::nccl::Comm;
@@ -54,6 +56,8 @@ struct MockModel {
     /// The attention layer the forward pass runs, so the KV cache is written through the
     /// scheduler's block tables rather than stubbed out.
     attention: FlashAttention,
+    /// `[1, hidden_size]` of `0..hidden_size`, added to a token id to spread it over the features.
+    feature_ramp: Tensor,
     dtype: DType,
 }
 
@@ -116,9 +120,14 @@ impl MockModel {
             device.clone(),
         )?;
 
+        let feature_ramp = Tensor::arange(0u32, MOCK_HIDDEN_SIZE as u32, device)?
+            .to_dtype(dtype)?
+            .reshape((1, MOCK_HIDDEN_SIZE))?;
+
         Ok(Self {
             config,
             attention,
+            feature_ramp,
             dtype,
         })
     }
@@ -189,11 +198,14 @@ impl ModelExecutor for MockModel {
         attention_metadata: FlashAttentionMetadata,
     ) -> Result<Tensor, ModelExecutorError> {
         let num_tokens = input_tensor.elem_count();
+        // A token embeds to its own id, spread over the features so the attention weights are not
+        // uniform. Nothing else feeds the embedding, so what a sequence attends over is decided by
+        // which tokens its blocks hold.
         let embeddings = input_tensor
             .flatten_all()?
             .to_dtype(self.dtype)?
             .reshape((num_tokens, 1))?
-            .broadcast_as((num_tokens, MOCK_HIDDEN_SIZE))?
+            .broadcast_add(&self.feature_ramp)?
             .contiguous()?;
         let query = embeddings.reshape((num_tokens, MOCK_NUM_ATTENTION_HEADS, MOCK_HEAD_DIM))?;
         let key_value = embeddings.reshape((num_tokens, MOCK_NUM_KV_HEADS, MOCK_HEAD_DIM))?;

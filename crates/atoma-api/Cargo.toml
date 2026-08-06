@@ -26,4 +26,4 @@ nccl = [ "atoma-backends/nccl", "cuda" ]
 
 [dev-dependencies]
 metrics = { workspace = true }
-tower   = { workspace = true }
+tower   = { workspace = true, features = [ "util" ] }

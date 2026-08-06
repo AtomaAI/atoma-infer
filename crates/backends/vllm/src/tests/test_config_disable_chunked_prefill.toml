@@ -8,8 +8,9 @@ model_name            = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 num_tokenizer_workers = 4
 revision              = "main"
 
-# The engine tests serve `MockModel`, whose forward pass never reads the KV cache. The caches are
-# sized explicitly rather than profiled so the tests do not claim a share of the host's RAM and GPU.
+# The engine tests serve `MockModel`, whose forward pass runs a real attention layer over these
+# caches. They are sized explicitly rather than profiled so the tests do not claim a share of the
+# host's RAM and GPU.
 [cache]
 block_size              = 16
 cache_dtype             = "bf16"   # Most often, it agrees with inference.dtype

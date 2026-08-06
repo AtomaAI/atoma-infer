@@ -2461,25 +2461,26 @@ mod tests {
         const BLOCK_SIZE: usize = 4;
         const NUM_GPU_BLOCKS: usize = 8;
 
-        for queue in ["waiting", "running", "swapped"] {
+        type Enqueue = fn(&mut Scheduler<FcfsPolicy>, SequenceGroup);
+        let queues: [(&str, Enqueue); 3] = [
+            ("waiting", |scheduler, group| {
+                scheduler.waiting.push_back(group)
+            }),
+            ("running", |scheduler, group| {
+                scheduler.running.push_back(group)
+            }),
+            ("swapped", |scheduler, group| {
+                scheduler.swapped.push_back(group)
+            }),
+        ];
+
+        for (queue, enqueue) in queues {
             let mut scheduler = test_scheduler(BLOCK_SIZE, NUM_GPU_BLOCKS, 4);
             let (_, aborted) = create_dummy_prompt(0, BLOCK_SIZE, None, 1);
             let (_, survivor) = create_dummy_prompt(1, BLOCK_SIZE, None, 1);
 
-            match queue {
-                "waiting" => {
-                    scheduler.waiting.push_back(aborted.clone());
-                    scheduler.waiting.push_back(survivor.clone());
-                }
-                "running" => {
-                    scheduler.running.push_back(aborted.clone());
-                    scheduler.running.push_back(survivor.clone());
-                }
-                _ => {
-                    scheduler.swapped.push_back(aborted.clone());
-                    scheduler.swapped.push_back(survivor.clone());
-                }
-            }
+            enqueue(&mut scheduler, aborted.clone());
+            enqueue(&mut scheduler, survivor.clone());
 
             scheduler
                 .abort_sequence_group(aborted.request_id.clone())

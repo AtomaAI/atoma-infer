@@ -9,7 +9,6 @@ use crate::{
     model_executor::{Config, ModelExecutor, ModelThreadDispatcher},
     request::{EngineRequest, ServiceRequest},
     scheduler::Scheduler,
-    sequence::SequenceIdCounter,
     tokenizer::TokenizerWorker,
     types::GenerateRequest,
     validation::Validation,
@@ -17,7 +16,7 @@ use crate::{
 use crate::{
     error::LlmServiceError,
     sampling::logits_processor,
-    sequence::{Sequence, SequenceGroup},
+    sequence::{Sequence, SequenceGroup, SequenceIdCounter},
     validation::ValidGenerateRequest,
 };
 #[cfg(feature = "cuda")]
@@ -40,35 +39,52 @@ use tracing::{error, info, info_span, instrument, Span};
 // TODO:
 // 1. Add proper tokenizer shutdown logic, and other related services
 
-/// Builds the `SequenceGroup` the engine schedules for an already validated request.
+/// Turns validated requests into the `SequenceGroup`s the engine schedules.
 ///
-/// `sequence_id` keys the block manager's block tables, so it has to come from a counter that
-/// never repeats: two live sequences sharing an id share one block table and corrupt each other's
-/// output.
+/// This owns the sequence id counter because those ids key the block manager's block tables: two
+/// live sequences sharing an id share one block table and corrupt each other's output, so no
+/// caller gets to choose an id.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-pub(crate) fn build_sequence_group(
-    request_id: String,
-    valid_request: &ValidGenerateRequest,
-    sequence_id: u64,
+pub(crate) struct RequestAdmitter {
+    /// Source of the sequence ids handed to newly admitted requests.
+    sequence_id_counter: SequenceIdCounter,
+    /// Number of tokens a KV block holds, which fixes how a sequence is split into blocks.
     block_size: usize,
-    arrival_time: Instant,
-) -> Result<SequenceGroup, LlmServiceError> {
-    let sequence = Sequence::new(
-        sequence_id,
-        valid_request.inputs.clone(),
-        valid_request.encoding.get_ids().to_vec(),
-        block_size,
-        valid_request.return_full_text,
-    )?;
+}
 
-    Ok(SequenceGroup::new(
-        request_id,
-        vec![sequence],
-        arrival_time,
-        valid_request.parameters.clone(),
-        valid_request.stopping_parameters.clone(),
-        logits_processor(&valid_request.parameters),
-    )?)
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl RequestAdmitter {
+    pub(crate) fn new(block_size: usize) -> Self {
+        Self {
+            sequence_id_counter: SequenceIdCounter::default(),
+            block_size,
+        }
+    }
+
+    /// Admits an already validated request, giving it a sequence id no other live request holds.
+    pub(crate) fn admit(
+        &mut self,
+        request_id: String,
+        valid_request: &ValidGenerateRequest,
+        arrival_time: Instant,
+    ) -> Result<SequenceGroup, LlmServiceError> {
+        let sequence = Sequence::new(
+            self.sequence_id_counter.next_id(),
+            valid_request.inputs.clone(),
+            valid_request.encoding.get_ids().to_vec(),
+            self.block_size,
+            valid_request.return_full_text,
+        )?;
+
+        Ok(SequenceGroup::new(
+            request_id,
+            vec![sequence],
+            arrival_time,
+            valid_request.parameters.clone(),
+            valid_request.stopping_parameters.clone(),
+            logits_processor(&valid_request.parameters),
+        )?)
+    }
 }
 
 /// `LlmService` - the entrypoint of the Atoma's inference service.
@@ -82,8 +98,8 @@ pub struct LlmService {
     service_request_receiver: UnboundedReceiver<ServiceRequest>,
     /// Sender to communicate with the `LlmEngine` serviceservice_response_sender,
     engine_sender: UnboundedSender<EngineRequest>,
-    /// Block size
-    block_size: usize,
+    /// Admits validated requests, handing each one its own sequence id
+    request_admitter: RequestAdmitter,
     /// Join handle for the background task
     /// running the `LlmEngine` instance
     llm_engine_handle: JoinHandle<Result<(), LlmServiceError>>,
@@ -91,8 +107,6 @@ pub struct LlmService {
     model_config: ModelConfig,
     /// Starting time of the instance
     start_time: Instant,
-    /// Source of the sequence ids handed to newly admitted requests
-    sequence_id_counter: SequenceIdCounter,
     /// A request validation instance
     validation_service: Validation,
     /// Tokenizer handle
@@ -255,10 +269,9 @@ impl LlmService {
         Ok(Self {
             service_request_receiver,
             engine_sender,
-            block_size,
+            request_admitter: RequestAdmitter::new(block_size),
             llm_engine_handle,
             model_config,
-            sequence_id_counter: SequenceIdCounter::default(),
             start_time,
             validation_service,
             shutdown_signal,
@@ -349,13 +362,8 @@ impl LlmService {
             "Received and validated new request"
         );
 
-        build_sequence_group(
-            request_id,
-            &valid_request,
-            self.sequence_id_counter.next_id(),
-            self.block_size,
-            arrival_time,
-        )
+        self.request_admitter
+            .admit(request_id, &valid_request, arrival_time)
     }
 
     /// Processes newly arrived inputs
@@ -415,7 +423,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::{sequence::SequenceIdCounter, tests::fixtures::valid_request};
+    use crate::tests::fixtures::valid_request;
 
     const BLOCK_SIZE: usize = 4;
     const MAX_NEW_TOKENS: u32 = 16;
@@ -424,20 +432,15 @@ mod tests {
     fn test_concurrent_requests_get_distinct_sequence_ids() {
         const NUM_REQUESTS: usize = 32;
 
-        let mut counter = SequenceIdCounter::default();
+        let mut admitter = RequestAdmitter::new(BLOCK_SIZE);
         let mut sequence_ids = HashSet::with_capacity(NUM_REQUESTS);
 
         for i in 0..NUM_REQUESTS {
             let request_id = format!("request-{i}");
             let request = valid_request(&request_id, 8, MAX_NEW_TOKENS);
-            let sequence_group = build_sequence_group(
-                request_id,
-                &request,
-                counter.next_id(),
-                BLOCK_SIZE,
-                Instant::now(),
-            )
-            .expect("Failed to build sequence group");
+            let sequence_group = admitter
+                .admit(request_id, &request, Instant::now())
+                .expect("Failed to admit request");
 
             sequence_ids.extend(sequence_group.sequences.keys().copied());
         }
@@ -450,24 +453,16 @@ mod tests {
     }
 
     #[test]
-    fn test_sequence_group_carries_the_request_prompt() {
+    fn test_admitted_request_carries_its_own_prompt() {
         let request = valid_request("request-3", 6, MAX_NEW_TOKENS);
 
-        let sequence_group = build_sequence_group(
-            "request-3".to_string(),
-            &request,
-            7,
-            BLOCK_SIZE,
-            Instant::now(),
-        )
-        .expect("Failed to build sequence group");
+        let sequence_group = RequestAdmitter::new(BLOCK_SIZE)
+            .admit("request-3".to_string(), &request, Instant::now())
+            .expect("Failed to admit request");
 
         assert_eq!(sequence_group.request_id, "request-3");
         assert_eq!(sequence_group.prompt(), "prompt of request-3");
-        assert_eq!(
-            sequence_group.sequences.keys().collect::<Vec<_>>(),
-            vec![&7]
-        );
+        assert_eq!(sequence_group.sequences.len(), 1);
         assert_eq!(
             sequence_group.prompt_token_ids(),
             request.encoding.get_ids().to_vec()
