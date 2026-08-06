@@ -19,8 +19,9 @@ use tracing::{debug, error, instrument, trace, warn};
 
 /// The gauge carrying the number of free GPU KV blocks.
 ///
-/// The benchmark harness's KV-leak probe samples this by name; `atoma-bench` re-declares it in
-/// `atoma_bench::kv_probe::FREE_GPU_BLOCKS_METRIC`, and a test in this crate holds the two equal.
+/// This is the engine's published name for it, and the one an operator puts in the benchmark
+/// harness's `kv_probe.metric`. `tests::concurrency` scrapes it with the harness's own parser, so
+/// a rename that the harness could not follow fails there.
 pub const FREE_GPU_BLOCKS_METRIC: &str = "atoma_kv_free_gpu_blocks";
 
 /// Preemption modes.

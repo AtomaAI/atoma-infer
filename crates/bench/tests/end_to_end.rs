@@ -121,11 +121,16 @@ async fn completions(State(state): State<Arc<StubState>>) -> Response {
         .into_response()
 }
 
+/// The gauge the stub engine publishes its free-block count on, standing in for the name a real
+/// engine publishes and an operator puts in `kv_probe.metric`.
+const STUB_FREE_BLOCKS_METRIC: &str = "atoma_kv_free_gpu_blocks";
+
 /// Publishes the free-block gauge in the Prometheus text format.
 async fn metrics(State(state): State<Arc<StubState>>) -> String {
     format!(
-        "# TYPE atoma_kv_free_gpu_blocks gauge\natoma_kv_free_gpu_blocks {}\n",
-        state.free_blocks()
+        "# TYPE {metric} gauge\n{metric} {value}\n",
+        metric = STUB_FREE_BLOCKS_METRIC,
+        value = state.free_blocks()
     )
 }
 
@@ -215,6 +220,7 @@ fn config(address: SocketAddr, runs: usize) -> BenchConfig {
             ..VllmBaseline::default()
         },
         kv_probe: KvProbeConfig {
+            metric: STUB_FREE_BLOCKS_METRIC.to_string(),
             interval_ms: 10,
             ..KvProbeConfig::default()
         },

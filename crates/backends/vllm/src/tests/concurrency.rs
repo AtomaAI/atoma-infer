@@ -16,9 +16,9 @@ use atoma_bench::kv_probe::{FreeBlockSample, KvProbeConfig, KvProbeVerdict};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use crate::{
+    admission::RequestAdmitter,
     config::{CacheConfig, SchedulerConfig},
     egress::{ClientState, ResponseSenders},
-    llm_service::RequestAdmitter,
     output::{GenerateStreamingOutput, StreamResponse},
     policy::FcfsPolicy,
     scheduler::Scheduler,
@@ -438,22 +438,13 @@ fn test_a_disconnected_client_does_not_disturb_the_others() {
     );
 }
 
-/// The name the engine publishes the gauge under is what the harness scrapes; the two constants
-/// live in different crates and have to stay equal.
-#[test]
-fn test_the_free_block_gauge_is_named_what_the_probe_samples() {
-    assert_eq!(
-        crate::scheduler::FREE_GPU_BLOCKS_METRIC,
-        atoma_bench::kv_probe::FREE_GPU_BLOCKS_METRIC
-    );
-}
-
-/// Samples the free-block gauge the way the benchmark harness does: scrape the Prometheus text,
-/// read the gauge out of it.
+/// Samples the free-block gauge the way the benchmark harness does: scrape the Prometheus text
+/// with the harness's own parser, looking for the name the engine says it publishes under. A
+/// rename on either side of that seam fails every test that samples the gauge.
 fn sample_gauge(handle: &PrometheusHandle, at: Duration) -> FreeBlockSample {
     let free_blocks = atoma_bench::kv_probe::parse_gauge(
         &handle.render(),
-        atoma_bench::kv_probe::FREE_GPU_BLOCKS_METRIC,
+        crate::scheduler::FREE_GPU_BLOCKS_METRIC,
     )
     .expect("The scheduler did not publish the free-block gauge");
 

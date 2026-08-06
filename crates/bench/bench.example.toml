@@ -87,7 +87,9 @@ server_args             = [  ]
 shm_size                = "16g"
 startup_timeout_seconds = 900
 
-# A run fails if the engine's free-block count never recovers to where it started.
+# A run fails if the engine's free-block count never recovers to where it started. `metric` is the
+# gauge the engine under test publishes that count on, so it changes with the engine: the value
+# below is `atoma-infer`'s. Required whenever `engine.metrics_url` is set.
 [kv_probe]
 interval_ms      = 1000
 metric           = "atoma_kv_free_gpu_blocks"

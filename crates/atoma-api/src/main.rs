@@ -3,10 +3,7 @@ use atoma_backends::{LlamaModel, LlmService};
 #[cfg(feature = "cuda")]
 use clap::Parser;
 #[cfg(feature = "cuda")]
-use std::{
-    env,
-    sync::{atomic::AtomicU64, Arc},
-};
+use std::env;
 #[cfg(feature = "cuda")]
 use tokio::{net::TcpListener, sync::mpsc};
 
@@ -63,7 +60,6 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let app_state = AppState {
-        request_counter: Arc::new(AtomicU64::new(0)),
         llm_service_sender,
         shutdown_signal_sender,
         streaming_interval_in_millis: env::var("STREAMING_INTERVAL_IN_MILLIS")

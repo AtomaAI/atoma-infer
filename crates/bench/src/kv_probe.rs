@@ -18,29 +18,46 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, task::JoinHandle};
 use tracing::warn;
 
-/// The gauge the engine publishes its free GPU KV block count on.
-pub const FREE_GPU_BLOCKS_METRIC: &str = "atoma_kv_free_gpu_blocks";
-
 /// How the probe samples and how it judges what it sampled.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct KvProbeConfig {
     /// Name of the gauge carrying the free block count.
+    ///
+    /// The engine under test owns this name, so the harness takes it as configuration rather than
+    /// compiling in a copy that could drift: `atoma-infer` publishes
+    /// `atoma_vllm_backend::scheduler::FREE_GPU_BLOCKS_METRIC`, and another engine publishes
+    /// whatever it publishes. Empty means unset, which is only allowed when no `metrics_url` is
+    /// configured and the probe therefore never runs.
+    #[serde(default)]
     pub metric: String,
     /// How often the gauge is sampled.
+    #[serde(default = "default_interval_ms")]
     pub interval_ms: u64,
     /// Blocks the pool may be short by at the end of a run without failing it.
+    #[serde(default)]
     pub tolerance_blocks: u64,
     /// Number of windows the series is split into when looking for a falling ceiling.
+    #[serde(default = "default_num_windows")]
     pub num_windows: usize,
+}
+
+/// A sample a second: fine enough to see a batch retire, coarse enough not to perturb the run.
+fn default_interval_ms() -> u64 {
+    1_000
+}
+
+/// Four windows over a run: enough for a ceiling to fall three times before the run is judged.
+fn default_num_windows() -> usize {
+    4
 }
 
 impl Default for KvProbeConfig {
     fn default() -> Self {
         Self {
-            metric: FREE_GPU_BLOCKS_METRIC.to_string(),
-            interval_ms: 1_000,
+            metric: String::new(),
+            interval_ms: default_interval_ms(),
             tolerance_blocks: 0,
-            num_windows: 4,
+            num_windows: default_num_windows(),
         }
     }
 }

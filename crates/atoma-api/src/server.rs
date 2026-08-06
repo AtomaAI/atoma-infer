@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::time::Duration;
 
 use anyhow::Context;
 use atoma_backends::{GenerateRequest, ServiceRequest};
@@ -32,6 +26,7 @@ use tokio::{
 use tracing::{error, info, instrument};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+use uuid::Uuid;
 
 use crate::{
     api::chat_completions::{ChatCompletionResponse, RequestBody},
@@ -52,10 +47,6 @@ pub const AUTH_BEARER_PREFIX: &str = "Bearer ";
 /// application, particularly for handling requests and managing the lifecycle of the server.
 #[derive(Clone)]
 pub struct AppState {
-    /// A counter for generating unique request IDs.
-    ///
-    /// This atomic counter is incremented for each new request, ensuring unique identification.
-    pub request_counter: Arc<AtomicU64>,
     /// A sender for non-streaming LLM service requests.
     ///
     /// This channel is used to send generate requests to the LLM service and receive
@@ -223,6 +214,16 @@ impl IntoResponse for ChatResponse {
     }
 }
 
+/// The id an arriving request is known by, here and everywhere downstream.
+///
+/// UUIDv7: the leading 48 bits are the arrival time in milliseconds, so an id carries its own
+/// timestamp into the engine's logs and ids issued in different milliseconds sort by arrival. The
+/// rest is random, which keeps ids unique across processes and across restarts — a per-process
+/// counter is neither.
+fn next_request_id() -> Uuid {
+    Uuid::now_v7()
+}
+
 /// Handles chat completion requests by processing the input, sending it to the LLM service,
 /// and returning the generated response.
 ///
@@ -270,12 +271,7 @@ pub async fn completion_handler(
     headers: HeaderMap,
     Json(request): Json<RequestBody>,
 ) -> Result<ChatResponse, (StatusCode, Json<serde_json::Value>)> {
-    let request_number = app_state.request_counter.fetch_add(1, Ordering::SeqCst);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_nanos();
-    let request_id = format!("{request_number}-{now}");
+    let request_id = next_request_id().to_string();
 
     let _auth_key = headers
         .get(header::AUTHORIZATION)
@@ -467,6 +463,8 @@ async fn handle_generate_stream_request(
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use axum::{
         body::{to_bytes, Body},
         http::Request,
@@ -484,7 +482,6 @@ mod tests {
 
         (
             AppState {
-                request_counter: Arc::new(AtomicU64::new(0)),
                 llm_service_sender,
                 shutdown_signal_sender,
                 streaming_interval_in_millis: 100,
@@ -571,6 +568,48 @@ mod tests {
         let (status, _) = get(router, CHAT_COMPLETIONS_PATH).await;
 
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// Two requests must never share an id: ids key the engine's client channels, and a collision
+    /// hands one client another's tokens.
+    #[test]
+    fn test_request_ids_are_unique() {
+        const NUM_IDS: usize = 1024;
+
+        let ids = (0..NUM_IDS)
+            .map(|_| next_request_id())
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(ids.len(), NUM_IDS);
+    }
+
+    #[test]
+    fn test_request_ids_carry_their_arrival_time() {
+        let before = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards");
+
+        let (seconds, _) = next_request_id()
+            .get_timestamp()
+            .expect("A request id must carry a timestamp")
+            .to_unix();
+
+        assert!(
+            seconds >= before.as_secs() && seconds <= before.as_secs() + 1,
+            "id timestamp {seconds} is not the arrival time {}",
+            before.as_secs()
+        );
+    }
+
+    /// Ids issued in different milliseconds sort by arrival, which is what makes them useful for
+    /// ordering a log. Within one millisecond UUIDv7 makes no such promise.
+    #[test]
+    fn test_request_ids_sort_by_arrival() {
+        let earlier = next_request_id().to_string();
+        std::thread::sleep(Duration::from_millis(2));
+        let later = next_request_id().to_string();
+
+        assert!(earlier < later, "{earlier} should sort before {later}");
     }
 
     #[tokio::test]

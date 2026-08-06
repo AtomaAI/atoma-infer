@@ -58,8 +58,8 @@ impl BenchConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`BenchError::Config`] if the protocol's run count is not met, or if the baseline
-    /// is not pinned.
+    /// Returns [`BenchError::Config`] if the protocol's run count is not met, if the KV probe has
+    /// an endpoint to scrape but no gauge to look for, or if the baseline is not pinned.
     pub fn validate(&self) -> Result<()> {
         if self.run.runs < 3 {
             return Err(BenchError::Config(format!(
@@ -70,6 +70,14 @@ impl BenchConfig {
         if self.load.num_requests == 0 {
             return Err(BenchError::Config(
                 "A run with no requests measures nothing".to_string(),
+            ));
+        }
+        if self.engine.metrics_url.is_some() && self.kv_probe.metric.trim().is_empty() {
+            return Err(BenchError::Config(
+                "`engine.metrics_url` is set but `kv_probe.metric` is not, so the KV-leak probe \
+                 has no gauge to sample; name the gauge the engine publishes its free block count \
+                 on, as `bench.example.toml` does"
+                    .to_string(),
             ));
         }
         self.baseline.validate()
@@ -214,6 +222,9 @@ gpus = "all"
 shm_size = "16g"
 server_args = []
 startup_timeout_seconds = 900
+
+[kv_probe]
+metric = "atoma_kv_free_gpu_blocks"
 "#
     }
 
@@ -269,6 +280,37 @@ startup_timeout_seconds = 900
         let error = BenchConfig::load(&path).expect_err("Two runs is not a median");
 
         assert!(matches!(error, BenchError::Config(_)), "{error}");
+    }
+
+    /// The gauge name belongs to the engine, so the harness cannot supply it. Scraping an endpoint
+    /// for a gauge nobody named finds nothing and reports a leak-free run it never watched.
+    #[test]
+    fn test_a_watched_engine_without_a_named_gauge_is_rejected() {
+        let path = write_config(
+            &temp_dir("config-metric"),
+            &config_toml().replace("metric = \"atoma_kv_free_gpu_blocks\"", "metric = \"\""),
+        );
+
+        let error = BenchConfig::load(&path).expect_err("An unnamed gauge cannot be sampled");
+
+        assert!(matches!(error, BenchError::Config(_)), "{error}");
+        assert!(format!("{error}").contains("kv_probe.metric"), "{error}");
+    }
+
+    /// An engine that exposes no metrics endpoint is not watched at all, so it needs no gauge.
+    #[test]
+    fn test_an_unwatched_engine_needs_no_gauge() {
+        let path = write_config(
+            &temp_dir("config-unwatched"),
+            &config_toml()
+                .replace("metrics_url = \"http://127.0.0.1:8080/metrics\"\n", "")
+                .replace("\n[kv_probe]\nmetric = \"atoma_kv_free_gpu_blocks\"\n", ""),
+        );
+
+        let config = BenchConfig::load(&path).expect("Failed to load the configuration");
+
+        assert!(config.engine.metrics_url.is_none());
+        assert!(config.kv_probe.metric.is_empty());
     }
 
     #[test]
