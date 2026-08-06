@@ -1,23 +1,27 @@
+use std::time::Instant;
 #[cfg(feature = "cuda")]
-use std::{path::Path, str::FromStr, time::Instant};
+use std::{path::Path, str::FromStr};
 
 #[cfg(feature = "cuda")]
 use crate::{
     config::{CacheConfig, ModelConfig, SchedulerConfig, ValidationConfig},
-    error::LlmServiceError,
     llm_engine::LlmEngine,
     model_executor::{Config, ModelExecutor, ModelThreadDispatcher},
     request::{EngineRequest, ServiceRequest},
     scheduler::Scheduler,
-    sequence::{Sequence, SequenceGroup},
+    sequence::SequenceIdCounter,
     tokenizer::TokenizerWorker,
     types::GenerateRequest,
-    validation::{ValidGenerateRequest, Validation},
+    validation::Validation,
+};
+use crate::{
+    error::LlmServiceError,
+    sampling::logits_processor,
+    sequence::{Sequence, SequenceGroup},
+    validation::ValidGenerateRequest,
 };
 #[cfg(feature = "cuda")]
 use candle_core::DType;
-#[cfg(feature = "cuda")]
-use candle_transformers::generation::{LogitsProcessor, Sampling};
 #[cfg(feature = "cuda")]
 use metrics::{counter, gauge};
 #[cfg(feature = "cuda")]
@@ -35,6 +39,37 @@ use tracing::{error, info, info_span, instrument, Span};
 
 // TODO:
 // 1. Add proper tokenizer shutdown logic, and other related services
+
+/// Builds the `SequenceGroup` the engine schedules for an already validated request.
+///
+/// `sequence_id` keys the block manager's block tables, so it has to come from a counter that
+/// never repeats: two live sequences sharing an id share one block table and corrupt each other's
+/// output.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn build_sequence_group(
+    request_id: String,
+    valid_request: &ValidGenerateRequest,
+    sequence_id: u64,
+    block_size: usize,
+    arrival_time: Instant,
+) -> Result<SequenceGroup, LlmServiceError> {
+    let sequence = Sequence::new(
+        sequence_id,
+        valid_request.inputs.clone(),
+        valid_request.encoding.get_ids().to_vec(),
+        block_size,
+        valid_request.return_full_text,
+    )?;
+
+    Ok(SequenceGroup::new(
+        request_id,
+        vec![sequence],
+        arrival_time,
+        valid_request.parameters.clone(),
+        valid_request.stopping_parameters.clone(),
+        logits_processor(&valid_request.parameters),
+    )?)
+}
 
 /// `LlmService` - the entrypoint of the Atoma's inference service.
 /// It receives requests from the Atoma's event subscriber
@@ -56,8 +91,8 @@ pub struct LlmService {
     model_config: ModelConfig,
     /// Starting time of the instance
     start_time: Instant,
-    /// Request counter
-    request_counter: u64,
+    /// Source of the sequence ids handed to newly admitted requests
+    sequence_id_counter: SequenceIdCounter,
     /// A request validation instance
     validation_service: Validation,
     /// Tokenizer handle
@@ -223,7 +258,7 @@ impl LlmService {
             block_size,
             llm_engine_handle,
             model_config,
-            request_counter: 0,
+            sequence_id_counter: SequenceIdCounter::default(),
             start_time,
             validation_service,
             shutdown_signal,
@@ -314,53 +349,13 @@ impl LlmService {
             "Received and validated new request"
         );
 
-        let sequence_id = self.request_counter;
-
-        let sampling =
-            if !valid_request.parameters.do_sample || valid_request.parameters.temperature == 1.0 {
-                Sampling::ArgMax
-            } else if valid_request.parameters.top_p == 1.0 && valid_request.parameters.top_k == 0 {
-                Sampling::All {
-                    temperature: valid_request.parameters.temperature as f64,
-                }
-            } else if valid_request.parameters.top_k == 0 && valid_request.parameters.top_p < 1.0 {
-                Sampling::TopP {
-                    p: valid_request.parameters.top_p as f64,
-                    temperature: valid_request.parameters.temperature as f64,
-                }
-            } else if valid_request.parameters.top_k != 0 && valid_request.parameters.top_p == 1.0 {
-                Sampling::TopK {
-                    k: valid_request.parameters.top_k as usize,
-                    temperature: valid_request.parameters.temperature as f64,
-                }
-            } else {
-                Sampling::TopKThenTopP {
-                    k: valid_request.parameters.top_k as usize,
-                    p: valid_request.parameters.top_p as f64,
-                    temperature: valid_request.parameters.temperature as f64,
-                }
-            };
-
-        let logits_processor =
-            LogitsProcessor::from_sampling(valid_request.parameters.random_seed, sampling);
-
-        let sequence = Sequence::new(
-            sequence_id,
-            valid_request.inputs.clone(),
-            valid_request.encoding.get_ids().to_vec(),
-            self.block_size,
-            valid_request.return_full_text,
-        )?;
-        let sequence_group = SequenceGroup::new(
+        build_sequence_group(
             request_id,
-            vec![sequence],
+            &valid_request,
+            self.sequence_id_counter.next_id(),
+            self.block_size,
             arrival_time,
-            valid_request.parameters.clone(),
-            valid_request.stopping_parameters.clone(),
-            logits_processor,
-        )?;
-
-        Ok(sequence_group)
+        )
     }
 
     /// Processes newly arrived inputs
@@ -412,5 +407,70 @@ impl LlmService {
 
         info!("`LlmService` stopped successfully");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+    use crate::{sequence::SequenceIdCounter, tests::fixtures::valid_request};
+
+    const BLOCK_SIZE: usize = 4;
+    const MAX_NEW_TOKENS: u32 = 16;
+
+    #[test]
+    fn test_concurrent_requests_get_distinct_sequence_ids() {
+        const NUM_REQUESTS: usize = 32;
+
+        let mut counter = SequenceIdCounter::default();
+        let mut sequence_ids = HashSet::with_capacity(NUM_REQUESTS);
+
+        for i in 0..NUM_REQUESTS {
+            let request_id = format!("request-{i}");
+            let request = valid_request(&request_id, 8, MAX_NEW_TOKENS);
+            let sequence_group = build_sequence_group(
+                request_id,
+                &request,
+                counter.next_id(),
+                BLOCK_SIZE,
+                Instant::now(),
+            )
+            .expect("Failed to build sequence group");
+
+            sequence_ids.extend(sequence_group.sequences.keys().copied());
+        }
+
+        assert_eq!(
+            sequence_ids.len(),
+            NUM_REQUESTS,
+            "each request must own its sequence id, or its block table is shared"
+        );
+    }
+
+    #[test]
+    fn test_sequence_group_carries_the_request_prompt() {
+        let request = valid_request("request-3", 6, MAX_NEW_TOKENS);
+
+        let sequence_group = build_sequence_group(
+            "request-3".to_string(),
+            &request,
+            7,
+            BLOCK_SIZE,
+            Instant::now(),
+        )
+        .expect("Failed to build sequence group");
+
+        assert_eq!(sequence_group.request_id, "request-3");
+        assert_eq!(sequence_group.prompt(), "prompt of request-3");
+        assert_eq!(
+            sequence_group.sequences.keys().collect::<Vec<_>>(),
+            vec![&7]
+        );
+        assert_eq!(
+            sequence_group.prompt_token_ids(),
+            request.encoding.get_ids().to_vec()
+        );
     }
 }

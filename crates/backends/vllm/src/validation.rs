@@ -1,16 +1,12 @@
 use thiserror::Error;
 use tokenizers::Encoding;
 use tokio::sync::{mpsc, oneshot};
-#[cfg(feature = "cuda")]
-use tracing::error;
-use tracing::{info_span, instrument, trace, Span};
+use tracing::{error, info_span, instrument, trace, Span};
 
-use crate::tokenizer::{EncodeTokenizerRequest, TokenizerError};
-#[cfg(feature = "cuda")]
-use crate::types::{GenerateParameters, GenerateRequest};
-
-#[cfg(feature = "cuda")]
-const DEFAULT_RANDOM_SEED: u64 = 1_283_768_955;
+use crate::{
+    tokenizer::{EncodeTokenizerRequest, TokenizerError},
+    types::{GenerateParameters, GenerateRequest},
+};
 
 /// `Validation` - Responsible for validating `Request`/`Response` parameters
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -112,7 +108,6 @@ impl Validation {
     /// * Tokenization fails
     /// * The total number of tokens (input + new) exceeds the maximum allowed
     /// * The input length exceeds the maximum allowed
-    #[cfg(feature = "cuda")]
     #[instrument(skip_all)]
     async fn validate_input(
         &self,
@@ -187,7 +182,7 @@ impl Validation {
     /// - Invalid token limits (max_new_tokens, truncate)
     /// - Empty input
     /// - Too many stop sequences
-    #[cfg(feature = "cuda")]
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     #[instrument(skip_all)]
     pub(crate) async fn validate(
         &self,
@@ -293,11 +288,8 @@ impl Validation {
             ));
         }
 
-        // If seed is None, assign a default value
-        // TODO: how secure is this for Atoma nodes ?
         let random_seed = match random_seed {
-            // TODO: this approach might be unsecure for Atoma nodes
-            None => DEFAULT_RANDOM_SEED,
+            None => fresh_random_seed(),
             Some(seed) => {
                 if best_of > 1 {
                     error!("Best of is not supported with sampling");
@@ -380,6 +372,15 @@ impl Validation {
             return_full_text: return_full_text.unwrap_or(false),
         })
     }
+}
+
+/// Draws the sampling seed for a request that did not pin one.
+///
+/// Every unseeded request has to get its own seed: sharing one makes the whole node decode the
+/// same continuation for the same prompt, which is a correctness bug for callers who asked for
+/// sampling rather than a reproducibility feature.
+fn fresh_random_seed() -> u64 {
+    rand::random()
 }
 
 /// `ValidGenerateRequest` - A validated and processed version of a `GenerateRequest`.
@@ -491,4 +492,203 @@ pub enum ValidationError {
     EmptyInput,
     #[error("Invalid truncate paremeter: `{0}` < `{1}`")]
     Truncate(usize, usize),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use tokenizers::{Encoding, Token};
+
+    use super::*;
+    use crate::types::GenerateParameters;
+
+    const MAX_INPUT_LENGTH: usize = 128;
+    const MAX_TOTAL_TOKENS: u32 = 256;
+
+    /// A `Validation` whose tokenizer is a background task returning one token per whitespace
+    /// separated word, so the tests exercise the real request path without loading a tokenizer.
+    fn test_validation() -> Validation {
+        let (sender, mut receiver) = mpsc::unbounded_channel::<EncodeTokenizerRequest>();
+        tokio::spawn(async move {
+            while let Some(request) = receiver.recv().await {
+                let tokens = request
+                    .input
+                    .split_whitespace()
+                    .enumerate()
+                    .map(|(i, word)| Token::new(i as u32, word.to_string(), (0, 0)))
+                    .collect::<Vec<_>>();
+                let encoding = Encoding::from_tokens(tokens, 0);
+                request.sender.send(Ok((encoding, request.input))).ok();
+            }
+        });
+
+        Validation::new(1, 4, 8, MAX_INPUT_LENGTH, MAX_TOTAL_TOKENS, sender)
+    }
+
+    fn generate_request(parameters: GenerateParameters) -> GenerateRequest {
+        GenerateRequest {
+            request_id: "request".to_string(),
+            inputs: "Hello world, from the Caribbean".to_string(),
+            parameters,
+        }
+    }
+
+    fn generate_parameters() -> GenerateParameters {
+        GenerateParameters {
+            best_of: None,
+            temperature: None,
+            repetition_penalty: None,
+            frequency_penalty: None,
+            repeat_last_n: None,
+            top_k: None,
+            top_p: None,
+            typical_p: None,
+            do_sample: true,
+            max_new_tokens: Some(16),
+            return_full_text: None,
+            stop: Vec::new(),
+            truncate: None,
+            decoder_input_details: false,
+            random_seed: None,
+            top_n_tokens: None,
+            n: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unseeded_requests_do_not_share_a_seed() {
+        const NUM_REQUESTS: usize = 64;
+
+        let validation = test_validation();
+        let mut seeds = HashSet::with_capacity(NUM_REQUESTS);
+        for _ in 0..NUM_REQUESTS {
+            let valid_request = validation
+                .validate(generate_request(generate_parameters()))
+                .await
+                .expect("Failed to validate request");
+            seeds.insert(valid_request.parameters.random_seed);
+        }
+
+        assert_eq!(
+            seeds.len(),
+            NUM_REQUESTS,
+            "unseeded requests must not decode from a shared seed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_requested_seed_is_preserved() {
+        let validation = test_validation();
+        let parameters = GenerateParameters {
+            random_seed: Some(1234),
+            ..generate_parameters()
+        };
+
+        let valid_request = validation
+            .validate(generate_request(parameters))
+            .await
+            .expect("Failed to validate request");
+
+        assert_eq!(valid_request.parameters.random_seed, 1234);
+    }
+
+    /// The OpenAI defaults have to survive validation unchanged, since they are what selects the
+    /// decoding strategy downstream.
+    #[tokio::test]
+    async fn test_default_sampling_parameters_are_normalised() {
+        let validation = test_validation();
+
+        let valid_request = validation
+            .validate(generate_request(generate_parameters()))
+            .await
+            .expect("Failed to validate request");
+
+        assert_eq!(valid_request.parameters.temperature, 1.0);
+        assert_eq!(valid_request.parameters.top_k, 0);
+        assert_eq!(valid_request.parameters.top_p, 1.0);
+        assert!(valid_request.parameters.do_sample);
+    }
+
+    #[tokio::test]
+    async fn test_empty_input_is_rejected() {
+        let validation = test_validation();
+        let mut request = generate_request(generate_parameters());
+        request.inputs = String::new();
+
+        let error = validation
+            .validate(request)
+            .await
+            .expect_err("Empty inputs must be rejected");
+
+        assert!(matches!(error, ValidationError::EmptyInput));
+    }
+
+    #[tokio::test]
+    async fn test_non_positive_temperature_is_rejected() {
+        let validation = test_validation();
+        let parameters = GenerateParameters {
+            temperature: Some(0.0),
+            ..generate_parameters()
+        };
+
+        let error = validation
+            .validate(generate_request(parameters))
+            .await
+            .expect_err("Non-positive temperature must be rejected");
+
+        assert!(matches!(error, ValidationError::Temperature));
+    }
+
+    #[tokio::test]
+    async fn test_too_many_stop_sequences_are_rejected() {
+        let validation = test_validation();
+        let parameters = GenerateParameters {
+            stop: (0..8).map(|i| format!("stop-{i}")).collect(),
+            ..generate_parameters()
+        };
+
+        let error = validation
+            .validate(generate_request(parameters))
+            .await
+            .expect_err("Too many stop sequences must be rejected");
+
+        assert!(matches!(error, ValidationError::StopSequence(4, 8)));
+    }
+
+    #[tokio::test]
+    async fn test_request_exceeding_total_tokens_is_rejected() {
+        let validation = test_validation();
+        let parameters = GenerateParameters {
+            max_new_tokens: Some(MAX_TOTAL_TOKENS),
+            ..generate_parameters()
+        };
+
+        let error = validation
+            .validate(generate_request(parameters))
+            .await
+            .expect_err("Requests over the total token budget must be rejected");
+
+        assert!(matches!(error, ValidationError::MaxTotalTokens(..)));
+    }
+
+    #[tokio::test]
+    async fn test_unset_max_new_tokens_fills_the_remaining_budget() {
+        let validation = test_validation();
+        let parameters = GenerateParameters {
+            max_new_tokens: None,
+            ..generate_parameters()
+        };
+
+        let valid_request = validation
+            .validate(generate_request(parameters))
+            .await
+            .expect("Failed to validate request");
+
+        let input_token_len = valid_request.input_token_len as u32;
+        assert_eq!(
+            valid_request.stopping_parameters.max_new_tokens,
+            MAX_TOTAL_TOKENS - input_token_len
+        );
+    }
 }

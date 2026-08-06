@@ -6,6 +6,7 @@ pub mod block;
 pub mod block_allocator;
 pub mod block_manager;
 pub mod config;
+pub mod egress;
 pub mod error;
 pub mod llm_engine;
 pub mod llm_service;
@@ -16,10 +17,11 @@ pub mod models;
 pub mod output;
 pub mod policy;
 pub mod request;
+pub mod sampling;
 pub mod scheduler;
 pub mod sequence;
-#[cfg(all(test, feature = "cuda"))]
-pub mod tests;
+#[cfg(test)]
+mod tests;
 pub mod tokenizer;
 pub mod types;
 pub mod validation;

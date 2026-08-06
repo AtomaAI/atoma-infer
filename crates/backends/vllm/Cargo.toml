@@ -16,6 +16,7 @@ futures             = { workspace = true }
 hf-hub              = { workspace = true }
 metrics             = { workspace = true }
 models              = { workspace = true }
+rand                = { workspace = true }
 serde               = { workspace = true }
 serde_json          = { workspace = true }
 sys-info            = { workspace = true }
@@ -25,7 +26,6 @@ tokio               = { workspace = true, features = [ "fs", "macros" ] }
 tracing             = { workspace = true }
 
 [dev-dependencies]
-rand               = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [features]

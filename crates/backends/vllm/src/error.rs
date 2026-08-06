@@ -17,8 +17,6 @@ use crate::model_executor::{ConfigError, ModelLoaderError, ModelThreadError};
 
 #[derive(Debug, Error)]
 pub enum EngineError {
-    #[error("Flume send error: `{0}`")]
-    FlumeSendError(String),
     #[error("Scheduler error: `{0}`")]
     SchedulerError(#[from] SchedulerError),
     #[error("Sequence error: `{0}`")]
@@ -31,8 +29,6 @@ pub enum EngineError {
     SendError(#[from] SendError<Vec<GenerateRequestOutput>>),
     #[error("Recv error: `{0}`")]
     RecvError(#[from] RecvError),
-    #[error("Failed to send response to the OpenAI API service: {0}")]
-    SendResponseError(String),
 }
 
 #[derive(Debug, Error)]
