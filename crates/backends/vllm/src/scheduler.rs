@@ -365,11 +365,12 @@ impl<P> Scheduler<P> {
     /// This method searches for the sequence group with the specified ID in all state queues
     /// (waiting, running, and swapped). If found:
     ///
-    /// 1. It removes the sequence group from its current queue.
-    /// 2. For any unfinished sequences in the group, it: a. Sets their status to `FinishedAborted`.
-    ///    b. Frees the associated resources.
+    /// 1. For any unfinished sequences in the group, it sets their status to `FinishedAborted` and
+    ///    frees the associated blocks.
+    /// 2. It removes the sequence group from its queue.
     ///
-    /// If no matching sequence group is found, this method does nothing.
+    /// If no matching sequence group is found, this method does nothing. A request id lives in at
+    /// most one queue, so all three are filtered rather than guessing which queue holds it.
     ///
     /// # Arguments
     ///
@@ -390,54 +391,35 @@ impl<P> Scheduler<P> {
     pub fn abort_sequence_group(&mut self, request_id: String) -> Result<(), SchedulerError> {
         debug!("Aborting sequence group..");
 
-        let mut queue_identifier = 'w';
-        let waiting_length = self.waiting.len();
-        let running_length = self.running.len();
-
         let mut sequence_ids_to_free = vec![];
-        let mut index = 0;
         for sequence_group in self
             .waiting
             .iter()
             .chain(self.running.iter().chain(self.swapped.iter()))
+            .filter(|s| s.request_id == request_id)
         {
-            if sequence_group.request_id == request_id {
-                for sequence in sequence_group.sequences.values() {
-                    let mut sequence_guard_lock = sequence.write_lock()?;
-                    let (sequence_id, is_finished) = (
-                        sequence_guard_lock.sequence_id(),
-                        sequence_guard_lock.is_finished(),
-                    );
-                    debug!("Sequence ID: {}, is finished: {}", sequence_id, is_finished);
-                    if is_finished {
-                        continue;
-                    }
-                    sequence_guard_lock.set_sequence_status(SequenceStatus::FinishedAborted);
-                    sequence_ids_to_free.push(sequence_id);
+            for sequence in sequence_group.sequences.values() {
+                let mut sequence_guard_lock = sequence.write_lock()?;
+                let (sequence_id, is_finished) = (
+                    sequence_guard_lock.sequence_id(),
+                    sequence_guard_lock.is_finished(),
+                );
+                debug!("Sequence ID: {}, is finished: {}", sequence_id, is_finished);
+                if is_finished {
+                    continue;
                 }
-
-                break;
+                sequence_guard_lock.set_sequence_status(SequenceStatus::FinishedAborted);
+                sequence_ids_to_free.push(sequence_id);
             }
-            index += 1;
         }
 
         for sequence_id in sequence_ids_to_free {
             self.free_sequence(sequence_id)?;
         }
 
-        if index >= waiting_length && index < waiting_length + running_length {
-            queue_identifier = 'r';
-        } else if index > waiting_length + running_length {
-            queue_identifier = 's';
-        }
-
-        if queue_identifier == 'w' {
-            self.waiting.retain(|s| s.request_id != request_id);
-        } else if queue_identifier == 'r' {
-            self.running.retain(|s| s.request_id != request_id);
-        } else {
-            self.swapped.retain(|s| s.request_id == request_id);
-        }
+        self.waiting.retain(|s| s.request_id != request_id);
+        self.running.retain(|s| s.request_id != request_id);
+        self.swapped.retain(|s| s.request_id != request_id);
 
         Ok(())
     }
@@ -558,6 +540,11 @@ impl<P> Scheduler<P> {
     /// The total number of unfinished sequences.
     pub fn num_unfinished_sequeces(&self) -> usize {
         self.waiting.len() + self.running.len() + self.swapped.len()
+    }
+
+    /// Returns the number of GPU blocks the KV pool has left.
+    pub fn num_free_gpu_blocks(&self) -> usize {
+        self.block_manager.get_number_of_free_gpu_blocks()
     }
 }
 
@@ -2170,37 +2157,44 @@ impl<P: Debug> Scheduler<P> {
         Ok(())
     }
 
-    /// Removes finished sequences from the running queue.
+    /// Removes finished sequence groups from the running queue and returns their KV blocks to the
+    /// block manager.
     ///
-    /// This method filters out any sequence groups that have completed their
-    /// generation (i.e., are marked as finished) from the `running` queue.
-    /// This helps to free up resources and maintain an accurate list of
-    /// actively running sequences.
+    /// Normal completion is the only path that retires a running sequence group, so the free here
+    /// is what keeps the KV pool from draining monotonically: nothing else reclaims the blocks of a
+    /// request that ran to its stopping criteria.
     ///
     /// # Effects
     ///
+    /// - Frees the block table of every sequence in a finished group.
     /// - Modifies `self.running` to only contain unfinished sequence groups.
-    /// - Does not directly free block table resources; this should be handled separately by the
-    ///   block manager.
     ///
-    /// # Note
+    /// # Errors
     ///
-    /// This method should be called periodically to clean up the running queue,
-    /// typically after each generation step or when checking for completed sequences.
+    /// Returns a `SchedulerError` if a sequence lock is poisoned or the block manager fails to free
+    /// a block table.
     #[instrument(skip_all)]
-    pub fn remove_finished_sequences(&mut self) {
+    pub fn remove_finished_sequences(&mut self) -> Result<(), SchedulerError> {
         trace!("Freeing finished sequence");
-        self.running = self
-            .running
-            .iter()
-            .filter_map(|s| {
-                if !s.is_finished() {
-                    Some(s.clone())
-                } else {
-                    None
+        let mut sequence_ids_to_free = Vec::new();
+        let mut running = VecDeque::with_capacity(self.running.len());
+
+        for sequence_group in self.running.iter() {
+            if sequence_group.is_finished() {
+                for sequence in sequence_group.sequences.values() {
+                    sequence_ids_to_free.push(sequence.read_lock()?.sequence_id());
                 }
-            })
-            .collect();
+            } else {
+                running.push_back(sequence_group.clone());
+            }
+        }
+
+        self.running = running;
+        for sequence_id in sequence_ids_to_free {
+            self.free_sequence(sequence_id)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -2348,6 +2342,183 @@ mod tests {
         let (_, mock_seq_group) = create_dummy_prompt(10, 60, None, 1);
         budget.add_num_batched_tokens(mock_seq_group.request_id.clone(), num_batched_tokens);
         budget.add_number_sequences(mock_seq_group.request_id, num_current_sequences);
+    }
+
+    /// Builds a scheduler over a KV pool of `num_gpu_blocks` blocks, with room for
+    /// `max_num_sequences` concurrent sequences.
+    fn test_scheduler(
+        block_size: usize,
+        num_gpu_blocks: usize,
+        max_num_sequences: usize,
+    ) -> Scheduler<FcfsPolicy> {
+        const GPU_MEMORY_UTILIZATION: f32 = 1.0;
+        const SWAP_SPACE_FRACTION: f32 = 0.4;
+        const MAX_NUM_BATCHED_TOKENS: usize = 4096;
+        const MAX_MODEL_LEN: usize = 512;
+
+        let scheduler_config = SchedulerConfig::new(
+            MAX_NUM_BATCHED_TOKENS,
+            max_num_sequences,
+            MAX_MODEL_LEN,
+            0.0,
+            false,
+        )
+        .expect("Failed to generate `SchedulerConfig`");
+        let cache_config = CacheConfig::new_from_blocks(
+            block_size,
+            GPU_MEMORY_UTILIZATION,
+            SWAP_SPACE_FRACTION,
+            None,
+            None,
+            num_gpu_blocks,
+            num_gpu_blocks,
+        )
+        .expect("Failed to generate `CacheConfig`");
+
+        Scheduler::<FcfsPolicy>::new(cache_config, scheduler_config)
+            .expect("Failed to generate `Scheduler`")
+    }
+
+    /// Marks every sequence of every running group as stopped, as the engine does once a sequence
+    /// hits its stopping criteria.
+    fn finish_running_sequence_groups(scheduler: &Scheduler<FcfsPolicy>) {
+        for sequence_group in scheduler.running.iter() {
+            for sequence in sequence_group.sequences.values() {
+                sequence
+                    .write()
+                    .unwrap()
+                    .set_sequence_status(SequenceStatus::FinishedStopped);
+            }
+        }
+    }
+
+    #[test]
+    fn test_finished_sequence_groups_return_their_blocks() {
+        const BLOCK_SIZE: usize = 4;
+        const NUM_GPU_BLOCKS: usize = 8;
+        const NUM_SEQUENCE_GROUPS: usize = 4;
+
+        let mut scheduler = test_scheduler(BLOCK_SIZE, NUM_GPU_BLOCKS, NUM_SEQUENCE_GROUPS);
+        let baseline_free_blocks = scheduler.block_manager.get_number_of_free_gpu_blocks();
+
+        for i in 0..NUM_SEQUENCE_GROUPS {
+            let (_, sequence_group) = create_dummy_prompt(i as u64, BLOCK_SIZE, None, 1);
+            scheduler.add_sequence_group(sequence_group);
+        }
+        schedule_and_update_computed_tokens(&mut scheduler);
+
+        assert_eq!(
+            scheduler.block_manager.get_number_of_free_gpu_blocks(),
+            baseline_free_blocks - NUM_SEQUENCE_GROUPS,
+            "each scheduled prompt holds one block"
+        );
+
+        finish_running_sequence_groups(&scheduler);
+        scheduler
+            .remove_finished_sequences()
+            .expect("Failed to remove finished sequences");
+
+        assert!(scheduler.running.is_empty());
+        assert_eq!(
+            scheduler.block_manager.get_number_of_free_gpu_blocks(),
+            baseline_free_blocks,
+            "finished sequence groups must return every block they held"
+        );
+    }
+
+    /// The blocks of a completed request have to come back, or a pool smaller than the request
+    /// stream wedges the engine: there is no retry timer behind the scheduler.
+    #[test]
+    fn test_sequential_requests_do_not_exhaust_the_block_pool() {
+        const BLOCK_SIZE: usize = 4;
+        const NUM_GPU_BLOCKS: usize = 4;
+        const NUM_REQUESTS: usize = 32;
+
+        let mut scheduler = test_scheduler(BLOCK_SIZE, NUM_GPU_BLOCKS, 1);
+        let baseline_free_blocks = scheduler.block_manager.get_number_of_free_gpu_blocks();
+
+        for i in 0..NUM_REQUESTS {
+            let (_, sequence_group) = create_dummy_prompt(i as u64, BLOCK_SIZE, None, 1);
+            scheduler.add_sequence_group(sequence_group);
+
+            let (metadata, _) = schedule_and_update_computed_tokens(&mut scheduler);
+            assert_eq!(metadata.len(), 1, "request {i} was never scheduled");
+
+            finish_running_sequence_groups(&scheduler);
+            scheduler
+                .remove_finished_sequences()
+                .expect("Failed to remove finished sequences");
+            assert_eq!(
+                scheduler.block_manager.get_number_of_free_gpu_blocks(),
+                baseline_free_blocks,
+                "request {i} leaked blocks"
+            );
+        }
+    }
+
+    #[test]
+    fn test_abort_removes_the_sequence_group_from_every_queue() {
+        const BLOCK_SIZE: usize = 4;
+        const NUM_GPU_BLOCKS: usize = 8;
+
+        type Enqueue = fn(&mut Scheduler<FcfsPolicy>, SequenceGroup);
+        let queues: [(&str, Enqueue); 3] = [
+            ("waiting", |scheduler, group| {
+                scheduler.waiting.push_back(group)
+            }),
+            ("running", |scheduler, group| {
+                scheduler.running.push_back(group)
+            }),
+            ("swapped", |scheduler, group| {
+                scheduler.swapped.push_back(group)
+            }),
+        ];
+
+        for (queue, enqueue) in queues {
+            let mut scheduler = test_scheduler(BLOCK_SIZE, NUM_GPU_BLOCKS, 4);
+            let (_, aborted) = create_dummy_prompt(0, BLOCK_SIZE, None, 1);
+            let (_, survivor) = create_dummy_prompt(1, BLOCK_SIZE, None, 1);
+
+            enqueue(&mut scheduler, aborted.clone());
+            enqueue(&mut scheduler, survivor.clone());
+
+            scheduler
+                .abort_sequence_group(aborted.request_id.clone())
+                .expect("Failed to abort sequence group");
+
+            let remaining = scheduler
+                .waiting
+                .iter()
+                .chain(scheduler.running.iter())
+                .chain(scheduler.swapped.iter())
+                .map(|s| s.request_id.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                remaining,
+                vec![survivor.request_id.clone()],
+                "aborting from the {queue} queue must drop only the aborted request"
+            );
+            assert_eq!(scheduler.num_unfinished_sequeces(), 1);
+        }
+    }
+
+    /// Aborting a request that finished a step earlier is a no-op, not a way to drop other
+    /// requests: the engine aborts by request id without knowing which queue the request is in.
+    #[test]
+    fn test_abort_of_unknown_request_leaves_the_queues_alone() {
+        const BLOCK_SIZE: usize = 4;
+        const NUM_GPU_BLOCKS: usize = 8;
+
+        let mut scheduler = test_scheduler(BLOCK_SIZE, NUM_GPU_BLOCKS, 4);
+        let (_, sequence_group) = create_dummy_prompt(0, BLOCK_SIZE, None, 1);
+        scheduler.add_sequence_group(sequence_group.clone());
+
+        scheduler
+            .abort_sequence_group("no-such-request".to_string())
+            .expect("Failed to abort sequence group");
+
+        assert_eq!(scheduler.num_unfinished_sequeces(), 1);
+        assert_eq!(scheduler.waiting[0].request_id, sequence_group.request_id);
     }
 
     #[test]

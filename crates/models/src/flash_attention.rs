@@ -1,6 +1,6 @@
 use atoma_kernels::{
     copy_blocks, flash_attn_kv_cache_full, flash_attn_varlen, flash_attn_varlen_with_block_table,
-    reshape_and_cache_flash, swap_blocks, Capability, KernelError,
+    reshape_and_cache_flash, swap_blocks, Capability, KernelError, CAUSAL_WINDOW,
 };
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use std::collections::HashMap;
@@ -435,6 +435,10 @@ impl FlashAttention {
                 } else {
                     candle_core::bail!("Missing sequence start locations tensor for prefill inference, with prefix enabled attention")
                 };
+                // The kernel reads causality off the window, so a prefill over a cached prefix has
+                // to ask for it explicitly; leaving the window unset is full bidirectional
+                // attention, letting each prefill token attend to its own future.
+                let (window_size_left, window_size_right) = CAUSAL_WINDOW;
                 let out = flash_attn_varlen_with_block_table(
                     &q,
                     &k_cache,
@@ -445,8 +449,8 @@ impl FlashAttention {
                     prefill_metadata.max_prefill_sequence_length,
                     max_sequence_length_k,
                     self.softmax_scale,
-                    /* window_size_left */ None,
-                    /* window_size_right */ None,
+                    window_size_left,
+                    window_size_right,
                     prefill_metadata.block_tables.as_ref(),
                 )?;
                 output.slice_set(&out, 0, 0)?;

@@ -1,6 +1,5 @@
 #[cfg(feature = "cuda")]
 use std::{
-    collections::HashMap,
     sync::{Arc, RwLock},
     time::{Duration, Instant, SystemTime},
 };
@@ -10,12 +9,13 @@ use futures::StreamExt;
 #[cfg(feature = "cuda")]
 use tokenizers::Tokenizer;
 #[cfg(feature = "cuda")]
-use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
+use tokio::sync::mpsc::UnboundedReceiver;
 #[cfg(feature = "cuda")]
 use tracing::{error, info, info_span, instrument, trace, Span};
 
 #[cfg(feature = "cuda")]
 use crate::{
+    egress::{ClientState, ResponseSenders},
     error::EngineError,
     model_executor::ModelThreadDispatcher,
     output::{GenerateRequestOutput, GenerateStreamingOutput, StreamResponse},
@@ -45,11 +45,8 @@ pub struct LlmEngine {
     model_thread_dispatcher: ModelThreadDispatcher,
     /// Channel for receiving new requests from the running main `LlmService` instance.
     request_receiver: UnboundedReceiver<EngineRequest>,
-    /// Hashmap for sending finished `SequenceGroup`'s outputs back to the OpenAI API service.
-    response_senders: HashMap<String, oneshot::Sender<GenerateRequestOutput>>,
-    /// Hashmap for sending finished `SequenceGroup`'s outputs back to the OpenAI API service,
-    /// with streaming responses.
-    response_streaming_senders: HashMap<String, flume::Sender<StreamResponse>>,
+    /// Client channels of the requests currently in flight, streaming and non-streaming alike.
+    response_senders: ResponseSenders,
     /// Metadata of currently scheduled `SequenceGroup`s.
     sequence_groups_metadata: Vec<Arc<SequenceGroupMetadata>>,
     /// Current outputs from the scheduler.
@@ -78,8 +75,7 @@ impl LlmEngine {
             scheduler,
             tokenizer,
             request_receiver,
-            response_senders: HashMap::new(),
-            response_streaming_senders: HashMap::new(),
+            response_senders: ResponseSenders::default(),
             span: info_span!("llm-engine"),
         }
     }
@@ -106,19 +102,21 @@ impl LlmEngine {
                     match engine_request {
                         EngineRequest::GenerateRequest(sequence_group, response_sender) => {
                             info!("Received new sequence group, with id = {}", sequence_group.request_id);
-                            let sequence_group_request_id = sequence_group.request_id.clone();
+                            let request_id = sequence_group.request_id.clone();
                             // 1. Add the received `SequenceGroup` to the `Scheduler` instance.
                             self.scheduler.add_sequence_group(sequence_group);
-                            // 2. Add the response sender to the `response_senders` map.
-                            self.response_senders.insert(sequence_group_request_id, response_sender);
+                            // 2. Register the client waiting for this request's output.
+                            self.response_senders
+                                .register_completion(request_id, response_sender);
                         },
                         EngineRequest::GenerateStreamingRequest(sequence_group, response_sender) => {
                             info!("Received new sequence group, with id = {}", sequence_group.request_id);
-                            let sequence_group_request_id = sequence_group.request_id.clone();
+                            let request_id = sequence_group.request_id.clone();
                             // 1. Add the received `SequenceGroup` to the `Scheduler` instance.
                             self.scheduler.add_sequence_group(sequence_group);
-                            // 2. Add the response sender to the `response_senders` map.
-                            self.response_streaming_senders.insert(sequence_group_request_id, response_sender);
+                            // 2. Register the client streaming this request's output.
+                            self.response_senders
+                                .register_stream(request_id, response_sender);
                         },
                     }
                     // 3. If the current `LlmInstance` doesn't have any on-going
@@ -181,22 +179,11 @@ impl LlmEngine {
                 // NOTE: This is after scheduling new sequences above,
                 //    we do so to optimize GPU utilization. This is
                 //    supposed to be safe
-                if !request_outputs.is_empty() {
-                    // 4. Extract the response sender from the `response_senders` hashmap
-                    for request_output in request_outputs {
-                        let response_sender = if let Some(response_sender) =
-                            self.response_senders.remove(&request_output.request_id)
-                        {
-                            response_sender
-                        } else {
-                            // NOTE: In this case, the request was streamed back to the OpenAI API
-                            // service, already.
-                            continue;
-                        };
-                        response_sender
-                            .send(request_output)
-                            .map_err(|out| EngineError::SendResponseError(out.request_id))?;
-                    }
+                //
+                // A client that hung up before its output was ready costs that request its
+                // channels and nothing more: the other outputs in this batch still go out.
+                for request_output in request_outputs {
+                    self.response_senders.complete(request_output);
                 }
             }
             Err(e) => {
@@ -257,7 +244,8 @@ impl LlmEngine {
     /// 1. Updates the state of each sequence in the scheduled sequence groups
     /// 2. Records metrics for sequence group processing times
     /// 3. Frees finished sequence groups
-    /// 4. Collects and returns outputs for finished sequence groups
+    /// 4. Aborts the requests whose client disconnected mid-generation
+    /// 5. Collects and returns outputs for finished sequence groups
     ///
     /// # Arguments
     ///
@@ -273,6 +261,7 @@ impl LlmEngine {
         outputs: Vec<SequenceGroupOutput>,
     ) -> Result<Vec<GenerateRequestOutput>, EngineError> {
         let now = Instant::now();
+        let mut disconnected_requests = Vec::new();
 
         for (output, (sequence_group_metadata, scheduled_sequence_group)) in outputs.iter().zip(
             self.sequence_groups_metadata
@@ -303,12 +292,15 @@ impl LlmEngine {
                 };
 
                 // 3. Updates the state of the current `Sequence`
-                self.update_sequence(
+                let client_state = self.update_sequence(
                     sequence,
                     sequence_output,
                     sequence_group_metadata,
                     &stopping_criteria_params,
                 )?;
+                if client_state == ClientState::Disconnected {
+                    disconnected_requests.push(sequence_group_metadata.request_id.clone());
+                }
             }
 
             // 4. Add a few metrics
@@ -325,10 +317,18 @@ impl LlmEngine {
             last_token_time_histogram.record(metrics_guard.last_token_time.elapsed().as_secs_f32());
         }
 
-        // 5. Removes all finished sequence groups from the `Scheduler`
-        self.scheduler.remove_finished_sequences();
+        // 5. Removes all finished sequence groups from the `Scheduler`, returning their blocks
+        self.scheduler.remove_finished_sequences()?;
 
-        // 6. Keep track of all the finished `SequenceGroup`s
+        // 6. Retire the requests whose client hung up: nobody is reading their output, so the
+        //    blocks they still hold have to go back to the pool.
+        for request_id in disconnected_requests {
+            info!("Aborting request {request_id}, its client disconnected");
+            self.response_senders.remove(&request_id);
+            self.scheduler.abort_sequence_group(request_id)?;
+        }
+
+        // 7. Keep track of all the finished `SequenceGroup`s
         let mut request_outputs = Vec::new();
         for scheduled_sequence_group in self.scheduler_outputs.scheduled_sequence_groups.iter() {
             scheduled_sequence_group
@@ -360,7 +360,9 @@ impl LlmEngine {
     /// * `stopping_criteria_params` - Parameters for stopping criteria
     ///
     /// # Returns
-    /// * `Result<(), EngineError>` - Ok if successful, or an error if something goes wrong
+    /// * `Result<ClientState, EngineError>` - whether the request's client is still listening, or
+    ///   an error if something goes wrong. A client that hung up is reported rather than raised:
+    ///   the caller retires that one request and keeps serving the rest of the batch.
     ///
     /// # Behavior
     /// - In decoding phase (do_sample == true):
@@ -377,8 +379,10 @@ impl LlmEngine {
         sequence_output: &SequenceOutput,
         sequence_group_metadata: &SequenceGroupMetadata,
         stopping_criteria_params: &StoppingCriteriaParameters,
-    ) -> Result<(), EngineError> {
+    ) -> Result<ClientState, EngineError> {
         let sequence_id = { sequence.read_lock()?.sequence_id() };
+        let request_id = &sequence_group_metadata.request_id;
+        let mut client_state = ClientState::Connected;
         // 1. Get the AI generated next output token id.
         let generated_token_id = sequence_output.output_token;
         let is_stop_token = sequence_output.is_stop_token;
@@ -408,27 +412,11 @@ impl LlmEngine {
 
             // 7. If the request is a streaming request, we need to send the generated token to the
             //    client as soon as possible.
-            if let Some(response_sender) = self
-                .response_streaming_senders
-                .get(&sequence_group_metadata.request_id)
-            {
-                let created = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .expect("Failed to get system duration")
-                    .as_millis() as u64;
-                let streaming_output = GenerateStreamingOutput {
-                    request_id: sequence_group_metadata.request_id.clone(),
-                    created,
-                    finish_reason: None,
-                    logprobs: sequence_guard_lock.output_logprobs.clone(),
-                    num_prompt_tokens: sequence_guard_lock.prompt_token_ids().len(),
-                    num_completion_tokens: sequence_guard_lock.tokens.len(),
-                    output_text: generated_text.clone(),
-                };
-                response_sender
-                    .send(StreamResponse::Chunk(streaming_output))
-                    .map_err(|e| EngineError::FlumeSendError(e.to_string()))?;
-            }
+            let streaming_output =
+                Self::streaming_output(request_id, &sequence_guard_lock, generated_text.clone());
+            client_state = self
+                .response_senders
+                .send_chunk(request_id, StreamResponse::Chunk(streaming_output));
 
             // 8. Update the `output_text` with the newly generated token, if in decoding phase.
             let generated_token = if sequence_guard_lock.tokens.last().is_some() {
@@ -440,74 +428,28 @@ impl LlmEngine {
             };
             sequence_guard_lock.output_text.push_str(&generated_token);
 
-            // 9. Check if the last generated token is a stop token. If so, update the `Sequence`'s
-            //    `SequenceState` and the `stop_reason`, as well.
-            if stopping_criteria_params
-                .stop_sequences
-                .contains(&generated_token)
-            {
-                info!("Current sequence with id = {sequence_id} has finished execution due to stopping token = {generated_token}");
-                {
-                    sequence_guard_lock.stop_reason = Some(generated_token_id)
-                }
+            // 9. Apply the stopping criteria to the sequence, now that it has a new token.
+            self.apply_stopping_criteria(
+                &mut sequence_guard_lock,
+                &generated_token,
+                sequence_output,
+                stopping_criteria_params,
+            );
 
-                if let Some(response_sender) = self
-                    .response_streaming_senders
-                    .get(&sequence_group_metadata.request_id)
-                {
-                    response_sender
-                        .send(StreamResponse::Finished)
-                        .map_err(|e| EngineError::FlumeSendError(e.to_string()))?;
-                }
-                sequence_guard_lock.set_sequence_status(SequenceStatus::FinishedStopped)
+            // 10. Tell a streaming client the sequence is done, whichever stopping criterion ended
+            //     it, so the stream is closed once per sequence. A non-streaming client is sent
+            //     nothing until then, so its channel is probed instead: a request nobody is waiting
+            //     for should stop holding blocks now, not at the end of its generation.
+            if sequence_guard_lock.is_finished() {
+                client_state = client_state.and(
+                    self.response_senders
+                        .send_chunk(request_id, StreamResponse::Finished),
+                );
             }
+            client_state =
+                client_state.and(self.response_senders.completion_client_state(request_id));
 
-            // 10. Check if the current `Sequence` last generated token
-            //    id equals to the `eos_token_id`, in which case the
-            //    the `Sequence`'s status should become `FinishedStopped`.
-            if is_stop_token && !stopping_criteria_params.ignore_eos_token {
-                if let Some(response_sender) = self
-                    .response_streaming_senders
-                    .get(&sequence_group_metadata.request_id)
-                {
-                    response_sender
-                        .send(StreamResponse::Finished)
-                        .map_err(|e| EngineError::FlumeSendError(e.to_string()))?;
-                }
-                sequence_guard_lock.set_sequence_status(SequenceStatus::FinishedStopped)
-            }
-
-            // 11. Check if the `Sequence`'s length exceeds that of `SchedulerConfig`'s. If so,
-            //     update the `Sequence`'s `SequenceStatus` to `FinishedLengthCapped`.
-            let sequence_len = sequence_guard_lock.length();
-            if sequence_len > self.scheduler.scheduler_config.max_model_len() {
-                if let Some(response_sender) = self
-                    .response_streaming_senders
-                    .get(&sequence_group_metadata.request_id)
-                {
-                    response_sender
-                        .send(StreamResponse::Finished)
-                        .map_err(|e| EngineError::FlumeSendError(e.to_string()))?;
-                }
-                sequence_guard_lock.set_sequence_status(SequenceStatus::FinishedLengthCapped)
-            }
-
-            // 12. Check if the `Sequence`'s output length exceeds that of Request's
-            //     `max_new_tokens`.
-            let sequence_output_len = sequence_guard_lock.get_output_len();
-            if sequence_output_len >= stopping_criteria_params.max_new_tokens as usize {
-                if let Some(response_sender) = self
-                    .response_streaming_senders
-                    .get(&sequence_group_metadata.request_id)
-                {
-                    response_sender
-                        .send(StreamResponse::Finished)
-                        .map_err(|e| EngineError::FlumeSendError(e.to_string()))?;
-                }
-                sequence_guard_lock.set_sequence_status(SequenceStatus::FinishedLengthCapped)
-            }
-
-            // 13. Update the `Sequence`'s tokens vec.
+            // 11. Update the `Sequence`'s tokens vec.
             sequence_guard_lock.tokens.push(generated_token)
         } else {
             // NOTE: in this case, we are not sampling newly
@@ -524,6 +466,72 @@ impl LlmEngine {
                 .push(sequence_output.logprob.clone());
         }
 
-        Ok(())
+        Ok(client_state)
+    }
+
+    /// Builds the chunk a streaming client receives for the token just generated.
+    fn streaming_output(
+        request_id: &str,
+        sequence: &Sequence,
+        output_text: String,
+    ) -> GenerateStreamingOutput {
+        let created = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Failed to get system duration")
+            .as_millis() as u64;
+
+        GenerateStreamingOutput {
+            request_id: request_id.to_string(),
+            created,
+            finish_reason: None,
+            logprobs: sequence.output_logprobs.clone(),
+            num_prompt_tokens: sequence.prompt_token_ids().len(),
+            num_completion_tokens: sequence.tokens.len(),
+            output_text,
+        }
+    }
+
+    /// Marks a `Sequence` finished if the token it just generated ended it, recording which
+    /// criterion did.
+    ///
+    /// # Arguments
+    /// * `sequence` - The `Sequence` the token was generated for
+    /// * `generated_token` - The decoded text of the generated token
+    /// * `sequence_output` - The output from the LLM for this sequence
+    /// * `stopping_criteria_params` - Parameters for stopping criteria
+    #[instrument(skip_all)]
+    fn apply_stopping_criteria(
+        &self,
+        sequence: &mut Sequence,
+        generated_token: &str,
+        sequence_output: &SequenceOutput,
+        stopping_criteria_params: &StoppingCriteriaParameters,
+    ) {
+        // The request asked to stop on this token.
+        if stopping_criteria_params
+            .stop_sequences
+            .iter()
+            .any(|stop_sequence| stop_sequence == generated_token)
+        {
+            let sequence_id = sequence.sequence_id();
+            info!("Sequence {sequence_id} finished on stopping token = {generated_token}");
+            sequence.stop_reason = Some(sequence_output.output_token);
+            sequence.set_sequence_status(SequenceStatus::FinishedStopped);
+        }
+
+        // The model emitted its end-of-sequence token.
+        if sequence_output.is_stop_token && !stopping_criteria_params.ignore_eos_token {
+            sequence.set_sequence_status(SequenceStatus::FinishedStopped);
+        }
+
+        // The sequence outgrew the model's context.
+        if sequence.length() > self.scheduler.scheduler_config.max_model_len() {
+            sequence.set_sequence_status(SequenceStatus::FinishedLengthCapped);
+        }
+
+        // The sequence generated everything the request asked for.
+        if sequence.get_output_len() >= stopping_criteria_params.max_new_tokens as usize {
+            sequence.set_sequence_status(SequenceStatus::FinishedLengthCapped);
+        }
     }
 }

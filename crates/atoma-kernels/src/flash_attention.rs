@@ -1,3 +1,4 @@
+use crate::attention_window;
 use crate::error::check_supported_capabilities;
 use crate::ffi;
 use candle_core::backend::BackendStorage;
@@ -197,25 +198,15 @@ impl FlashAttention {
                 (std::ptr::null(), 0, None)
             };
 
-        // if window_size_left > self.max_seqlen_k or None => -1
-        let mut window_size_left = self
-            .window_size_left
-            .filter(|v| v <= &seqlen_k)
-            .map(|v| v as i32)
-            .unwrap_or(-1);
+        let mut window_size_left =
+            attention_window::normalize_bound(self.window_size_left, seqlen_k);
+        let mut window_size_right =
+            attention_window::normalize_bound(self.window_size_right, seqlen_k);
 
-        // if window_size_right > self.max_seqlen_k or None => -1
-        let mut window_size_right = self
-            .window_size_right
-            .filter(|v| v <= &seqlen_k)
-            .map(|v| v as i32)
-            .unwrap_or(-1);
-
-        let mut is_causal = if window_size_left < 0 && window_size_right == 0 {
-            1
-        } else {
-            0
-        };
+        let mut is_causal = i32::from(attention_window::is_causal(
+            window_size_left,
+            window_size_right,
+        ));
         if seqlen_q == 1 && self.alibi_slopes.is_none() {
             is_causal = 0;
         }
@@ -978,19 +969,10 @@ impl FlashAttentionVarLen {
                 (std::ptr::null(), None)
             };
 
-        // if window_size_left > self.max_seqlen_k or None => -1
-        let mut window_size_left = self
-            .window_size_left
-            .filter(|v| v <= &self.max_seqlen_k)
-            .map(|v| v as i32)
-            .unwrap_or(-1);
-
-        // if window_size_right > self.max_seqlen_k or None => -1
-        let mut window_size_right = self
-            .window_size_right
-            .filter(|v| v <= &self.max_seqlen_k)
-            .map(|v| v as i32)
-            .unwrap_or(-1);
+        let mut window_size_left =
+            attention_window::normalize_bound(self.window_size_left, self.max_seqlen_k);
+        let mut window_size_right =
+            attention_window::normalize_bound(self.window_size_right, self.max_seqlen_k);
 
         let head_size = utils::round_multiple(head_size_og, 8);
         let head_size_rounded = utils::round_multiple(head_size, 32);
@@ -1007,11 +989,10 @@ impl FlashAttentionVarLen {
 
         // Causal is the special case where window_size_right == 0 and window_size_left < 0.
         // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-        let is_causal = if window_size_left < 0 && window_size_right == 0 {
-            1
-        } else {
-            0
-        };
+        let is_causal = i32::from(attention_window::is_causal(
+            window_size_left,
+            window_size_right,
+        ));
         if window_size_left < 0 && window_size_right >= 0 {
             window_size_left = self.max_seqlen_k as i32;
         }
@@ -1720,7 +1701,7 @@ impl FlashAttentionKvCache {
         let mut window_size_left = window_size_left.unwrap_or(-1);
         let mut window_size_right = window_size_right.unwrap_or(-1);
 
-        let mut is_causal = window_size_left < 0 && window_size_right == 0;
+        let mut is_causal = attention_window::is_causal(window_size_left, window_size_right);
         // causal=true is the same as causal=false in this case
         if seqlen_q == 1 && self.alibi_slopes.is_none() {
             is_causal = false;

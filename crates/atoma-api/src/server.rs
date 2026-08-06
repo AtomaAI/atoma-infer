@@ -6,6 +6,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::Context;
 use atoma_backends::{GenerateRequest, ServiceRequest};
 use axum::{
     extract::State,
@@ -14,9 +15,10 @@ use axum::{
         sse::{KeepAlive, KeepAliveStream},
         IntoResponse, Sse,
     },
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::{json, Value};
 use tokio::{
     net::TcpListener,
@@ -38,6 +40,10 @@ use crate::{
 
 /// The URL path to POST JSON for model chat completions.
 pub const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
+/// The URL path reporting whether the node can still serve requests.
+pub const HEALTHZ_PATH: &str = "/healthz";
+/// The URL path rendering the recorded metrics, in the Prometheus text format.
+pub const METRICS_PATH: &str = "/metrics";
 pub const AUTH_BEARER_PREFIX: &str = "Bearer ";
 
 /// Represents the shared state of the application.
@@ -119,10 +125,12 @@ pub async fn run_server(
     join_handle: JoinHandle<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     let shutdown_signal_sender = app_state.shutdown_signal_sender.clone();
-    let http_router = Router::new()
-        .route(CHAT_COMPLETIONS_PATH, post(completion_handler))
-        .with_state(app_state)
-        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()));
+    // Installing the recorder is what makes the `metrics!` macros throughout the engine record
+    // anywhere but a no-op sink, so it has to happen before the first request is served.
+    let prometheus_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .context("Failed to install the Prometheus metrics recorder")?;
+    let http_router = build_router(app_state, prometheus_handle);
 
     let shutdown_signal = async {
         signal::ctrl_c()
@@ -155,6 +163,45 @@ pub async fn run_server(
     info!("Server and LlmService shutdown complete");
 
     Ok(())
+}
+
+/// Builds the HTTP router the server serves: the OpenAI-compatible endpoint, the operational
+/// endpoints an orchestrator polls, and the API docs.
+pub fn build_router(app_state: AppState, prometheus_handle: PrometheusHandle) -> Router {
+    Router::new()
+        .route(CHAT_COMPLETIONS_PATH, post(completion_handler))
+        .route(HEALTHZ_PATH, get(health_handler))
+        .with_state(app_state)
+        .merge(
+            Router::new()
+                .route(METRICS_PATH, get(metrics_handler))
+                .with_state(prometheus_handle),
+        )
+        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
+}
+
+/// Reports whether this node can still accept requests.
+///
+/// The check is the engine channel: once the `LlmService` is gone, its receiver is dropped and no
+/// request submitted from here can ever be answered, so the node is unhealthy rather than merely
+/// idle.
+#[instrument(skip_all)]
+async fn health_handler(app_state: State<AppState>) -> impl IntoResponse {
+    if app_state.llm_service_sender.is_closed() {
+        error!("The LLM service is no longer accepting requests");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "unavailable", "reason": "llm service is not running" })),
+        );
+    }
+
+    (StatusCode::OK, Json(json!({ "status": "ok" })))
+}
+
+/// Renders the metrics recorded so far, in the Prometheus text format.
+#[instrument(skip_all)]
+async fn metrics_handler(prometheus_handle: State<PrometheusHandle>) -> impl IntoResponse {
+    prometheus_handle.render()
 }
 
 /// Represents the response from a chat completion request.
@@ -416,4 +463,123 @@ async fn handle_generate_stream_request(
             .interval(Duration::from_millis(streaming_interval_in_millis))
             .text("keep-alive-stream"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use metrics::counter;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    /// An app state whose LLM service is running, together with the receiver that keeps it so.
+    fn test_app_state() -> (AppState, mpsc::UnboundedReceiver<ServiceRequest>) {
+        let (llm_service_sender, llm_service_receiver) = mpsc::unbounded_channel();
+        let (shutdown_signal_sender, _shutdown_signal_receiver) = mpsc::channel(1);
+
+        (
+            AppState {
+                request_counter: Arc::new(AtomicU64::new(0)),
+                llm_service_sender,
+                shutdown_signal_sender,
+                streaming_interval_in_millis: 100,
+            },
+            llm_service_receiver,
+        )
+    }
+
+    /// A handle over a recorder that is not installed globally, so tests stay independent of each
+    /// other and of whatever the process-wide recorder is.
+    fn test_prometheus_handle() -> PrometheusHandle {
+        PrometheusBuilder::new().build_recorder().handle()
+    }
+
+    async fn get(router: Router, path: &str) -> (StatusCode, String) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("Failed to build request"),
+            )
+            .await
+            .expect("Router failed to answer");
+
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("Failed to read response body");
+
+        (
+            status,
+            String::from_utf8(body.to_vec()).expect("Response body is not valid UTF-8"),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_healthz_reports_a_running_service() {
+        let (app_state, _llm_service_receiver) = test_app_state();
+        let router = build_router(app_state, test_prometheus_handle());
+
+        let (status, body) = get(router, HEALTHZ_PATH).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"status\":\"ok\""), "got body: {body}");
+    }
+
+    #[tokio::test]
+    async fn test_healthz_reports_a_stopped_service() {
+        let (app_state, llm_service_receiver) = test_app_state();
+        drop(llm_service_receiver);
+        let router = build_router(app_state, test_prometheus_handle());
+
+        let (status, body) = get(router, HEALTHZ_PATH).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("unavailable"), "got body: {body}");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_renders_what_was_recorded() {
+        let (app_state, _llm_service_receiver) = test_app_state();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            counter!("llm_service_requests_total").increment(3);
+        });
+        let router = build_router(app_state, handle);
+
+        let (status, body) = get(router, METRICS_PATH).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("llm_service_requests_total 3"),
+            "got body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_is_mounted_as_a_post_route() {
+        let (app_state, _llm_service_receiver) = test_app_state();
+        let router = build_router(app_state, test_prometheus_handle());
+
+        let (status, _) = get(router, CHAT_COMPLETIONS_PATH).await;
+
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_paths_are_not_found() {
+        let (app_state, _llm_service_receiver) = test_app_state();
+        let router = build_router(app_state, test_prometheus_handle());
+
+        let (status, _) = get(router, "/not-a-route").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }

@@ -1,5 +1,7 @@
+pub mod attention_window;
 pub mod error;
 
+pub use attention_window::CAUSAL_WINDOW;
 pub use error::{check_supported_capabilities, Capability, KernelError};
 
 #[cfg(feature = "cuda")]

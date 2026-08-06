@@ -54,6 +54,26 @@ impl LogProb {
     }
 }
 
+/// Hands out the ids of newly admitted `Sequence`s.
+///
+/// A sequence id keys the block manager's block tables, so ids must never repeat while a sequence
+/// is alive: two sequences sharing an id share one block table, and each one's KV cache overwrites
+/// the other's.
+#[derive(Debug, Default)]
+pub struct SequenceIdCounter {
+    /// The id handed out by the next call to `next_id`.
+    next: u64,
+}
+
+impl SequenceIdCounter {
+    /// Returns an id that this counter has never returned before.
+    pub fn next_id(&mut self) -> u64 {
+        let sequence_id = self.next;
+        self.next += 1;
+        sequence_id
+    }
+}
+
 /// `SequenceStatus` represents the current status of a `Sequence` in the generation process.
 ///
 /// `Waiting:` The sequence is waiting to be processed.
@@ -2232,6 +2252,8 @@ pub enum SequenceError {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     fn sample_outputs() -> HashMap<u64, SequenceOutput> {
@@ -2419,5 +2441,26 @@ pub(crate) mod tests {
             .update_num_computed_tokens(1)
             .expect("Failed to update");
         assert!(!seq_group.is_prefill())
+    }
+
+    #[test]
+    fn test_sequence_id_counter_starts_at_zero_and_advances() {
+        let mut counter = SequenceIdCounter::default();
+
+        assert_eq!(counter.next_id(), 0);
+        assert_eq!(counter.next_id(), 1);
+        assert_eq!(counter.next_id(), 2);
+    }
+
+    #[test]
+    fn test_sequence_id_counter_never_repeats_an_id() {
+        const NUM_IDS: usize = 1024;
+
+        let mut counter = SequenceIdCounter::default();
+        let ids = (0..NUM_IDS)
+            .map(|_| counter.next_id())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(ids.len(), NUM_IDS);
     }
 }
