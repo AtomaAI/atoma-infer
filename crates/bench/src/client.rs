@@ -85,8 +85,10 @@ fn decode_event(event: &str) -> Option<SseEvent> {
 ///
 /// `max_completion_tokens` rather than the deprecated `max_tokens`: both engines accept it, and an
 /// engine that ignored an unknown length field would generate until its own stop condition and
-/// answer a different question than the one being measured. Temperature is zero so the sampler
-/// contributes as little variance as it can to the comparison.
+/// answer a different question than the one being measured. `temperature: 0` selects greedy
+/// decoding on both engines, so the sampler contributes no variance to the comparison; the engine
+/// under test accepts it at `crates/backends/vllm/src/validation.rs`, asserted there and at the
+/// `RequestBody` hop in `crates/atoma-api/src/api/chat_completions.rs`.
 fn completion_body(model: &str, request: &BenchRequest) -> serde_json::Value {
     serde_json::json!({
         "model": model,

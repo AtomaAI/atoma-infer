@@ -274,7 +274,7 @@ impl BenchmarkResults {
         ]
     }
 
-    /// Renders the whole document that is committed under `docs/plan/`: the table, plus the
+    /// Renders the whole document that is committed under `docs/benchmarks/`: the table, plus the
     /// command that regenerates it from `results_path`.
     pub fn render_document(&self, results_path: &std::path::Path) -> String {
         format!(
