@@ -17,11 +17,11 @@ use std::{
 use atoma_bench::{
     config::{BenchConfig, EngineConfig, RunConfig},
     goodput::Slo,
-    kv_probe::{KvProbeConfig, KvProbeVerdict},
+    kv_probe::{KvProbe, KvProbeConfig, KvProbeVerdict},
     report::EngineResults,
     runner::{run_engine, EngineTarget},
     vllm::VllmBaseline,
-    workload::{LoadPlan, LongContextSpec, Vocabulary, WorkloadSpec},
+    workload::{LoadPlan, LongContextSpec, WordVocabulary, WorkloadSpec},
 };
 use axum::{
     body::{Body, Bytes},
@@ -59,6 +59,8 @@ struct StubState {
     in_flight: AtomicU64,
     /// Requests answered so far.
     answered: AtomicU64,
+    /// Times `/metrics` has been scraped, so a test can tell when the probe read the gauge.
+    scrapes: AtomicU64,
 }
 
 impl StubState {
@@ -109,7 +111,8 @@ async fn completions(State(state): State<Arc<StubState>>) -> Response {
                 }
             }
 
-            let token = serde_json::json!({ "choices": [{ "delta": { "content": format!("t{index} ") } }] });
+            let content = format!("t{index} ");
+            let token = serde_json::json!({ "choices": [{ "delta": { "content": content } }] });
             Some((Ok(Bytes::from(format!("data: {token}\n\n"))), index + 1))
         }
     });
@@ -127,6 +130,7 @@ const STUB_FREE_BLOCKS_METRIC: &str = "atoma_kv_free_gpu_blocks";
 
 /// Publishes the free-block gauge in the Prometheus text format.
 async fn metrics(State(state): State<Arc<StubState>>) -> String {
+    state.scrapes.fetch_add(1, Ordering::Relaxed);
     format!(
         "# TYPE {metric} gauge\n{metric} {value}\n",
         metric = STUB_FREE_BLOCKS_METRIC,
@@ -134,17 +138,18 @@ async fn metrics(State(state): State<Arc<StubState>>) -> String {
     )
 }
 
-/// Starts a stub engine and returns the address it serves on.
-async fn start_stub(behaviour: Behaviour) -> SocketAddr {
+/// Starts a stub engine and returns its state alongside the address it serves on.
+async fn start_stub_with_state(behaviour: Behaviour) -> (SocketAddr, Arc<StubState>) {
     let state = Arc::new(StubState {
         behaviour,
         in_flight: AtomicU64::new(0),
         answered: AtomicU64::new(0),
+        scrapes: AtomicU64::new(0),
     });
     let app = Router::new()
         .route("/v1/chat/completions", post(completions))
         .route("/metrics", get(metrics))
-        .with_state(state);
+        .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -158,28 +163,12 @@ async fn start_stub(behaviour: Behaviour) -> SocketAddr {
             .expect("The stub engine stopped");
     });
 
-    address
+    (address, state)
 }
 
-/// Counts and mints tokens as whitespace-separated words.
-struct WordVocabulary;
-
-impl Vocabulary for WordVocabulary {
-    fn count_tokens(&self, text: &str) -> atoma_bench::Result<usize> {
-        Ok(text.split_whitespace().count())
-    }
-
-    fn decode(&self, token_ids: &[u32]) -> atoma_bench::Result<String> {
-        Ok(token_ids
-            .iter()
-            .map(|token_id| format!("w{token_id}"))
-            .collect::<Vec<_>>()
-            .join(" "))
-    }
-
-    fn size(&self) -> usize {
-        1_000
-    }
+/// Starts a stub engine and returns the address it serves on.
+async fn start_stub(behaviour: Behaviour) -> SocketAddr {
+    start_stub_with_state(behaviour).await.0
 }
 
 /// A configuration that offers 24 requests at 60/s and samples the pool every 10 ms.
@@ -220,7 +209,7 @@ fn config(address: SocketAddr, runs: usize) -> BenchConfig {
             ..VllmBaseline::default()
         },
         kv_probe: KvProbeConfig {
-            metric: STUB_FREE_BLOCKS_METRIC.to_string(),
+            metric: Some(STUB_FREE_BLOCKS_METRIC.to_string()),
             interval_ms: 10,
             ..KvProbeConfig::default()
         },
@@ -335,6 +324,35 @@ async fn test_refused_requests_are_recorded_as_failures() {
         "refused requests must not count towards goodput"
     );
     assert_eq!(summary.ttft_ms.count, 0, "a refusal has no first token");
+}
+
+/// The baseline sample is what the drain check judges a run against, so it has to be read before
+/// the caller offers any load. Leaving it to the probe's spawned task would race the run's first
+/// arrivals and record a pool that had already handed blocks out.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_the_probe_reads_its_baseline_before_it_starts_sampling() {
+    let (address, state) = start_stub_with_state(Behaviour::Healthy).await;
+
+    let probe = KvProbe::new(
+        format!("http://{address}/metrics"),
+        STUB_FREE_BLOCKS_METRIC.to_string(),
+        Duration::from_secs(60),
+    )
+    .start()
+    .await;
+
+    assert_eq!(
+        state.scrapes.load(Ordering::Relaxed),
+        1,
+        "the gauge must have been read by the time `start` returns"
+    );
+
+    let samples = probe.finish().await;
+    assert_eq!(
+        samples.first().map(|sample| sample.free_blocks),
+        Some(POOL_BLOCKS),
+        "the baseline is the whole pool, measured before any load: {samples:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use atoma_bench::{
     config::BenchConfig,
     report::{BenchmarkResults, EngineResults},
@@ -107,7 +107,11 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Drives the engine under test and writes what its runs measured.
+/// Drives the engine under test, writes what its runs measured, and fails on a leaking pool.
+///
+/// The artifact is written before the verdict is enforced: a run whose pool did not hold is the
+/// one worth inspecting. Failing here rather than only logging is what makes this command usable
+/// as the standing regression guard — in CI a leak has to fail the job.
 async fn run(config_path: &Path, results_path: &Path) -> Result<()> {
     let (config, requests) = prepare(config_path)?;
 
@@ -120,7 +124,8 @@ async fn run(config_path: &Path, results_path: &Path) -> Result<()> {
     .context("The engine under test did not complete its runs")?;
 
     report_probe_verdicts(&engine);
-    write_json(results_path, &engine)
+    write_json(results_path, &engine)?;
+    check_kv_pool_held(&engine)
 }
 
 /// Starts the pinned baseline, drives it, and stops it again.
@@ -132,16 +137,7 @@ async fn baseline(config_path: &Path, results_path: &Path) -> Result<()> {
         .await
         .context("Failed to start the pinned vLLM baseline")?;
 
-    let target = EngineTarget {
-        name: format!("vLLM {}", baseline.reported_version()),
-        version: baseline.reported_version().to_string(),
-        base_url: config.baseline.base_url(),
-        // vLLM publishes no free-KV-block gauge, so its runs are unwatched rather than unjudged.
-        metrics_url: None,
-        model: config.baseline.model.clone(),
-        api_key: None,
-        config: config.baseline.recorded_config(),
-    };
+    let target = EngineTarget::baseline(&config.baseline, baseline.reported_version());
 
     let runs = run_engine(&target, &config, &requests).await;
     baseline.stop().await;
@@ -228,6 +224,34 @@ fn report_probe_verdicts(engine: &EngineResults) {
     }
 }
 
+/// Fails if the KV-leak probe did not pass a run it watched.
+///
+/// An engine configured without a `metrics_url` publishes no gauge to sample, so its runs carry no
+/// verdict and are measured rather than guarded; `compare` is what refuses to publish a table from
+/// runs nobody watched.
+fn check_kv_pool_held(engine: &EngineResults) -> Result<()> {
+    let failures = engine
+        .runs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, run)| {
+            let reason = run.kv_probe.as_ref()?.failure_reason()?;
+            Some(format!("run {index}: {reason}"))
+        })
+        .collect::<Vec<_>>();
+
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "The KV-leak probe did not pass every run of {}, so these numbers are not comparable — \
+         {}. The artifact was written for inspection.",
+        engine.name,
+        failures.join("; ")
+    ))
+}
+
 /// Reads a JSON artifact.
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let artifact = std::fs::read_to_string(path)
@@ -257,4 +281,101 @@ fn write_text(path: &Path, contents: &str) -> Result<()> {
 
     info!(path = %path.display(), "Wrote");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use atoma_bench::{
+        kv_probe::KvProbeVerdict,
+        record::{Distribution, RunSummary},
+        report::RunResult,
+    };
+
+    use super::*;
+
+    fn run_with(kv_probe: Option<KvProbeVerdict>) -> RunResult {
+        RunResult {
+            summary: RunSummary {
+                num_requests: 24,
+                completed: 24,
+                failed: 0,
+                output_tokens: 144,
+                duration_seconds: 1.0,
+                goodput_per_second: 24.0,
+                request_throughput_per_second: 24.0,
+                output_token_throughput_per_second: 144.0,
+                ttft_ms: Distribution::default(),
+                itl_ms: Distribution::default(),
+                end_to_end_ms: Distribution::default(),
+            },
+            kv_probe,
+        }
+    }
+
+    fn engine(runs: Vec<RunResult>) -> EngineResults {
+        EngineResults {
+            name: "atoma-infer".to_string(),
+            version: "abc1234".to_string(),
+            config: serde_json::json!({}),
+            runs,
+        }
+    }
+
+    fn passed() -> Option<KvProbeVerdict> {
+        Some(KvProbeVerdict::Pass {
+            baseline_free_blocks: 4_096,
+            final_free_blocks: 4_096,
+            samples: 20,
+        })
+    }
+
+    #[test]
+    fn test_runs_whose_pool_held_pass_the_guard() {
+        let engine = engine(vec![run_with(passed()), run_with(passed())]);
+
+        assert!(check_kv_pool_held(&engine).is_ok());
+    }
+
+    /// The whole point of the guard: `run` is the command CI invokes, so a leaking run has to fail
+    /// it rather than pass with the leak recorded in a log line nobody reads.
+    #[test]
+    fn test_a_leaking_run_fails_the_command() {
+        let engine = engine(vec![
+            run_with(passed()),
+            run_with(Some(KvProbeVerdict::Leak {
+                reason: "128 of 4096 blocks had not returned once the run drained".to_string(),
+                baseline_free_blocks: 4_096,
+                final_free_blocks: 3_968,
+                samples: 20,
+            })),
+        ]);
+
+        let error = check_kv_pool_held(&engine).expect_err("A leaking run must fail the command");
+
+        assert!(format!("{error}").contains("run 1"), "{error}");
+        assert!(
+            format!("{error}").contains("blocks had not returned"),
+            "{error}"
+        );
+    }
+
+    /// A pool nobody could judge is not a pool that held.
+    #[test]
+    fn test_an_inconclusive_run_fails_the_command() {
+        let engine = engine(vec![run_with(Some(KvProbeVerdict::Inconclusive {
+            reason: "2 samples is fewer than the 8 needed to judge the pool".to_string(),
+            samples: 2,
+        }))]);
+
+        assert!(check_kv_pool_held(&engine).is_err());
+    }
+
+    /// An engine that publishes no free-block gauge is measured rather than guarded; failing here
+    /// would stop the harness driving any engine without Prometheus.
+    #[test]
+    fn test_an_unwatched_engine_is_not_failed_by_the_guard() {
+        let engine = engine(vec![run_with(None), run_with(None)]);
+
+        assert!(check_kv_pool_held(&engine).is_ok());
+    }
 }

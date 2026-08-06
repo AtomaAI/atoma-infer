@@ -126,6 +126,31 @@ impl Vocabulary for HfVocabulary {
     }
 }
 
+/// A vocabulary that counts and mints tokens as whitespace-separated words.
+///
+/// The harness's own tests measure with this rather than a real tokenizer, so neither the unit
+/// tests nor the end-to-end tests need a `tokenizer.json` on disk or a Hugging Face fetch.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WordVocabulary;
+
+impl Vocabulary for WordVocabulary {
+    fn count_tokens(&self, text: &str) -> Result<usize> {
+        Ok(text.split_whitespace().count())
+    }
+
+    fn decode(&self, token_ids: &[u32]) -> Result<String> {
+        Ok(token_ids
+            .iter()
+            .map(|token_id| format!("w{token_id}"))
+            .collect::<Vec<_>>()
+            .join(" "))
+    }
+
+    fn size(&self) -> usize {
+        1_000
+    }
+}
+
 /// One prompt and the answer it was given, derived from a ShareGPT conversation.
 #[derive(Clone, Debug)]
 pub struct Conversation {
@@ -370,28 +395,6 @@ fn arrivals(plan: &LoadPlan) -> Result<Vec<Duration>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Counts and mints tokens as whitespace-separated words, so workload tests do not need a real
-    /// tokenizer on disk.
-    struct WordVocabulary;
-
-    impl Vocabulary for WordVocabulary {
-        fn count_tokens(&self, text: &str) -> Result<usize> {
-            Ok(text.split_whitespace().count())
-        }
-
-        fn decode(&self, token_ids: &[u32]) -> Result<String> {
-            Ok(token_ids
-                .iter()
-                .map(|token_id| format!("w{token_id}"))
-                .collect::<Vec<_>>()
-                .join(" "))
-        }
-
-        fn size(&self) -> usize {
-            1_000
-        }
-    }
 
     fn sharegpt_json(conversations: &[(&str, &str)]) -> serde_json::Value {
         let entries = conversations

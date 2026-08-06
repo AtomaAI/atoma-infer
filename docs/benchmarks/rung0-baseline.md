@@ -25,7 +25,7 @@ Per [plan §8](../plan/README.md#8-benchmark--correctness-protocol):
 | **Workloads** | ShareGPT-derived conversational trace, and a long-context workload at 8k input tokens. One artifact and one table per workload — they are not averaged together |
 | **Runs** | ≥3 per engine per workload; the median run by goodput is reported, and every run is listed |
 | **Reporting** | Absolute numbers alongside ratios; both engines' full configurations emitted with the results |
-| **KV-leak probe** | `atoma-infer`'s free-block gauge is sampled across each of its runs. A pool whose ceiling falls, or that ends a run below where sampling started, fails the run and no table is written. vLLM publishes no such gauge, so its runs are recorded as unwatched |
+| **KV-leak probe** | `atoma-infer`'s free-block gauge is sampled across each of its runs, starting from a baseline read before any load is offered. A pool whose ceiling falls, or that ends a run below that baseline, fails the run: `run` exits non-zero and `compare` writes no table. vLLM publishes no such gauge, so its runs are recorded as unwatched |
 
 ## How it is produced
 
@@ -57,6 +57,12 @@ table paths — a second run against the same paths would overwrite the first wo
 `compare` writes the table only if the runs meet the protocol: too few runs, or a run whose KV pool
 did not hold, leaves the artifact behind for inspection and no table. `render` re-renders a table
 from an artifact without re-running anything.
+
+`run` on its own is the standing KV-leak regression guard. It writes its artifact and then exits
+non-zero if the probe did not pass a run it watched, so a reintroduced leak fails the job rather
+than appearing in a log line nobody reads. An engine configured without a `metrics_url` publishes
+no gauge to sample; its runs are measured but not guarded, and `compare` refuses to publish a table
+from them.
 
 Requirements on the host: the rung's GPU, Docker with the NVIDIA runtime, the ShareGPT dump, and a
 Hugging Face token (`HF_TOKEN`, forwarded to the container by name) for the model's weights.

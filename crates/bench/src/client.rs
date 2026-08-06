@@ -15,8 +15,9 @@ use crate::{
     workload::BenchRequest,
 };
 
-/// How much of an engine's error body is kept in a failure record.
-const MAX_ERROR_BODY_CHARS: usize = 200;
+/// How much of a failure reason is kept in a request's record. Reasons quote whatever the engine
+/// said, and an engine that answers a refusal with a page of HTML must not fill the artifact.
+const MAX_FAILURE_REASON_CHARS: usize = 200;
 
 /// What one decoded server-sent event carried.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,10 +153,10 @@ impl OpenAiClient {
 
         let response = match response {
             Ok(response) => response,
-            Err(error) => return self.record_failure(request, &error.to_string(), started),
+            Err(error) => return record_failure(request, &error.to_string(), started),
         };
 
-        self.record_stream(request, response, started).await
+        record_stream(request, response, started).await
     }
 
     /// Posts the completion request.
@@ -171,77 +172,72 @@ impl OpenAiClient {
 
         post.send().await
     }
+}
 
-    /// Times the streamed tokens of an accepted request.
-    async fn record_stream(
-        &self,
-        request: &BenchRequest,
-        response: reqwest::Response,
-        started: Instant,
-    ) -> RequestRecord {
-        let mut decoder = SseDecoder::default();
-        let mut token_offsets = Vec::new();
-        let mut body = response.bytes_stream();
+/// Times the streamed tokens of an accepted request.
+async fn record_stream(
+    request: &BenchRequest,
+    response: reqwest::Response,
+    started: Instant,
+) -> RequestRecord {
+    let mut decoder = SseDecoder::default();
+    let mut token_offsets = Vec::new();
+    let mut body = response.bytes_stream();
 
-        while let Some(chunk) = body.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    return self.record_failure(request, &error.to_string(), started);
+    while let Some(chunk) = body.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return record_failure(request, &error.to_string(), started);
+            }
+        };
+
+        for event in decoder.push(&String::from_utf8_lossy(&chunk)) {
+            match event {
+                SseEvent::Delta(_) => token_offsets.push(started.elapsed()),
+                SseEvent::Done => {
+                    return RequestRecord::completed(
+                        request.id.clone(),
+                        request.prompt_tokens,
+                        &token_offsets,
+                        started.elapsed(),
+                    )
                 }
-            };
-
-            for event in decoder.push(&String::from_utf8_lossy(&chunk)) {
-                match event {
-                    SseEvent::Delta(_) => token_offsets.push(started.elapsed()),
-                    SseEvent::Done => {
-                        return RequestRecord::completed(
-                            request.id.clone(),
-                            request.prompt_tokens,
-                            &token_offsets,
-                            started.elapsed(),
-                        )
-                    }
-                    SseEvent::Malformed(reason) => {
-                        return self.record_failure(
-                            request,
-                            &format!("the engine streamed an unreadable event: {reason}"),
-                            started,
-                        )
-                    }
+                SseEvent::Malformed(reason) => {
+                    return record_failure(
+                        request,
+                        &format!("the engine streamed an unreadable event: {reason}"),
+                        started,
+                    )
                 }
             }
         }
-
-        // The body ended without `[DONE]`: the engine hung up mid-answer.
-        self.record_failure(
-            request,
-            &format!(
-                "the stream ended after {} tokens without a completion event",
-                token_offsets.len()
-            ),
-            started,
-        )
     }
 
-    /// Records a request the engine did not answer.
-    fn record_failure(
-        &self,
-        request: &BenchRequest,
-        reason: &str,
-        started: Instant,
-    ) -> RequestRecord {
-        let reason = reason
-            .chars()
-            .take(MAX_ERROR_BODY_CHARS)
-            .collect::<String>();
-        RequestRecord::failed(
-            request.id.clone(),
-            request.prompt_tokens,
-            reason,
-            started.elapsed(),
-        )
-    }
+    // The body ended without `[DONE]`: the engine hung up mid-answer.
+    record_failure(
+        request,
+        &format!(
+            "the stream ended after {} tokens without a completion event",
+            token_offsets.len()
+        ),
+        started,
+    )
+}
+
+/// Records a request the engine did not answer.
+fn record_failure(request: &BenchRequest, reason: &str, started: Instant) -> RequestRecord {
+    let reason = reason
+        .chars()
+        .take(MAX_FAILURE_REASON_CHARS)
+        .collect::<String>();
+
+    RequestRecord::failed(
+        request.id.clone(),
+        request.prompt_tokens,
+        reason,
+        started.elapsed(),
+    )
 }
 
 #[cfg(test)]

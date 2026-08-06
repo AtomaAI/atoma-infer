@@ -98,8 +98,6 @@ struct Harness {
     admitted: HashMap<String, SequenceGroup>,
     /// The block table each request was last scheduled with.
     block_tables: HashMap<String, Vec<u32>>,
-    /// Requests whose client hung up during the current step.
-    disconnected_requests: Vec<String>,
 }
 
 impl Harness {
@@ -131,7 +129,6 @@ impl Harness {
             kv_pool: KvPool::new(num_gpu_blocks),
             admitted: HashMap::new(),
             block_tables: HashMap::new(),
-            disconnected_requests: Vec::new(),
         }
     }
 
@@ -157,16 +154,23 @@ impl Harness {
     /// Runs one engine step, then retires whatever finished — the seam the KV-leak regression
     /// tests suppress.
     fn step(&mut self) {
-        self.step_without_retiring();
+        let disconnected = self.step_without_retiring();
         self.scheduler
             .remove_finished_sequences()
             .expect("Failed to remove finished sequences");
-        self.abort_disconnected();
+
+        for request_id in disconnected {
+            self.abort(&request_id);
+        }
     }
 
     /// Runs one engine step: schedule, write KV and sample one token per scheduled sequence, and
     /// apply the stopping criteria.
-    fn step_without_retiring(&mut self) {
+    ///
+    /// Returns the requests whose clients hung up during the step, which the engine retires and
+    /// this seam deliberately does not.
+    fn step_without_retiring(&mut self) -> Vec<String> {
+        let mut disconnected = Vec::new();
         let (sequence_groups_metadata, scheduler_outputs) =
             self.scheduler.schedule().expect("Failed to schedule");
 
@@ -221,7 +225,7 @@ impl Harness {
                     .send_chunk(&metadata.request_id, streamed_token(&metadata.request_id))
                     == ClientState::Disconnected
                 {
-                    self.disconnected_requests.push(metadata.request_id.clone());
+                    disconnected.push(metadata.request_id.clone());
                 }
             }
         }
@@ -232,13 +236,8 @@ impl Harness {
                     .retire(&scheduled_sequence_group.scheduled_group.request_id);
             }
         }
-    }
 
-    /// Retires the requests whose clients hung up during the step.
-    fn abort_disconnected(&mut self) {
-        for request_id in std::mem::take(&mut self.disconnected_requests) {
-            self.abort(&request_id);
-        }
+        disconnected
     }
 
     /// Retires a request, as the engine does when its client disconnects.
@@ -478,7 +477,9 @@ fn sampled_run(retirement: Retirement, steps: usize) -> Vec<FreeBlockSample> {
             clients.push(harness.admit(&format!("request-{step}")));
             match retirement {
                 Retirement::Frees => harness.step(),
-                Retirement::Leaks => harness.step_without_retiring(),
+                Retirement::Leaks => {
+                    harness.step_without_retiring();
+                }
             }
             samples.push(sample_gauge(
                 &handle,

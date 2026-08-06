@@ -65,11 +65,28 @@ impl Default for VllmBaseline {
 }
 
 impl VllmBaseline {
+    /// The image's tag, empty when it carries none.
+    fn tag(&self) -> &str {
+        match self.image.rsplit_once(':') {
+            // A registry port is not a tag: `registry:5000/vllm` names no version.
+            Some((_, tag)) if !tag.contains('/') => tag,
+            Some(_) | None => "",
+        }
+    }
+
     /// The version this baseline is pinned to, taken from the image tag.
     pub fn pinned_version(&self) -> &str {
-        self.image
-            .rsplit_once(':')
-            .map_or("", |(_, tag)| tag.trim_start_matches('v'))
+        self.tag().trim_start_matches('v')
+    }
+
+    /// Whether the tag names a release rather than one that moves.
+    ///
+    /// A pinned tag starts with a version number. `latest`, `nightly` and `main` all point
+    /// somewhere new on the next pull, so a table rendered from them names a baseline nobody can
+    /// fetch again.
+    fn is_pinned(&self) -> bool {
+        self.pinned_version()
+            .starts_with(|character: char| character.is_ascii_digit())
     }
 
     /// The base URL the baseline serves on.
@@ -83,10 +100,11 @@ impl VllmBaseline {
     ///
     /// Returns [`BenchError::Config`] if the image carries no tag, or a moving one.
     pub fn validate(&self) -> Result<()> {
-        if self.pinned_version().is_empty() || self.pinned_version() == "latest" {
+        if !self.is_pinned() {
             return Err(BenchError::Config(format!(
                 "The baseline image `{}` is not pinned to a version; the protocol pins the \
-                 competitor at rung kickoff",
+                 competitor at rung kickoff, and a tag that moves re-baselines the comparison on \
+                 the next pull",
                 self.image
             )));
         }
@@ -244,18 +262,32 @@ impl VllmBaseline {
 }
 
 /// Removes a container, whatever state it is in.
+///
+/// A container left behind holds the GPU, so the next run of either engine fails to start. Both
+/// the failure to run docker at all and a non-zero exit from it are reported: only the operator
+/// can clear it.
 async fn remove_container(container_name: &str) {
     let removed = tokio::process::Command::new("docker")
         .args(["rm", "-f", container_name])
         .output()
         .await;
 
-    if let Err(error) = removed {
-        warn!(
+    match removed {
+        Ok(removed) if removed.status.success() => {}
+        Ok(removed) => {
+            let stderr = String::from_utf8_lossy(&removed.stderr);
+            warn!(
+                container = container_name,
+                status = %removed.status,
+                stderr = stderr.trim(),
+                "`docker rm -f` failed; remove the baseline container by hand before the next run"
+            );
+        }
+        Err(error) => warn!(
             container = container_name,
             %error,
-            "Failed to remove the baseline container; remove it by hand before the next run"
-        );
+            "Failed to run `docker rm -f`; remove the baseline container by hand before the next run"
+        ),
     }
 }
 
@@ -316,8 +348,8 @@ mod tests {
         );
     }
 
-    /// An untagged image is not a pinned baseline: `latest` would silently re-baseline the
-    /// comparison the next time the run happens.
+    /// An untagged image is not a pinned baseline: it would silently re-baseline the comparison
+    /// the next time the run happens.
     #[test]
     fn test_an_untagged_image_is_rejected() {
         let error = VllmBaseline {
@@ -328,6 +360,49 @@ mod tests {
         .expect_err("An untagged image is not pinned");
 
         assert!(matches!(error, BenchError::Config(_)), "{error}");
+    }
+
+    /// `latest` is not the only tag that moves, and the protocol pins the competitor by version.
+    /// A tag that points somewhere new on the next pull names a baseline nobody can fetch again.
+    #[test]
+    fn test_a_moving_tag_is_rejected() {
+        for tag in ["latest", "main", "nightly", "stable", "v"] {
+            let baseline = VllmBaseline {
+                image: format!("vllm/vllm-openai:{tag}"),
+                ..baseline()
+            };
+
+            assert!(
+                baseline.validate().is_err(),
+                "`{tag}` moves, so it is not a pinned baseline"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_version_tag_is_accepted_with_or_without_its_leading_v() {
+        for tag in ["v0.26.0", "0.26.0"] {
+            let baseline = VllmBaseline {
+                image: format!("vllm/vllm-openai:{tag}"),
+                ..baseline()
+            };
+
+            assert!(baseline.validate().is_ok(), "`{tag}` pins a version");
+            assert_eq!(baseline.pinned_version(), "0.26.0");
+        }
+    }
+
+    /// `registry:5000/vllm-openai` is a host and port, not a tag; reading `5000/vllm-openai` as
+    /// the version would report an unpinned image as pinned.
+    #[test]
+    fn test_a_registry_port_is_not_mistaken_for_a_tag() {
+        let baseline = VllmBaseline {
+            image: "registry:5000/vllm-openai".to_string(),
+            ..baseline()
+        };
+
+        assert_eq!(baseline.pinned_version(), "");
+        assert!(baseline.validate().is_err());
     }
 
     #[test]

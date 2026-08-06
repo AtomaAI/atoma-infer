@@ -4,10 +4,6 @@ license = "Apache-2.0"
 name    = "atoma-bench"
 version = { workspace = true }
 
-[[bin]]
-name = "atoma-bench"
-path = "src/main.rs"
-
 [dependencies]
 anyhow             = { workspace = true }
 chrono             = { workspace = true }

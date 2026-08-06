@@ -56,6 +56,10 @@ impl EngineResults {
     ///
     /// Returns `None` for an engine with no runs, which [`BenchmarkResults::validate`] reports.
     pub fn median_run(&self) -> Option<&RunResult> {
+        if self.runs.is_empty() {
+            return None;
+        }
+
         let mut ordered = self.runs.iter().collect::<Vec<_>>();
         ordered.sort_by(|left, right| {
             left.summary
@@ -63,7 +67,7 @@ impl EngineResults {
                 .total_cmp(&right.summary.goodput_per_second)
         });
 
-        ordered.get(ordered.len().checked_sub(1)? / 2).copied()
+        ordered.get((ordered.len() - 1) / 2).copied()
     }
 
     /// The problems that stop this engine's runs from being reportable.
@@ -78,23 +82,27 @@ impl EngineResults {
         }
 
         for (index, run) in self.runs.iter().enumerate() {
-            match (&run.kv_probe, probe) {
-                (Some(KvProbeVerdict::Pass { .. }), _)
-                | (None, ProbeExpectation::PublishesNoGauge) => {}
-                (None, ProbeExpectation::Required) => problems.push(format!(
-                    "{} run {index} was not watched for KV leaks; set `engine.metrics_url` so the \
-                     probe can sample the pool",
-                    self.name
-                )),
-                (Some(KvProbeVerdict::Leak { reason, .. }), _) => problems.push(format!(
+            let problem = match &run.kv_probe {
+                Some(KvProbeVerdict::Pass { .. }) => None,
+                Some(KvProbeVerdict::Leak { reason, .. }) => Some(format!(
                     "{} run {index} leaked KV blocks: {reason}",
                     self.name
                 )),
-                (Some(KvProbeVerdict::Inconclusive { reason, .. }), _) => problems.push(format!(
+                Some(KvProbeVerdict::Inconclusive { reason, .. }) => Some(format!(
                     "{} run {index} could not be checked for KV leaks: {reason}",
                     self.name
                 )),
-            }
+                None => match probe {
+                    ProbeExpectation::Required => Some(format!(
+                        "{} run {index} was not watched for KV leaks; set `engine.metrics_url` so \
+                         the probe can sample the pool",
+                        self.name
+                    )),
+                    ProbeExpectation::PublishesNoGauge => None,
+                },
+            };
+
+            problems.extend(problem);
         }
 
         problems

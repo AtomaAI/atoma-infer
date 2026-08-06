@@ -26,10 +26,10 @@ pub struct KvProbeConfig {
     /// The engine under test owns this name, so the harness takes it as configuration rather than
     /// compiling in a copy that could drift: `atoma-infer` publishes
     /// `atoma_vllm_backend::scheduler::FREE_GPU_BLOCKS_METRIC`, and another engine publishes
-    /// whatever it publishes. Empty means unset, which is only allowed when no `metrics_url` is
-    /// configured and the probe therefore never runs.
+    /// whatever it publishes. Naming no gauge is only allowed when no `metrics_url` is configured
+    /// and the probe therefore never runs.
     #[serde(default)]
-    pub metric: String,
+    pub metric: Option<String>,
     /// How often the gauge is sampled.
     #[serde(default = "default_interval_ms")]
     pub interval_ms: u64,
@@ -54,7 +54,7 @@ fn default_num_windows() -> usize {
 impl Default for KvProbeConfig {
     fn default() -> Self {
         Self {
-            metric: String::new(),
+            metric: None,
             interval_ms: default_interval_ms(),
             tolerance_blocks: 0,
             num_windows: default_num_windows(),
@@ -63,6 +63,14 @@ impl Default for KvProbeConfig {
 }
 
 impl KvProbeConfig {
+    /// The gauge to sample, if one is named. A name of nothing but whitespace names no gauge.
+    pub fn gauge(&self) -> Option<&str> {
+        self.metric
+            .as_deref()
+            .map(str::trim)
+            .filter(|gauge| !gauge.is_empty())
+    }
+
     /// The sampling interval.
     pub fn interval(&self) -> Duration {
         Duration::from_millis(self.interval_ms)
@@ -123,6 +131,14 @@ impl KvProbeVerdict {
     pub fn run_passes(&self) -> bool {
         matches!(self, Self::Pass { .. })
     }
+
+    /// Why the run did not pass, if it did not.
+    pub fn failure_reason(&self) -> Option<&str> {
+        match self {
+            Self::Pass { .. } => None,
+            Self::Leak { reason, .. } | Self::Inconclusive { reason, .. } => Some(reason),
+        }
+    }
 }
 
 /// Judges a sampled free-block series.
@@ -130,11 +146,14 @@ pub fn verdict(samples: &[FreeBlockSample], config: &KvProbeConfig) -> KvProbeVe
     if samples.len() < config.min_samples() {
         return KvProbeVerdict::Inconclusive {
             reason: format!(
-                "{} samples of `{}` is fewer than the {} needed to judge the pool; is the engine \
-                 publishing the gauge?",
+                "{} samples is fewer than the {} needed to judge the pool; is the engine \
+                 publishing {}?",
                 samples.len(),
-                config.metric,
-                config.min_samples()
+                config.min_samples(),
+                config.gauge().map_or_else(
+                    || "a free-block gauge".to_string(),
+                    |gauge| format!("`{gauge}`")
+                )
             ),
             samples: samples.len(),
         };
@@ -219,27 +238,38 @@ fn gauge_value(line: &str, metric: &str) -> Option<f64> {
 pub struct KvProbe {
     /// The engine's Prometheus endpoint.
     metrics_url: String,
-    /// What to sample and how often.
-    config: KvProbeConfig,
+    /// The gauge the engine publishes its free block count on.
+    gauge: String,
+    /// How often the gauge is sampled.
+    interval: Duration,
     /// The scraping client.
     client: reqwest::Client,
 }
 
 impl KvProbe {
     /// Builds a probe against an engine's metrics endpoint.
-    pub fn new(metrics_url: String, config: KvProbeConfig) -> Self {
+    pub fn new(metrics_url: String, gauge: String, interval: Duration) -> Self {
         Self {
             metrics_url,
-            config,
+            gauge,
+            interval,
             client: reqwest::Client::new(),
         }
     }
 
-    /// Starts sampling. The first sample is taken immediately, so it should be started before load
-    /// is offered — that reading is the baseline the run is judged against.
-    pub fn start(self) -> RunningKvProbe {
+    /// Takes the baseline sample, then samples on the interval until stopped.
+    ///
+    /// The baseline is read before this returns, so it measures the pool as it stood before the
+    /// caller offered any load — the reading the drain check is judged against. Leaving it to the
+    /// spawned task would race the run's first arrivals, and a baseline that already counted
+    /// allocated blocks understates the pool.
+    pub async fn start(self) -> RunningKvProbe {
+        let started = Instant::now();
+        let mut samples = Vec::new();
+        self.sample_into(&mut samples, started).await;
+
         let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(self.sample_until_stopped(stopped));
+        let task = tokio::spawn(self.sample_until_stopped(stopped, samples, started));
         RunningKvProbe { stop, task }
     }
 
@@ -247,10 +277,12 @@ impl KvProbe {
     async fn sample_until_stopped(
         self,
         mut stopped: oneshot::Receiver<()>,
+        mut samples: Vec<FreeBlockSample>,
+        started: Instant,
     ) -> Vec<FreeBlockSample> {
-        let started = Instant::now();
-        let mut samples = Vec::new();
-        let mut ticks = tokio::time::interval(self.config.interval());
+        // The first tick is skipped: `start` has already taken the baseline sample.
+        let first_tick = tokio::time::Instant::now() + self.interval;
+        let mut ticks = tokio::time::interval_at(first_tick, self.interval);
 
         loop {
             tokio::select! {
@@ -271,7 +303,7 @@ impl KvProbe {
                 free_blocks,
             }),
             None => warn!(
-                metric = self.config.metric,
+                metric = self.gauge,
                 url = self.metrics_url,
                 "Could not read the free-block gauge; skipping this sample"
             ),
@@ -294,7 +326,7 @@ impl KvProbe {
             }
         };
 
-        parse_gauge(&exposition, &self.config.metric).map(|value| value.max(0.0) as u64)
+        parse_gauge(&exposition, &self.gauge).map(|value| value.max(0.0) as u64)
     }
 }
 
@@ -346,6 +378,29 @@ mod tests {
         (0..cycles)
             .flat_map(|_| [ceiling, floor, floor + 5, ceiling])
             .collect()
+    }
+
+    /// The probe only runs against a named gauge, and a name of nothing but whitespace names
+    /// nothing — an operator who leaves the key blank must not get a leak-free verdict on a pool
+    /// nobody sampled.
+    #[test]
+    fn test_a_blank_gauge_name_names_no_gauge() {
+        let named = |metric: Option<&str>| KvProbeConfig {
+            metric: metric.map(str::to_string),
+            ..KvProbeConfig::default()
+        };
+
+        assert_eq!(
+            named(Some("atoma_kv_free_gpu_blocks")).gauge(),
+            Some("atoma_kv_free_gpu_blocks")
+        );
+        assert_eq!(
+            named(Some("  atoma_kv_free_gpu_blocks  ")).gauge(),
+            Some("atoma_kv_free_gpu_blocks")
+        );
+        assert_eq!(named(Some("   ")).gauge(), None);
+        assert_eq!(named(Some("")).gauge(), None);
+        assert_eq!(named(None).gauge(), None);
     }
 
     #[test]

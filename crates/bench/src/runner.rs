@@ -18,6 +18,7 @@ use crate::{
     kv_probe::{self, KvProbe},
     record::{RequestRecord, RunSummary},
     report::{EngineResults, RunResult},
+    vllm::VllmBaseline,
     workload::BenchRequest,
 };
 
@@ -51,6 +52,21 @@ impl EngineTarget {
             model: engine.model.clone(),
             api_key: engine.api_key.clone(),
             config: engine.recorded_config(),
+        }
+    }
+
+    /// The pinned baseline, named by the version the running server reported.
+    ///
+    /// vLLM publishes no free-KV-block gauge, so its runs are unwatched rather than unjudged.
+    pub fn baseline(baseline: &VllmBaseline, reported_version: &str) -> Self {
+        Self {
+            name: format!("vLLM {reported_version}"),
+            version: reported_version.to_string(),
+            base_url: baseline.base_url(),
+            metrics_url: None,
+            model: baseline.model.clone(),
+            api_key: None,
+            config: baseline.recorded_config(),
         }
     }
 }
@@ -137,10 +153,20 @@ async fn run_once(
     config: &BenchConfig,
     requests: &[BenchRequest],
 ) -> RunResult {
-    let probe = target
-        .metrics_url
-        .as_ref()
-        .map(|metrics_url| KvProbe::new(metrics_url.clone(), config.kv_probe.clone()).start());
+    // The probe takes its baseline sample before any load is offered, so it is started and awaited
+    // before `offer` rather than alongside it.
+    let probe = match target.metrics_url.as_ref().zip(config.kv_probe.gauge()) {
+        Some((metrics_url, gauge)) => Some(
+            KvProbe::new(
+                metrics_url.clone(),
+                gauge.to_string(),
+                config.kv_probe.interval(),
+            )
+            .start()
+            .await,
+        ),
+        None => None,
+    };
 
     let started = Instant::now();
     let records = offer(client, requests).await;

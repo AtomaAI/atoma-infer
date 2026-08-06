@@ -72,7 +72,7 @@ impl BenchConfig {
                 "A run with no requests measures nothing".to_string(),
             ));
         }
-        if self.engine.metrics_url.is_some() && self.kv_probe.metric.trim().is_empty() {
+        if self.engine.metrics_url.is_some() && self.kv_probe.gauge().is_none() {
             return Err(BenchError::Config(
                 "`engine.metrics_url` is set but `kv_probe.metric` is not, so the KV-leak probe \
                  has no gauge to sample; name the gauge the engine publishes its free block count \
@@ -253,7 +253,7 @@ metric = "atoma_kv_free_gpu_blocks"
         assert_eq!(config.workload.name(), "long-context");
         assert_eq!(config.engine.name, "atoma-infer");
         assert_eq!(config.baseline.pinned_version(), "0.26.0");
-        assert_eq!(config.kv_probe.metric, "atoma_kv_free_gpu_blocks");
+        assert_eq!(config.kv_probe.gauge(), Some("atoma_kv_free_gpu_blocks"));
     }
 
     /// The example is what an operator copies; if it stops matching this struct, the first thing
@@ -266,7 +266,7 @@ metric = "atoma_kv_free_gpu_blocks"
 
         assert_eq!(config.workload.name(), "sharegpt");
         assert_eq!(config.baseline.pinned_version(), "0.26.0");
-        assert_eq!(config.kv_probe.metric, "atoma_kv_free_gpu_blocks");
+        assert_eq!(config.kv_probe.gauge(), Some("atoma_kv_free_gpu_blocks"));
     }
 
     /// Two runs cannot have a median, and the protocol asks for at least three.
@@ -310,7 +310,7 @@ metric = "atoma_kv_free_gpu_blocks"
         let config = BenchConfig::load(&path).expect("Failed to load the configuration");
 
         assert!(config.engine.metrics_url.is_none());
-        assert!(config.kv_probe.metric.is_empty());
+        assert!(config.kv_probe.gauge().is_none());
     }
 
     #[test]
