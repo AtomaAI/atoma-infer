@@ -1084,6 +1084,32 @@ pub mod tests {
         assert!(request_body.is_ok());
     }
 
+    /// The benchmark harness holds the sampler still by sending `temperature: 0`, and asks for a
+    /// token budget with `max_completion_tokens` rather than the deprecated `max_tokens`. Both have
+    /// to survive the hop into `GenerateParameters` for the harness to measure this engine at all:
+    /// a dropped budget generates until the model's own stop condition, and a rejected temperature
+    /// refuses the request outright. Mirrors `completion_body` in `crates/bench/src/client.rs`.
+    #[test]
+    fn benchmark_harness_body_reaches_the_engine_intact() {
+        let json_request_body = r#"
+            {
+                "model": "meta-llama/Meta-Llama-3-8B-Instruct",
+                "messages": [{ "role": "user", "content": "Hello" }],
+                "max_completion_tokens": 128,
+                "stream": true,
+                "temperature": 0.0
+            }
+        "#;
+
+        let request_body: RequestBody =
+            serde_json::from_str(json_request_body).expect("Harness body must deserialize");
+        let request = request_body.to_generate_request("request".to_string());
+
+        assert_eq!(request.parameters.temperature, Some(0.0));
+        assert_eq!(request.parameters.max_new_tokens, Some(128));
+        assert!(request.parameters.do_sample);
+    }
+
     #[test]
     fn deserialize_system_message() {
         let json_system_message_text = r#"

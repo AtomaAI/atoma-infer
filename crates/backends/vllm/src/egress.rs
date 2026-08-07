@@ -109,7 +109,9 @@ impl ResponseSenders {
         self.streams.remove(request_id);
     }
 
-    /// Whether any request still holds a client channel.
+    /// Whether any request still holds a client channel. No production caller needs this; it is
+    /// how the tests below assert that a finished or aborted request leaves nothing behind.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.completions.is_empty() && self.streams.is_empty()
     }

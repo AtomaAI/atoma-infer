@@ -1,0 +1,97 @@
+# Example benchmark configuration. Copy to `bench.toml`, fill in the paths for your rig, and run
+# the three commands of a comparison — both engines want the whole GPU, so they take turns:
+#
+#   # with atoma-infer serving (you start it; the harness measures what you serve, and records it):
+#   cargo run --release -p atoma-bench -- run \
+#       --config bench.toml --results results/atoma-sharegpt.json
+#   # stop atoma-infer, then:
+#   cargo run --release -p atoma-bench -- baseline \
+#       --config bench.toml --results results/vllm-sharegpt.json
+#   cargo run --release -p atoma-bench -- compare \
+#       --config bench.toml \
+#       --engine results/atoma-sharegpt.json \
+#       --baseline results/vllm-sharegpt.json \
+#       --results docs/benchmarks/rung0-baseline-sharegpt.json \
+#       --table docs/benchmarks/rung0-baseline-table.md
+#
+# Repeat with the long-context workload and its own artifact paths. See
+# docs/benchmarks/rung0-baseline.md.
+
+# `runs`: the protocol reports the median of at least three.
+# `hardware`: recorded verbatim in the results artifact.
+# `tokenizer`: a `tokenizer.json` path, or a Hugging Face model id whose tokenizer is fetched
+# through the hub. Prompt lengths are measured with it, so it must belong to the model served.
+[run]
+cooldown_seconds        = 30
+hardware                = "1xH100 SXM 80GB, driver 580.105.08, CUDA 12.8"
+request_timeout_seconds = 600
+runs                    = 3
+tokenizer               = "meta-llama/Meta-Llama-3-8B-Instruct"
+
+# Requests arrive as a Poisson process at `request_rate_per_second`; `seed` fixes both the arrival
+# times and the prompts, so two runs offer the same load.
+[load]
+num_requests            = 500
+request_rate_per_second = 8.0
+seed                    = 1
+
+# Goodput counts the requests that met both of these.
+[slo]
+itl_ms  = 50.0
+ttft_ms = 2000.0
+
+# The ShareGPT-derived conversational trace. Download the dump first:
+#   curl -L -o data/sharegpt.json \
+#     https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
+#
+# For the long-context workload, replace this section with:
+#   [workload]
+#   kind          = "long-context"
+#   input_tokens  = 8000
+#   output_tokens = 256
+#   range_ratio   = 0.1
+#
+# One workload per run, one artifact per workload.
+[workload]
+kind = "sharegpt"
+path = "data/sharegpt.json"
+
+# Conversations outside these lengths are dropped rather than truncated.
+[workload.limits]
+max_total_tokens  = 2048
+min_output_tokens = 4
+min_prompt_tokens = 4
+
+# The engine under test, which you start yourself. `config_path` is copied into the results
+# artifact, so the table carries the configuration that produced it; `metrics_url` is what the
+# KV-leak probe samples; an omitted `version` records the current git commit.
+[engine]
+base_url    = "http://127.0.0.1:8080"
+config_path = "config.toml"
+metrics_url = "http://127.0.0.1:8080/metrics"
+model       = "meta-llama/Meta-Llama-3-8B-Instruct"
+name        = "atoma-infer"
+# version   = "abc1234"   # omitted: the current git commit is recorded
+
+# The pinned competitor. The protocol pins it by name and version at rung kickoff and runs it in
+# its documented recommended configuration, which for vLLM is its defaults plus the model —
+# `server_args` is the escape hatch, and anything in it is published with the results.
+[baseline]
+container_name          = "atoma-bench-vllm"
+gpus                    = "all"
+hugging_face_cache      = "/root/.cache/huggingface"
+image                   = "vllm/vllm-openai:v0.26.0"
+model                   = "meta-llama/Meta-Llama-3-8B-Instruct"
+port                    = 8000
+server_args             = [  ]
+shm_size                = "16g"
+startup_timeout_seconds = 900
+
+# A run fails if the engine's free-block count never recovers to where it started. `metric` is the
+# gauge the engine under test publishes that count on, so it changes with the engine: the value
+# below is `atoma-infer`'s. Required whenever `engine.metrics_url` is set.
+[kv_probe]
+interval_ms      = 1000
+metric           = "atoma_kv_free_gpu_blocks"
+num_windows      = 4
+tolerance_blocks = 0

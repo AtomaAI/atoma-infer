@@ -223,9 +223,11 @@ impl Validation {
             return Err(ValidationError::BestOfSampling);
         }
 
+        // `temperature == 0` is the OpenAI convention for greedy decoding, which `sampling` maps to
+        // `Sampling::ArgMax`. Rejecting it would refuse every deterministic request.
         let temperature = temperature.unwrap_or(1.0);
-        if temperature <= 0.0 {
-            error!("Temperature must be greater than 0");
+        if temperature < 0.0 {
+            error!("Temperature must not be negative");
             return Err(ValidationError::Temperature);
         }
 
@@ -625,19 +627,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_non_positive_temperature_is_rejected() {
+    async fn test_negative_temperature_is_rejected() {
         let validation = test_validation();
         let parameters = GenerateParameters {
-            temperature: Some(0.0),
+            temperature: Some(-0.5),
             ..generate_parameters()
         };
 
         let error = validation
             .validate(generate_request(parameters))
             .await
-            .expect_err("Non-positive temperature must be rejected");
+            .expect_err("Negative temperature must be rejected");
 
         assert!(matches!(error, ValidationError::Temperature));
+    }
+
+    /// `temperature: 0` is how an OpenAI client asks for greedy decoding, and how the benchmark
+    /// harness holds the sampler still across engines. Rejecting it refuses every deterministic
+    /// request, including every request the harness makes.
+    #[tokio::test]
+    async fn test_zero_temperature_is_accepted() {
+        let validation = test_validation();
+        let parameters = GenerateParameters {
+            temperature: Some(0.0),
+            ..generate_parameters()
+        };
+
+        let valid_request = validation
+            .validate(generate_request(parameters))
+            .await
+            .expect("Zero temperature must be accepted as a request for greedy decoding");
+
+        assert_eq!(valid_request.parameters.temperature, 0.0);
+        assert!(valid_request.parameters.do_sample);
     }
 
     #[tokio::test]

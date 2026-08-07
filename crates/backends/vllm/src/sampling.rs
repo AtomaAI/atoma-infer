@@ -12,11 +12,13 @@ pub fn logits_processor(parameters: &NextTokenChooserParameters) -> LogitsProces
 
 /// Selects the decoding strategy for a request.
 ///
-/// Greedy decoding is chosen only when the request opts out of sampling. `temperature == 1.0` is
-/// the OpenAI default and means "sample from the model's own distribution" — treating it as a
-/// request for greedy decoding makes every default-parameter request deterministic.
-pub fn sampling_strategy(parameters: &NextTokenChooserParameters) -> Sampling {
-    if !parameters.do_sample {
+/// Greedy decoding is chosen when the request opts out of sampling, or asks for `temperature == 0`
+/// — the OpenAI convention for determinism, and the only sound reading of a temperature the sampler
+/// would otherwise divide the logits by. `temperature == 1.0` is the OpenAI default and means
+/// "sample from the model's own distribution"; treating *that* as a request for greedy decoding
+/// would make every default-parameter request deterministic.
+fn sampling_strategy(parameters: &NextTokenChooserParameters) -> Sampling {
+    if !parameters.do_sample || parameters.temperature <= 0.0 {
         return Sampling::ArgMax;
     }
 
@@ -74,6 +76,30 @@ mod tests {
     fn test_sampling_disabled_decodes_greedily() {
         let parameters = NextTokenChooserParameters {
             do_sample: false,
+            ..default_parameters()
+        };
+        assert_eq!(sampling_strategy(&parameters), Sampling::ArgMax);
+    }
+
+    /// An OpenAI client asking for determinism sends `temperature: 0`, not `do_sample: false` —
+    /// the API surface has no way to express the latter and always forwards `do_sample: true`.
+    #[test]
+    fn test_zero_temperature_decodes_greedily() {
+        let parameters = NextTokenChooserParameters {
+            temperature: 0.0,
+            ..default_parameters()
+        };
+        assert_eq!(sampling_strategy(&parameters), Sampling::ArgMax);
+    }
+
+    /// Greedy decoding has to win over the narrowing parameters too: `Sampling::TopK` and friends
+    /// divide the logits by the temperature, which is undefined at zero.
+    #[test]
+    fn test_zero_temperature_wins_over_top_k_and_top_p() {
+        let parameters = NextTokenChooserParameters {
+            temperature: 0.0,
+            top_k: 40,
+            top_p: 0.75,
             ..default_parameters()
         };
         assert_eq!(sampling_strategy(&parameters), Sampling::ArgMax);

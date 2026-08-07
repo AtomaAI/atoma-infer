@@ -9,13 +9,16 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
+use atoma_bench::kv_probe::{FreeBlockSample, KvProbeConfig, KvProbeVerdict};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
 use crate::{
+    admission::RequestAdmitter,
     config::{CacheConfig, SchedulerConfig},
     egress::{ClientState, ResponseSenders},
-    llm_service::RequestAdmitter,
     output::{GenerateStreamingOutput, StreamResponse},
     policy::FcfsPolicy,
     scheduler::Scheduler,
@@ -148,12 +151,28 @@ impl Harness {
         receiver
     }
 
-    /// Runs one engine step: schedule, write KV and sample one token per scheduled sequence, apply
-    /// the stopping criteria, then retire whatever finished.
+    /// Runs one engine step, then retires whatever finished — the seam the KV-leak regression
+    /// tests suppress.
     fn step(&mut self) {
+        let disconnected = self.step_without_retiring();
+        self.scheduler
+            .remove_finished_sequences()
+            .expect("Failed to remove finished sequences");
+
+        for request_id in disconnected {
+            self.abort(&request_id);
+        }
+    }
+
+    /// Runs one engine step: schedule, write KV and sample one token per scheduled sequence, and
+    /// apply the stopping criteria.
+    ///
+    /// Returns the requests whose clients hung up during the step, which the engine retires and
+    /// this seam deliberately does not.
+    fn step_without_retiring(&mut self) -> Vec<String> {
+        let mut disconnected = Vec::new();
         let (sequence_groups_metadata, scheduler_outputs) =
             self.scheduler.schedule().expect("Failed to schedule");
-        let mut disconnected_requests = Vec::new();
 
         for (metadata, scheduled_sequence_group) in sequence_groups_metadata
             .iter()
@@ -206,7 +225,7 @@ impl Harness {
                     .send_chunk(&metadata.request_id, streamed_token(&metadata.request_id))
                     == ClientState::Disconnected
                 {
-                    disconnected_requests.push(metadata.request_id.clone());
+                    disconnected.push(metadata.request_id.clone());
                 }
             }
         }
@@ -218,13 +237,7 @@ impl Harness {
             }
         }
 
-        self.scheduler
-            .remove_finished_sequences()
-            .expect("Failed to remove finished sequences");
-
-        for request_id in disconnected_requests {
-            self.abort(&request_id);
-        }
+        disconnected
     }
 
     /// Retires a request, as the engine does when its client disconnects.
@@ -421,6 +434,93 @@ fn test_a_disconnected_client_does_not_disturb_the_others() {
         harness.free_gpu_blocks(),
         baseline_free_blocks,
         "the disconnected request's blocks must return to the pool"
+    );
+}
+
+/// Samples the free-block gauge the way the benchmark harness does: scrape the Prometheus text
+/// with the harness's own parser, looking for the name the engine says it publishes under. A
+/// rename on either side of that seam fails every test that samples the gauge.
+fn sample_gauge(handle: &PrometheusHandle, at: Duration) -> FreeBlockSample {
+    let free_blocks = atoma_bench::kv_probe::parse_gauge(
+        &handle.render(),
+        crate::scheduler::FREE_GPU_BLOCKS_METRIC,
+    )
+    .expect("The scheduler did not publish the free-block gauge");
+
+    FreeBlockSample {
+        at,
+        free_blocks: free_blocks as u64,
+    }
+}
+
+/// Whether a run retires its finished requests — the P0-2 seam.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retirement {
+    /// Finished requests give their blocks back, as the fixed engine does.
+    Frees,
+    /// Finished requests are never retired, as the engine did before the P0 fix.
+    Leaks,
+}
+
+/// Drives `steps` steps of a run, sampling the gauge before load, after every step, and once the
+/// run has drained.
+fn sampled_run(retirement: Retirement, steps: usize) -> Vec<FreeBlockSample> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+
+    metrics::with_local_recorder(&recorder, || {
+        let mut harness = Harness::new(NUM_GPU_BLOCKS, NUM_REQUESTS);
+        let mut samples = vec![sample_gauge(&handle, Duration::ZERO)];
+        let mut clients = Vec::new();
+
+        for step in 0..steps {
+            clients.push(harness.admit(&format!("request-{step}")));
+            match retirement {
+                Retirement::Frees => harness.step(),
+                Retirement::Leaks => {
+                    harness.step_without_retiring();
+                }
+            }
+            samples.push(sample_gauge(
+                &handle,
+                Duration::from_millis(step as u64 + 1),
+            ));
+        }
+
+        if retirement == Retirement::Frees {
+            harness.run_to_completion();
+        }
+        samples.push(sample_gauge(
+            &handle,
+            Duration::from_millis(steps as u64 + 1),
+        ));
+        samples
+    })
+}
+
+/// The gauge an untouched engine publishes has to satisfy the probe, or the guard would fail every
+/// clean run and get switched off.
+#[test]
+fn test_the_kv_probe_passes_a_run_that_returns_its_blocks() {
+    let samples = sampled_run(Retirement::Frees, 24);
+
+    let verdict = atoma_bench::kv_probe::verdict(&samples, &KvProbeConfig::default());
+
+    assert!(verdict.run_passes(), "{verdict:?}");
+}
+
+/// P0-2 reintroduced: finished requests are never retired, so their blocks never return. The probe
+/// has to fail the run — this is the guard that keeps the fix from regressing unnoticed.
+#[test]
+fn test_the_kv_probe_fails_a_run_that_never_frees_finished_requests() {
+    let samples = sampled_run(Retirement::Leaks, 24);
+
+    let verdict = atoma_bench::kv_probe::verdict(&samples, &KvProbeConfig::default());
+
+    assert!(
+        matches!(verdict, KvProbeVerdict::Leak { .. }),
+        "a pool that never gets its blocks back must fail the run as a leak, not for want of \
+         samples: {verdict:?}"
     );
 }
 

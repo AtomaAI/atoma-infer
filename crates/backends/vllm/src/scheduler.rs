@@ -13,8 +13,16 @@ use crate::{
     sequence::{SequenceData, SequenceError, SequenceGroup, SequenceGroupMetadata, SequenceStatus},
     types::{ReadLock, WriteLock},
 };
+use metrics::gauge;
 use thiserror::Error;
 use tracing::{debug, error, instrument, trace, warn};
+
+/// The gauge carrying the number of free GPU KV blocks.
+///
+/// This is the engine's published name for it, and the one an operator puts in the benchmark
+/// harness's `kv_probe.metric`. `tests::concurrency` scrapes it with the harness's own parser, so
+/// a rename that the harness could not follow fails there.
+pub const FREE_GPU_BLOCKS_METRIC: &str = "atoma_kv_free_gpu_blocks";
 
 /// Preemption modes.
 ///
@@ -340,7 +348,7 @@ impl<P> Scheduler<P> {
         cache_config: CacheConfig,
         scheduler_config: SchedulerConfig,
     ) -> Result<Self, SchedulerError> {
-        Ok(Self {
+        let scheduler = Self {
             block_manager: BlockSpaceManager::new(
                 cache_config.block_size(),
                 cache_config.num_cpu_blocks().unwrap(),
@@ -357,7 +365,13 @@ impl<P> Scheduler<P> {
             last_prompt_latency: 0.0,
             num_cumulative_preemption: 0,
             _phantom: PhantomData,
-        })
+        };
+
+        // Published before any request arrives, so a probe that starts with an idle engine reads
+        // the full pool as its baseline rather than whatever the first batch had left.
+        scheduler.publish_free_gpu_blocks();
+
+        Ok(scheduler)
     }
 
     /// Aborts a sequence group with the given ID.
@@ -420,6 +434,7 @@ impl<P> Scheduler<P> {
         self.waiting.retain(|s| s.request_id != request_id);
         self.running.retain(|s| s.request_id != request_id);
         self.swapped.retain(|s| s.request_id != request_id);
+        self.publish_free_gpu_blocks();
 
         Ok(())
     }
@@ -545,6 +560,20 @@ impl<P> Scheduler<P> {
     /// Returns the number of GPU blocks the KV pool has left.
     pub fn num_free_gpu_blocks(&self) -> usize {
         self.block_manager.get_number_of_free_gpu_blocks()
+    }
+
+    /// Publishes the free GPU block count.
+    ///
+    /// Called at the end of every `schedule`, which covers everything a scheduling pass does to
+    /// the pool, and from the seams that free blocks outside one — retiring finished requests and
+    /// aborting a request.
+    ///
+    /// This is what makes a KV leak observable from outside the process: the benchmark harness
+    /// samples this gauge across a run, and a pool whose ceiling falls window after window fails
+    /// the run. Sampling it only from the scheduler keeps the reading exact — the block manager is
+    /// owned by this thread and nothing else can be mid-allocation when it is read.
+    fn publish_free_gpu_blocks(&self) {
+        gauge!(FREE_GPU_BLOCKS_METRIC).set(self.num_free_gpu_blocks() as f64);
     }
 }
 
@@ -1527,6 +1556,8 @@ impl<P: Policy> Scheduler<P> {
         //         scheduled_seq_group.scheduled_group)
         // }
 
+        self.publish_free_gpu_blocks();
+
         Ok((sequence_groups_metadata, scheduler_outputs))
     }
 }
@@ -2193,6 +2224,7 @@ impl<P: Debug> Scheduler<P> {
         for sequence_id in sequence_ids_to_free {
             self.free_sequence(sequence_id)?;
         }
+        self.publish_free_gpu_blocks();
 
         Ok(())
     }

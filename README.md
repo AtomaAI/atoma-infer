@@ -61,6 +61,18 @@ export ATOMA_FLASH_ATTN_BUILD_DIR="$HOME/.cache/atoma-flash-attn-build"
 
 Multi-GPU builds additionally enable `nccl`, which is compile-checked with `cargo check --workspace --features cuda,nccl`. Running tensor-parallel inference is not verified in this checkout.
 
+## Benchmarks
+
+`crates/bench` holds the benchmark harness (`atoma-bench`). It offers an open-loop Poisson workload
+over the OpenAI surface, records TTFT, inter-token and end-to-end latency as hdrhistogram
+distributions, reports goodput at a fixed SLO, samples the engine's free-KV-block gauge for leaks,
+and drives a pinned vLLM baseline over the same workload on the same host for comparison. Copy
+`crates/bench/bench.example.toml`, then run `cargo run --release -p atoma-bench -- --help`. The
+protocol and the procedure are in
+[docs/benchmarks/rung0-baseline.md](docs/benchmarks/rung0-baseline.md) and the table it produces in
+[docs/benchmarks/rung0-baseline-table.md](docs/benchmarks/rung0-baseline-table.md); no measurements
+have been taken yet.
+
 ## Configuration and running
 
 Copy the example configuration and provide the Hugging Face API key, model, cache path, and GPU device IDs for your environment:

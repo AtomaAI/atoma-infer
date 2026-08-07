@@ -4,6 +4,7 @@ members = [
     "crates/atoma-kernels",
     "crates/backends",
     "crates/backends/vllm",
+    "crates/bench",
     "crates/models",
 ]
 resolver = "2"
@@ -15,6 +16,7 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1.0.89"
 atoma-backends = { path = "crates/backends" }
+atoma-bench = { path = "crates/bench" }
 atoma-kernels = { path = "crates/atoma-kernels" }
 axum = "0.8"
 bindgen_cuda = "0.1.5"
@@ -22,6 +24,7 @@ candle-core = "0.11.0"
 candle-examples = "0.11.0"
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
+chrono = "0.4.45"
 clap = "4.5.18"
 config = "0.15.25"
 cuda-runtime-sys = "0.3.0-alpha.1"
@@ -40,11 +43,13 @@ cudarc = { version = "0.19.8", features = [
 flume = "0.12.0"
 futures = "0.3.30"
 half = "2.4.1"
+hdrhistogram = "7.6.0"
 hf-hub = "0.5.0"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 models = { path = "crates/models" }
 rand = "0.9.0"
+reqwest = "0.12.15" # hf-hub already pulls the 0.12 line; keep one copy
 serde = "1.0.204"
 serde_json = "1.0.120"
 serial_test = "4.0.1"
@@ -57,3 +62,4 @@ tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
 utoipa = "5"
 utoipa-swagger-ui = "9"
+uuid = "1.24.0"
