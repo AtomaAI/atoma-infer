@@ -7,3 +7,6 @@ version = { workspace = true }
 [dependencies]
 cudarc    = { workspace = true }
 thiserror = { workspace = true }
+
+[features]
+nccl = [ "cudarc/nccl" ]
