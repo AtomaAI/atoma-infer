@@ -5,4 +5,5 @@ name    = "atoma-runtime"
 version = { workspace = true }
 
 [dependencies]
-cudarc = { workspace = true }
+cudarc    = { workspace = true }
+thiserror = { workspace = true }

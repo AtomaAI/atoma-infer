@@ -199,6 +199,7 @@ name = "atoma-runtime"
 version = "0.1.0"
 dependencies = [
  "cudarc 0.19.8",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
