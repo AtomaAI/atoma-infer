@@ -31,10 +31,10 @@ cuda-runtime-sys = "0.3.0-alpha.1"
 cudarc = { version = "0.19.8", features = [
     "cublas",
     "cublaslt",
-    "cuda-version-from-build-system",
+    "cuda-12000",
     "curand",
     "driver",
-    "dynamic-linking",
+    "dynamic-loading",
     "f16",
     "f8",
     "nvrtc",
