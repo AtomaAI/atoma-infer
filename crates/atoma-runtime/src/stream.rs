@@ -53,4 +53,10 @@ impl CaptureStream {
     pub fn cu_stream(&self) -> sys::CUstream {
         self.stream.cu_stream()
     }
+
+    /// The underlying cudarc stream, for this crate's end-capture paths only: the public surface
+    /// must never grow a synchronize or an allocate.
+    pub(crate) fn cudarc_stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
 }

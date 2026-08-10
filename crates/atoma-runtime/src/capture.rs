@@ -1,13 +1,23 @@
-//! Capture lifecycle: which operations are legal in which capture state.
+//! Capture lifecycle: which operations are legal in which capture state, and the end-capture
+//! paths that instantiate or discard a recording.
 //!
 //! The driver reports a stream's capture status as none, active, or invalidated. The transition
 //! rules — begin only when idle, instantiate only when active, and an invalidated capture can
 //! only be discarded — are pure logic, kept out of the driver-calling seams so they are testable
 //! on a machine with no GPU.
+//!
+//! The end-capture paths are this crate's own rather than cudarc's: cudarc's `end_capture`
+//! always instantiates, and its instantiate-flags parameter is an enum with no zero value, so
+//! neither "instantiate with flags 0" nor "discard without instantiating" is expressible through
+//! it. Both paths are built over cudarc's public `result` and `sys` layers — no fork, no patch.
 
-use cudarc::driver::sys::CUstreamCaptureStatus;
+use std::sync::Arc;
+
+use cudarc::driver::sys::{CUresult, CUstreamCaptureStatus};
+use cudarc::driver::{result, sys, CudaStream};
 
 use crate::error::RuntimeError;
+use crate::stream::CaptureStream;
 
 /// Capture state of a stream, as the driver reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +66,116 @@ pub enum CaptureOp {
     EndInstantiate,
     /// Stop recording and destroy the recorded graph without instantiating it.
     Discard,
+}
+
+/// A recorded graph and its instantiated executable, replayed with [`CapturedGraph::launch`].
+///
+/// `!Send` and `!Sync` by construction (raw driver handles): NVIDIA documents graph objects as
+/// not internally synchronized, so warmup, capture, and replay all run on the executor thread
+/// that owns the stream — a graph cannot be captured on a setup thread and moved.
+pub struct CapturedGraph {
+    cu_graph: sys::CUgraph,
+    cu_graph_exec: sys::CUgraphExec,
+    stream: Arc<CudaStream>,
+}
+
+impl CapturedGraph {
+    /// Replays the graph on the stream it was captured from.
+    pub fn launch(&self) -> Result<(), RuntimeError> {
+        let ctx = self.stream.context();
+        ctx.bind_to_thread()?;
+        unsafe { result::graph::launch(self.cu_graph_exec, self.stream.cu_stream()) }?;
+        Ok(())
+    }
+
+    /// Pre-uploads the executable's device state so the first launch pays no setup cost.
+    pub fn upload(&self) -> Result<(), RuntimeError> {
+        let ctx = self.stream.context();
+        ctx.bind_to_thread()?;
+        unsafe { result::graph::upload(self.cu_graph_exec, self.stream.cu_stream()) }?;
+        Ok(())
+    }
+
+    /// Raw graph handle for the diagnostic wrappers. Do not destroy it; this type owns it.
+    pub fn cu_graph(&self) -> sys::CUgraph {
+        self.cu_graph
+    }
+
+    /// Raw executable handle for the update wrappers. Do not destroy it; this type owns it.
+    pub fn cu_graph_exec(&self) -> sys::CUgraphExec {
+        self.cu_graph_exec
+    }
+}
+
+impl Drop for CapturedGraph {
+    fn drop(&mut self) {
+        let ctx = self.stream.context();
+        ctx.record_err(ctx.bind_to_thread());
+        // The executable references the graph, so it is destroyed first — the same order
+        // cudarc's own graph destructor uses.
+        let cu_graph_exec = std::mem::replace(&mut self.cu_graph_exec, std::ptr::null_mut());
+        if !cu_graph_exec.is_null() {
+            ctx.record_err(unsafe { result::graph::exec_destroy(cu_graph_exec) });
+        }
+        let cu_graph = std::mem::replace(&mut self.cu_graph, std::ptr::null_mut());
+        if !cu_graph.is_null() {
+            ctx.record_err(unsafe { result::graph::destroy(cu_graph) });
+        }
+    }
+}
+
+/// Ends the capture on `stream` and instantiates the recording with instantiate flags 0 —
+/// deterministic memory from the pre-allocated arena, no auto-free, no device-launch, no memory
+/// pool coupling.
+///
+/// Every error path drains the capture and never leaks a graph or an executable: an end-capture
+/// failure leaves no graph behind (the driver drains the capture even when it reports it
+/// invalidated), and an instantiate failure destroys the drained graph before returning.
+pub fn end_capture_instantiate(stream: &CaptureStream) -> Result<CapturedGraph, RuntimeError> {
+    stream.state()?.apply(CaptureOp::EndInstantiate)?;
+    let cudarc_stream = stream.cudarc_stream();
+    let ctx = cudarc_stream.context();
+    ctx.bind_to_thread()?;
+
+    let cu_graph = unsafe { result::stream::end_capture(cudarc_stream.cu_stream()) }?;
+    if cu_graph.is_null() {
+        return Err(RuntimeError::EndWithoutCapture);
+    }
+
+    let mut cu_graph_exec = std::ptr::null_mut();
+    let instantiated =
+        unsafe { sys::cuGraphInstantiateWithFlags(&mut cu_graph_exec, cu_graph, 0) }.result();
+    if let Err(err) = instantiated {
+        ctx.record_err(unsafe { result::graph::destroy(cu_graph) });
+        return Err(err.into());
+    }
+
+    Ok(CapturedGraph {
+        cu_graph,
+        cu_graph_exec,
+        stream: cudarc_stream.clone(),
+    })
+}
+
+/// Ends the capture on `stream` and destroys whatever was recorded without instantiating it —
+/// the path an invalidated capture must take, which cudarc's always-instantiating `end_capture`
+/// cannot express. Discarding costs nothing and leaks nothing.
+pub fn end_capture_discard(stream: &CaptureStream) -> Result<(), RuntimeError> {
+    stream.state()?.apply(CaptureOp::Discard)?;
+    let cudarc_stream = stream.cudarc_stream();
+    cudarc_stream.context().bind_to_thread()?;
+
+    match unsafe { result::stream::end_capture(cudarc_stream.cu_stream()) } {
+        Ok(cu_graph) if !cu_graph.is_null() => {
+            unsafe { result::graph::destroy(cu_graph) }?;
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        // Ending an invalidated capture reports the invalidation but still drains the recording
+        // with no graph to destroy; for a discard that is success, not an error.
+        Err(err) if err.0 == CUresult::CUDA_ERROR_STREAM_CAPTURE_INVALIDATED => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 #[cfg(test)]
