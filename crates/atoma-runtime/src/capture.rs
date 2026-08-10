@@ -68,7 +68,7 @@ pub enum CaptureOp {
     Discard,
 }
 
-/// A recorded graph and its instantiated executable, replayed with [`CapturedGraph::launch`].
+/// A recorded graph and its instantiated executable, replayed with [`CapturedGraph::replay`].
 ///
 /// `!Send` and `!Sync` by construction (raw driver handles): NVIDIA documents graph objects as
 /// not internally synchronized, so warmup, capture, and replay all run on the executor thread
@@ -81,14 +81,14 @@ pub struct CapturedGraph {
 
 impl CapturedGraph {
     /// Replays the graph on the stream it was captured from.
-    pub fn launch(&self) -> Result<(), RuntimeError> {
+    pub fn replay(&self) -> Result<(), RuntimeError> {
         let ctx = self.stream.context();
         ctx.bind_to_thread()?;
         unsafe { result::graph::launch(self.cu_graph_exec, self.stream.cu_stream()) }?;
         Ok(())
     }
 
-    /// Pre-uploads the executable's device state so the first launch pays no setup cost.
+    /// Pre-uploads the executable's device state so the first replay pays no setup cost.
     pub fn upload(&self) -> Result<(), RuntimeError> {
         let ctx = self.stream.context();
         ctx.bind_to_thread()?;
@@ -128,9 +128,11 @@ impl Drop for CapturedGraph {
 /// deterministic memory from the pre-allocated arena, no auto-free, no device-launch, no memory
 /// pool coupling.
 ///
-/// Every error path drains the capture and never leaks a graph or an executable: an end-capture
-/// failure leaves no graph behind (the driver drains the capture even when it reports it
-/// invalidated), and an instantiate failure destroys the drained graph before returning.
+/// No path leaks a graph or an executable. The lifecycle pre-checks reject an idle or
+/// invalidated stream before anything is drained — an invalidated capture stays live for
+/// [`end_capture_discard`], as its error directs. Past the pre-checks, an end-capture failure
+/// leaves no graph behind (the driver drains the capture even when it reports it invalidated),
+/// and an instantiate failure destroys the drained graph before returning.
 pub fn end_capture_instantiate(stream: &CaptureStream) -> Result<CapturedGraph, RuntimeError> {
     stream.state()?.apply(CaptureOp::EndInstantiate)?;
     let cudarc_stream = stream.cudarc_stream();
@@ -192,7 +194,7 @@ pub unsafe fn debug_dot_print(
     flags: u32,
 ) -> Result<(), RuntimeError> {
     let path = std::ffi::CString::new(path.to_string_lossy().as_bytes())
-        .expect("dot-print path contains an interior NUL byte");
+        .map_err(|_| RuntimeError::DotPrintPathHasNul)?;
     unsafe { sys::cuGraphDebugDotPrint(cu_graph, path.as_ptr(), flags) }.result()?;
     Ok(())
 }

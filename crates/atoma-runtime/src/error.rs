@@ -115,6 +115,12 @@ pub enum RuntimeError {
 
     #[error("end_capture_discard on a stream with no capture in progress; nothing to discard")]
     DiscardWithoutCapture,
+
+    #[error(
+        "dot-print path contains an interior NUL byte and cannot be passed to the driver; \
+         choose a different output path"
+    )]
+    DotPrintPathHasNul,
 }
 
 impl From<DriverError> for RuntimeError {
@@ -133,6 +139,8 @@ impl From<DriverError> for RuntimeError {
             | CUresult::CUDA_ERROR_NOT_INITIALIZED
             | CUresult::CUDA_ERROR_SHARED_OBJECT_INIT_FAILED => Self::NoDriver(err.0),
             CUresult::CUDA_ERROR_OUT_OF_MEMORY => Self::OutOfDeviceMemory(err.0),
+            // CUresult is a foreign enum with ~90 non-capture statuses; Driver is the deliberate
+            // catch-all for everything the taxonomy does not name.
             _ => Self::Driver(err.0),
         }
     }

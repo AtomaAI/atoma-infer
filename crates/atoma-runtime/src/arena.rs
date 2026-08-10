@@ -64,17 +64,17 @@ pub struct CaptureArena {
     role_widths: Vec<usize>,
     /// Tokens per bucket, indexed by [`BucketIdx`]. Uninterpreted: never sorted, deduplicated,
     /// or assumed monotonic.
-    ladder: Vec<usize>,
+    bucket_ladder: Vec<usize>,
 }
 
 impl CaptureArena {
     /// Builds the arena layout from `num_layers` layers, caller-declared per-token role widths
     /// in bytes, and the bucket ladder in tokens per bucket.
-    pub fn new(num_layers: usize, role_widths: &[usize], ladder: &[usize]) -> Self {
+    pub fn new(num_layers: usize, role_widths: &[usize], bucket_ladder: &[usize]) -> Self {
         Self {
             num_layers,
             role_widths: role_widths.to_vec(),
-            ladder: ladder.to_vec(),
+            bucket_ladder: bucket_ladder.to_vec(),
         }
     }
 
@@ -104,7 +104,13 @@ impl CaptureArena {
 
     /// Size in bytes of the slot holding `role`'s activation under `bucket`.
     pub fn slot_size(&self, bucket: BucketIdx, role: TensorRole) -> usize {
-        let tokens = self.ladder[bucket.0];
+        assert!(
+            bucket.0 < self.bucket_ladder.len(),
+            "bucket index {} out of range: the bucket ladder has {} buckets",
+            bucket.0,
+            self.bucket_ladder.len()
+        );
+        let tokens = self.bucket_ladder[bucket.0];
         (self.role_widths[role.0] * tokens).next_multiple_of(SLOT_ALIGN)
     }
 
@@ -116,7 +122,7 @@ impl CaptureArena {
     /// Bytes of device memory backing the arena: the largest bucket's footprint, since every
     /// bucket bumps from the same base and buckets never replay concurrently.
     pub fn total_size(&self) -> usize {
-        (0..self.ladder.len())
+        (0..self.bucket_ladder.len())
             .map(|b| self.bucket_footprint(BucketIdx(b)))
             .max()
             .unwrap_or(0)
@@ -277,5 +283,11 @@ mod tests {
     #[should_panic(expected = "role index 2 out of range")]
     fn offset_rejects_out_of_range_role() {
         two_role_arena().offset(BucketIdx(0), LayerIdx(0), TensorRole(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "bucket index 2 out of range")]
+    fn offset_rejects_out_of_range_bucket() {
+        two_role_arena().offset(BucketIdx(2), LayerIdx(0), TensorRole(0));
     }
 }
