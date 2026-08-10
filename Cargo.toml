@@ -2,6 +2,7 @@
 members = [
     "crates/atoma-api",
     "crates/atoma-kernels",
+    "crates/atoma-runtime",
     "crates/backends",
     "crates/backends/vllm",
     "crates/bench",
@@ -18,6 +19,7 @@ anyhow = "1.0.89"
 atoma-backends = { path = "crates/backends" }
 atoma-bench = { path = "crates/bench" }
 atoma-kernels = { path = "crates/atoma-kernels" }
+atoma-runtime = { path = "crates/atoma-runtime" }
 axum = "0.8"
 bindgen_cuda = "0.1.5"
 candle-core = "0.11.0"
