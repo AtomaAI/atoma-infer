@@ -178,6 +178,116 @@ pub fn end_capture_discard(stream: &CaptureStream) -> Result<(), RuntimeError> {
     }
 }
 
+/// Writes the graph's recorded topology to `path` as Graphviz dot, so a failed or suspect
+/// capture is diagnosed by inspecting what was actually recorded rather than by guessing.
+///
+/// `flags` is a bitmask of [`sys::CUgraphDebugDot_flags`] verbosity bits; `0` prints the basic
+/// topology.
+///
+/// # Safety
+/// `cu_graph` must be a live graph handle, e.g. from [`CapturedGraph::cu_graph`].
+pub unsafe fn debug_dot_print(
+    cu_graph: sys::CUgraph,
+    path: &std::path::Path,
+    flags: u32,
+) -> Result<(), RuntimeError> {
+    let path = std::ffi::CString::new(path.to_string_lossy().as_bytes())
+        .expect("dot-print path contains an interior NUL byte");
+    unsafe { sys::cuGraphDebugDotPrint(cu_graph, path.as_ptr(), flags) }.result()?;
+    Ok(())
+}
+
+/// The graph's recorded nodes, for asserting a capture's shape (node count, kernel nodes only)
+/// on the rig.
+///
+/// # Safety
+/// `cu_graph` must be a live graph handle, e.g. from [`CapturedGraph::cu_graph`].
+pub unsafe fn graph_nodes(cu_graph: sys::CUgraph) -> Result<Vec<sys::CUgraphNode>, RuntimeError> {
+    let mut num_nodes = 0usize;
+    unsafe { sys::cuGraphGetNodes(cu_graph, std::ptr::null_mut(), &mut num_nodes) }.result()?;
+    let mut nodes = vec![std::ptr::null_mut(); num_nodes];
+    unsafe { sys::cuGraphGetNodes(cu_graph, nodes.as_mut_ptr(), &mut num_nodes) }.result()?;
+    nodes.truncate(num_nodes);
+    Ok(nodes)
+}
+
+/// Applies a re-recorded graph's parameters to an existing executable without re-instantiating.
+///
+/// Returns the driver's result info in both outcomes the operator must distinguish: an applied
+/// update, and an update the driver rejected because the topology changed — the info names the
+/// offending node and reason. Other driver failures classify as usual.
+///
+/// # Safety
+/// `cu_graph_exec` and `cu_graph` must be live handles, e.g. from a [`CapturedGraph`].
+pub unsafe fn exec_update(
+    cu_graph_exec: sys::CUgraphExec,
+    cu_graph: sys::CUgraph,
+) -> Result<sys::CUgraphExecUpdateResultInfo, RuntimeError> {
+    let mut info = std::mem::MaybeUninit::uninit();
+    let status = unsafe { sys::cuGraphExecUpdate_v2(cu_graph_exec, cu_graph, info.as_mut_ptr()) };
+    match status {
+        CUresult::CUDA_SUCCESS | CUresult::CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE => {
+            Ok(unsafe { info.assume_init() })
+        }
+        other => Err(cudarc::driver::DriverError(other).into()),
+    }
+}
+
+/// Exchanges the calling thread's capture-interaction mode, returning the previous mode.
+///
+/// Wraps a region of driver calls that must not interact with this thread's capture — the
+/// caller restores the returned mode afterwards.
+pub fn thread_exchange_capture_mode(
+    mode: sys::CUstreamCaptureMode,
+) -> Result<sys::CUstreamCaptureMode, RuntimeError> {
+    let mut mode = mode;
+    unsafe { sys::cuThreadExchangeStreamCaptureMode(&mut mode) }.result()?;
+    Ok(mode)
+}
+
+/// The launch parameters recorded in a kernel node, for asserting baked pointers on the rig.
+///
+/// Uses the `_v2` symbol: under the CUDA 12 bindings [`sys::CUDA_KERNEL_NODE_PARAMS`] is the v2
+/// struct, and the un-versioned driver symbol keeps the v1 ABI.
+///
+/// # Safety
+/// `node` must be a kernel node in a live graph, e.g. from [`graph_nodes`].
+pub unsafe fn kernel_node_params(
+    node: sys::CUgraphNode,
+) -> Result<sys::CUDA_KERNEL_NODE_PARAMS, RuntimeError> {
+    let mut params = std::mem::MaybeUninit::uninit();
+    unsafe { sys::cuGraphKernelNodeGetParams_v2(node, params.as_mut_ptr()) }.result()?;
+    Ok(unsafe { params.assume_init() })
+}
+
+/// Replaces the launch parameters of a kernel node in a graph (before instantiation).
+///
+/// # Safety
+/// `node` must be a kernel node in a live graph, and `params` must describe a launch valid for
+/// that node's kernel.
+pub unsafe fn set_kernel_node_params(
+    node: sys::CUgraphNode,
+    params: &sys::CUDA_KERNEL_NODE_PARAMS,
+) -> Result<(), RuntimeError> {
+    unsafe { sys::cuGraphKernelNodeSetParams_v2(node, params) }.result()?;
+    Ok(())
+}
+
+/// Replaces the launch parameters of a kernel node in an instantiated executable — the patch
+/// path for updating baked pointers without re-instantiating.
+///
+/// # Safety
+/// `cu_graph_exec` must be live, `node` must be a kernel node of the graph it was instantiated
+/// from, and `params` must describe a launch valid for that node's kernel.
+pub unsafe fn set_exec_kernel_node_params(
+    cu_graph_exec: sys::CUgraphExec,
+    node: sys::CUgraphNode,
+    params: &sys::CUDA_KERNEL_NODE_PARAMS,
+) -> Result<(), RuntimeError> {
+    unsafe { sys::cuGraphExecKernelNodeSetParams_v2(cu_graph_exec, node, params) }.result()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
