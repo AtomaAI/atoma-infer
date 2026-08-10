@@ -12,4 +12,5 @@
 
 pub mod arena;
 pub mod capture;
+pub mod context;
 pub mod error;
