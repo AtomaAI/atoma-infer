@@ -9,3 +9,5 @@
 //! The crate links cudarc unconditionally under the workspace's `dynamic-loading` pin, so it
 //! compiles, links, and runs `cargo test` on a machine with no CUDA toolkit, driver, or GPU.
 //! Only paths that call the driver require one, and they fail loudly at the call.
+
+pub mod arena;
