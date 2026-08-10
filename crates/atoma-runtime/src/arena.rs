@@ -4,7 +4,7 @@
 //! footprint is the largest bucket's, not the sum across the bucket ladder. A slot's address is a
 //! pure function of (bucket, layer, role): every bucket bumps from the same base, so address
 //! stability across replays is guaranteed by construction and needs no pinning, weak references,
-//! or write-back copies (ADR 0004).
+//! or write-back copies.
 //!
 //! Addresses are exposed only through [`CaptureArena::offset`] — never an open-coded formula at a
 //! call site — so a smarter allocation plan (e.g. layer-parity ping-pong) can replace the naive
@@ -81,7 +81,7 @@ impl CaptureArena {
     /// Byte offset of the slot holding `role`'s activation for `layer` under `bucket`.
     ///
     /// One slot per layer, no liveness-based reuse: a wrong reuse decision cannot corrupt
-    /// numbers silently inside a replay (ADR 0004).
+    /// numbers silently inside a replay.
     pub fn offset(&self, bucket: BucketIdx, layer: LayerIdx, role: TensorRole) -> usize {
         assert!(
             layer.0 < self.num_layers,

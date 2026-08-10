@@ -10,6 +10,14 @@
 //! compiles, links, and runs `cargo test` on a machine with no CUDA toolkit, driver, or GPU.
 //! Only paths that call the driver require one, and they fail loudly at the call.
 //!
+//! Layout rule: `#[repr(C)]` (or `#[repr(transparent)]`) is required for exactly the types whose
+//! bytes cross the driver or device boundary — kernel-argument structs, anything serialized into
+//! a device buffer. No such type exists in this crate yet: every struct the driver reads or
+//! writes is cudarc's bindgen-generated type, buffers are opaque `CudaSlice<u8>` whose contents
+//! the caller formats, and the load-bearing field order in [`graph_entry::GraphEntry`] is drop
+//! order — a source-declaration guarantee independent of memory layout — so default `repr(Rust)`
+//! is correct for every type defined here.
+//!
 //! Module map:
 //!
 //! | Module | Responsibility |
