@@ -11,4 +11,5 @@
 //! Only paths that call the driver require one, and they fail loudly at the call.
 
 pub mod arena;
+pub mod capture;
 pub mod error;

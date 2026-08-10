@@ -91,6 +91,30 @@ pub enum RuntimeError {
         "driver call failed ({0:?}): not a capture-classified status; consult the CUDA driver docs"
     )]
     Driver(CUresult),
+
+    #[error(
+        "begin_capture while a capture is already active on this stream; end or discard the \
+         current capture first"
+    )]
+    BeginWhileActive,
+
+    #[error(
+        "begin_capture on a stream whose previous capture was invalidated and still holds \
+         recorded state; call end_capture_discard first"
+    )]
+    BeginAfterInvalidation,
+
+    #[error("end_capture on a stream with no capture in progress; call begin_capture first")]
+    EndWithoutCapture,
+
+    #[error(
+        "end_capture on an invalidated capture, which cannot be instantiated; call \
+         end_capture_discard to drain it, then inspect what invalidated the recording"
+    )]
+    EndAfterInvalidation,
+
+    #[error("end_capture_discard on a stream with no capture in progress; nothing to discard")]
+    DiscardWithoutCapture,
 }
 
 impl From<DriverError> for RuntimeError {
