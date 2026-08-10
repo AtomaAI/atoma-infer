@@ -129,6 +129,21 @@ impl CaptureArena {
     }
 }
 
+/// The workspace-ownership contract for kernels: the caller owns a preallocated workspace, and
+/// the kernel may not allocate.
+///
+/// A kernel that allocates inside a captured region invalidates the capture — or bakes a
+/// pool-owned address into the graph — so allocation-freedom is the backend's contract with
+/// this crate. A kernel-call descriptor implements this trait to declare how much caller-owned
+/// workspace one invocation needs; the caller allocates at least that much before capture
+/// (a [`GraphEntry`](crate::graph_entry::GraphEntry) workspace buffer) and hands it to every
+/// launch. Defined here, implemented by the attention backend that will exist later; the
+/// current FlashAttention-2 wrapper deliberately does not implement it.
+pub trait WorkspaceRequirement {
+    /// Bytes of caller-owned workspace one invocation of this call needs.
+    fn workspace_bytes(&self) -> usize;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
