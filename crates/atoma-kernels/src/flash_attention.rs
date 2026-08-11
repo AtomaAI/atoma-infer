@@ -20,6 +20,12 @@ pub struct FlashAttention {
     pub window_size_right: Option<usize>,
     /// Softcap parameter, used in Grok and Gemma2 models
     pub softcap: Option<f32>,
+    /// When set, the kernel writes its softmax log-sum-exp into this caller-allocated f32
+    /// tensor — contiguous, holding exactly `batch_size * num_heads * seqlen_q` elements, laid
+    /// out `[batch_size, num_heads, seqlen_q]` — instead of a private buffer no caller can
+    /// observe. The size is validated exactly, so an under- or over-allocated buffer fails
+    /// loudly here rather than writing out of bounds silently (#166).
+    pub softmax_lse: Option<Tensor>,
 }
 
 impl FlashAttention {
@@ -219,8 +225,23 @@ impl FlashAttention {
         let elem_count = out_shape.elem_count();
         let mut dst = unsafe { stream.alloc::<T>(elem_count) }.w()?;
         // The kernels write the LSE as `[b, h, seqlen_q]` whenever `unpadded_lse` is false, which
-        // is what this path passes.
-        let mut softmax_lse = stream.alloc_zeros::<f32>(b_sz * num_heads * seqlen_q).w()?;
+        // is what this path passes. A caller-provided tensor replaces the private buffer so the
+        // values become observable; its size is validated exactly, so a wrong allocation fails
+        // here instead of writing out of bounds. `b_sz`/`num_heads`/`seqlen_q` are the
+        // post-regroup values when `seqlenq_ngroups_swapped` holds; the regroup preserves their
+        // product.
+        if let Some(lse) = self.softmax_lse.as_ref() {
+            check_lse_tensor(lse, b_sz * num_heads * seqlen_q)?;
+        }
+        let external_lse_storage = self
+            .softmax_lse
+            .as_ref()
+            .map(|lse| lse.storage_and_layout());
+        let mut internal_lse = if self.softmax_lse.is_none() {
+            Some(stream.alloc_zeros::<f32>(b_sz * num_heads * seqlen_q).w()?)
+        } else {
+            None
+        };
 
         let is_bf16 = if is_bf16 { 1 } else { 0 };
 
@@ -259,7 +280,18 @@ impl FlashAttention {
             let (k_ptr, _k_guard) = k.device_ptr(&stream);
             let (v_ptr, _v_guard) = v.device_ptr(&stream);
             let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&stream);
-            let (softmax_lse_ptr, _softmax_lse_guard) = softmax_lse.device_ptr_mut(&stream);
+            // The kernel writes through this pointer; candle keeps one stream per device, so the
+            // write is ordered before any later read of the caller's tensor.
+            let (softmax_lse_ptr, _softmax_lse_guard) =
+                if let Some((lse_storage, lse_layout)) = &external_lse_storage {
+                    utils::device_ptr::<f32>(lse_storage, lse_layout, &stream, "softmax_lse")?
+                } else {
+                    // DON'T PANIC: allocated above exactly when no external tensor was given.
+                    internal_lse
+                        .as_mut()
+                        .expect("internal LSE buffer exists when no external tensor is set")
+                        .device_ptr_mut(&stream)
+                };
             let q_ptr = q_ptr as *const core::ffi::c_void;
             let k_ptr = k_ptr as *const core::ffi::c_void;
             let v_ptr = v_ptr as *const core::ffi::c_void;
@@ -409,6 +441,7 @@ pub fn flash_attn(
     let window_size_right = if causal { Some(0) } else { None };
 
     let op = FlashAttention {
+        softmax_lse: None,
         softmax_scale,
         alibi_slopes: None,
         window_size_left,
@@ -416,6 +449,69 @@ pub fn flash_attn(
         softcap: None,
     };
     q.apply_op3(k, v, op)
+}
+
+/// Validates a caller-provided softmax LSE tensor: f32, contiguous, exactly `expected` elements.
+///
+/// The kernel writes every element of its LSE layout, so anything but an exact-size buffer is
+/// either an out-of-bounds write (too small) or silently unobserved memory (too large) — both
+/// are rejected before the launch.
+fn check_lse_tensor(lse: &Tensor, expected: usize) -> Result<()> {
+    if lse.dtype() != DType::F32 {
+        candle_core::bail!("softmax_lse must have dtype F32, got {:?}", lse.dtype());
+    }
+    if !lse.is_contiguous() {
+        candle_core::bail!("softmax_lse must be contiguous");
+    }
+    if lse.elem_count() != expected {
+        candle_core::bail!(
+            "softmax_lse must hold exactly {expected} elements, got {}",
+            lse.elem_count()
+        );
+    }
+    Ok(())
+}
+
+/// Flash-attention v2 layer that also returns the softmax log-sum-exp.
+///
+/// Behaves exactly like [`flash_attn`]; the second returned tensor is the kernel's per-query-row
+/// `log(sum(exp(scores * softmax_scale)))` in f32, of shape `[batch_size, num_heads, seq_len_q]`.
+/// The LSE is what split/chunked attention merging and context-parallel attention combine on,
+/// and the buffer no caller could previously observe (#166).
+///
+/// The grouped-query decode fast path (`seq_len_q == 1` with more query than kv heads, acausal)
+/// regroups heads internally, which changes the LSE layout; it is rejected here.
+pub fn flash_attn_with_lse(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<(Tensor, Tensor)> {
+    let (batch_size, seqlen_q, num_heads, _head_size) = q.dims4()?;
+    let (_batch_size_k, _seqlen_k, num_heads_k, _head_size_k) = k.dims4()?;
+    if seqlen_q == 1 && num_heads > num_heads_k && !causal {
+        candle_core::bail!(
+            "flash_attn_with_lse does not support the grouped-query decode fast path (seq_len_q \
+             == 1 with more query than kv heads, acausal): the kernel regroups heads there and \
+             the LSE layout stops being [batch_size, num_heads, seq_len_q]"
+        );
+    }
+
+    let softmax_lse = Tensor::zeros((batch_size, num_heads, seqlen_q), DType::F32, q.device())?;
+    let window_size_left = None;
+    let window_size_right = if causal { Some(0) } else { None };
+    let op = FlashAttention {
+        // Tensor clones share storage: the kernel writes into the tensor returned below.
+        softmax_lse: Some(softmax_lse.clone()),
+        softmax_scale,
+        alibi_slopes: None,
+        window_size_left,
+        window_size_right,
+        softcap: None,
+    };
+    let output = q.apply_op3(k, v, op)?;
+    Ok((output, softmax_lse))
 }
 
 /// Flash-attention v2 layer.
@@ -449,6 +545,7 @@ pub fn flash_attn_windowed(
     window_size_right: Option<usize>,
 ) -> Result<Tensor> {
     let op = FlashAttention {
+        softmax_lse: None,
         softmax_scale,
         alibi_slopes: None,
         window_size_left,
@@ -484,6 +581,7 @@ pub fn flash_attn_alibi(
     let window_size_right = if causal { Some(0) } else { None };
 
     let op = FlashAttention {
+        softmax_lse: None,
         softmax_scale,
         alibi_slopes: Some(alibi_slopes.clone()),
         window_size_left,
@@ -526,6 +624,7 @@ pub fn flash_attn_alibi_windowed(
     window_size_right: Option<usize>,
 ) -> Result<Tensor> {
     let op = FlashAttention {
+        softmax_lse: None,
         softmax_scale,
         alibi_slopes: Some(alibi_slopes.clone()),
         window_size_left,
@@ -575,6 +674,7 @@ pub fn flash_attn_alibi_windowed_with_softcap(
     softcap: Option<f32>,
 ) -> Result<Tensor> {
     let op = FlashAttention {
+        softmax_lse: None,
         softmax_scale,
         alibi_slopes: Some(alibi_slopes.clone()),
         window_size_left,
@@ -614,6 +714,13 @@ struct FlashAttentionVarLen {
     pub window_size_right: Option<usize>,
     /// Softcap parameter, used in Grok and Gemma2 models
     pub softcap: Option<f32>,
+    /// When set, the kernel writes its softmax log-sum-exp into this caller-allocated f32
+    /// tensor — contiguous, holding exactly `num_heads * total_q` elements, laid out
+    /// `[num_heads, total_q]` (the unpadded layout, strided by `total_q`) — instead of a
+    /// private buffer no caller can observe. The size is validated exactly, so an under- or
+    /// over-allocated buffer fails loudly here rather than writing out of bounds silently
+    /// (#166).
+    pub softmax_lse: Option<Tensor>,
 }
 
 impl FlashAttentionVarLen {
@@ -982,8 +1089,22 @@ impl FlashAttentionVarLen {
         let elem_count = out_shape.elem_count();
         let mut dst = unsafe { stream.alloc::<T>(elem_count) }.w()?;
         // With `unpadded_lse` the kernels write the LSE as `[h, total_q]`, indexed through
-        // `params.total_q`.
-        let mut softmax_lse = stream.alloc_zeros::<f32>(total_q * num_heads).w()?;
+        // `params.total_q`. A caller-provided tensor replaces the private buffer so the values
+        // become observable; its size is validated exactly, so a wrong allocation — including a
+        // wrong `total_q` stride — fails here or in the value comparison instead of writing out
+        // of bounds.
+        if let Some(lse) = self.softmax_lse.as_ref() {
+            check_lse_tensor(lse, total_q * num_heads)?;
+        }
+        let external_lse_storage = self
+            .softmax_lse
+            .as_ref()
+            .map(|lse| lse.storage_and_layout());
+        let mut internal_lse = if self.softmax_lse.is_none() {
+            Some(stream.alloc_zeros::<f32>(total_q * num_heads).w()?)
+        } else {
+            None
+        };
 
         let is_bf16 = if is_bf16 { 1 } else { 0 };
 
@@ -1053,7 +1174,18 @@ impl FlashAttentionVarLen {
                 0
             };
             let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&stream);
-            let (softmax_lse_ptr, _softmax_lse_guard) = softmax_lse.device_ptr_mut(&stream);
+            // The kernel writes through this pointer; candle keeps one stream per device, so the
+            // write is ordered before any later read of the caller's tensor.
+            let (softmax_lse_ptr, _softmax_lse_guard) =
+                if let Some((lse_storage, lse_layout)) = &external_lse_storage {
+                    utils::device_ptr::<f32>(lse_storage, lse_layout, &stream, "softmax_lse")?
+                } else {
+                    // DON'T PANIC: allocated above exactly when no external tensor was given.
+                    internal_lse
+                        .as_mut()
+                        .expect("internal LSE buffer exists when no external tensor is set")
+                        .device_ptr_mut(&stream)
+                };
             let dst_ptr = dst_ptr as *const core::ffi::c_void;
             let softmax_lse_ptr = softmax_lse_ptr as *const core::ffi::c_void;
             let (seqlens_q_ptr, _seqlens_q_guard) = if !seqlenq_ngroups_swapped {
@@ -1226,6 +1358,7 @@ pub fn flash_attn_varlen(
     let window_size_right = if causal { Some(0) } else { None };
 
     let op = FlashAttentionVarLen {
+        softmax_lse: None,
         softmax_scale,
         max_seqlen_q,
         max_seqlen_k,
@@ -1239,6 +1372,62 @@ pub fn flash_attn_varlen(
         seqused_k: None,
     };
     q.apply_op3(k, v, op)
+}
+
+/// Flash-attention v2 layer with variable-length batching that also returns the softmax
+/// log-sum-exp.
+///
+/// Behaves exactly like [`flash_attn_varlen`]; the second returned tensor is the kernel's
+/// per-query-row `log(sum(exp(scores * softmax_scale)))` in f32, of shape
+/// `[num_heads, total_q]` — the unpadded layout, strided by `total_q`, so a sequence's rows sit
+/// at its `seqlens_q` offsets. The LSE is what split/chunked attention merging and
+/// context-parallel attention combine on, and the buffer no caller could previously observe
+/// (#166).
+///
+/// The grouped-query decode fast path (`max_seqlen_q == 1` with more query than kv heads,
+/// acausal) regroups heads internally, which changes the LSE layout; it is rejected here.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_varlen_with_lse(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seqlens_q: &Tensor,
+    seqlens_k: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<(Tensor, Tensor)> {
+    let (total_q, num_heads, _head_size) = q.dims3()?;
+    let (_total_k, num_heads_k, _head_size_k) = k.dims3()?;
+    if max_seqlen_q == 1 && num_heads > num_heads_k && !causal {
+        candle_core::bail!(
+            "flash_attn_varlen_with_lse does not support the grouped-query decode fast path \
+             (max_seqlen_q == 1 with more query than kv heads, acausal): the kernel regroups \
+             heads there and the LSE layout stops being [num_heads, total_q]"
+        );
+    }
+
+    let softmax_lse = Tensor::zeros((num_heads, total_q), DType::F32, q.device())?;
+    let window_size_left = None;
+    let window_size_right = if causal { Some(0) } else { None };
+    let op = FlashAttentionVarLen {
+        // Tensor clones share storage: the kernel writes into the tensor returned below.
+        softmax_lse: Some(softmax_lse.clone()),
+        softmax_scale,
+        max_seqlen_q,
+        max_seqlen_k,
+        seqlens_q: seqlens_q.clone(),
+        seqlens_k: seqlens_k.clone(),
+        alibi_slopes: None,
+        window_size_left,
+        window_size_right,
+        softcap: None,
+        block_table: None,
+        seqused_k: None,
+    };
+    let output = q.apply_op3(k, v, op)?;
+    Ok((output, softmax_lse))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1284,6 +1473,7 @@ pub fn flash_attn_varlen_windowed(
     window_size_right: Option<usize>,
 ) -> Result<Tensor> {
     let op = FlashAttentionVarLen {
+        softmax_lse: None,
         softmax_scale,
         max_seqlen_q,
         max_seqlen_k,
@@ -1337,6 +1527,7 @@ pub fn flash_attn_varlen_alibi(
     let window_size_right = if causal { Some(0) } else { None };
 
     let op = FlashAttentionVarLen {
+        softmax_lse: None,
         softmax_scale,
         max_seqlen_q,
         max_seqlen_k,
@@ -1397,6 +1588,7 @@ pub fn flash_attn_varlen_alibi_windowed(
     window_size_right: Option<usize>,
 ) -> Result<Tensor> {
     let op = FlashAttentionVarLen {
+        softmax_lse: None,
         softmax_scale,
         max_seqlen_q,
         max_seqlen_k,
@@ -1464,6 +1656,7 @@ pub fn flash_attn_varlen_with_block_table(
     block_table: Option<&Tensor>,
 ) -> Result<Tensor> {
     let op = FlashAttentionVarLen {
+        softmax_lse: None,
         softmax_scale,
         max_seqlen_q,
         max_seqlen_k,
@@ -1540,6 +1733,7 @@ pub fn flash_attn_varlen_full(
     softcap: Option<f32>,
 ) -> Result<Tensor> {
     let op = FlashAttentionVarLen {
+        softmax_lse: None,
         softmax_scale,
         max_seqlen_q,
         max_seqlen_k,

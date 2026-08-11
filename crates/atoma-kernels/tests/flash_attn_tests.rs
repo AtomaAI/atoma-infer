@@ -524,3 +524,168 @@ fn flash_attn_varlen_rejects_seqlens_the_kernels_cannot_read_as_i32() -> Result<
 
     Ok(())
 }
+
+/// CPU log-sum-exp reference: `logsumexp(q @ k^T * softmax_scale)` per query row, with an
+/// optional causal mask, in f32 from the same values the kernel sees.
+///
+/// `q` and `k` are `[num_heads, seq_len, head_dim]`; returns `[num_heads, seq_len_q]`.
+fn lse_reference(q: &Tensor, k: &Tensor, softmax_scale: f32, causal: bool) -> Result<Tensor> {
+    let q = q.to_dtype(DType::F32)?;
+    let k = k.to_dtype(DType::F32)?;
+    let scores = (q.matmul(&k.t()?.contiguous()?)? * softmax_scale as f64)?;
+    let scores = if causal {
+        let (_num_heads, seqlen_q, seqlen_k) = scores.dims3()?;
+        let mask: Vec<f32> = (0..seqlen_q)
+            .flat_map(|i| (0..seqlen_k).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 }))
+            .collect();
+        let mask = Tensor::from_vec(mask, (1, seqlen_q, seqlen_k), scores.device())?;
+        scores.broadcast_add(&mask)?
+    } else {
+        scores
+    };
+    let row_max = scores.max_keepdim(candle_core::D::Minus1)?;
+    let sum = scores
+        .broadcast_sub(&row_max)?
+        .exp()?
+        .sum(candle_core::D::Minus1)?;
+    let lse = (sum.log()? + row_max.squeeze(candle_core::D::Minus1)?)?;
+    Ok(lse)
+}
+
+fn max_abs_diff(lhs: &Tensor, rhs: &Tensor) -> Result<f32> {
+    Ok(lhs
+        .sub(rhs)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?)
+}
+
+/// The fixed-sequence-length LSE layout is `[batch, num_heads, seqlen_q]`; the values must be
+/// the log-sum-exp of the masked, scaled scores — the quantity split-attention merging combines
+/// on, previously written to a buffer nothing could read (#166).
+#[test]
+#[serial]
+fn flash_attn_lse_matches_cpu_reference() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let (q, k, v) = qkv(&device, 3, 6, 64)?;
+
+    for causal in [false, true] {
+        let (output, lse) = atoma_kernels::flash_attn_with_lse(
+            &q.transpose(1, 2)?,
+            &k.transpose(1, 2)?,
+            &v.transpose(1, 2)?,
+            0.5,
+            causal,
+        )?;
+
+        // The attention output itself is unchanged by observing the LSE.
+        let baseline = atoma_kernels::flash_attn(
+            &q.transpose(1, 2)?,
+            &k.transpose(1, 2)?,
+            &v.transpose(1, 2)?,
+            0.5,
+            causal,
+        )?;
+        let output_diff = max_abs_diff(
+            &output.to_dtype(DType::F32)?,
+            &baseline.to_dtype(DType::F32)?,
+        )?;
+        assert_eq!(output_diff, 0.0, "causal={causal}");
+
+        assert_eq!(lse.dims(), &[1, 3, 6], "causal={causal}");
+        let reference = lse_reference(&q.i(0)?, &k.i(0)?, 0.5, causal)?;
+        let diff = max_abs_diff(&lse.i(0)?, &reference)?;
+        assert!(diff < 5e-3, "causal={causal}: lse diverges by {diff}");
+    }
+    Ok(())
+}
+
+/// The varlen LSE layout is `[num_heads, total_q]` strided by `total_q`, so with unequal
+/// sequence lengths each sequence's columns sit at its `seqlens_q` offsets — a wrong `total_q`
+/// stride lands sequence 1's values in the wrong columns and fails this comparison.
+#[test]
+#[serial]
+fn flash_attn_varlen_lse_matches_cpu_reference_with_unequal_lengths() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    const NUM_HEADS: usize = 2;
+    const HEAD_DIM: usize = 64;
+    const LENGTHS: [usize; 2] = [3, 5];
+    let total: usize = LENGTHS.iter().sum();
+
+    let elem_count = total * NUM_HEADS * HEAD_DIM;
+    let base = (Tensor::arange(0u32, elem_count as u32, &device)?.to_dtype(DType::F32)?
+        / elem_count as f64)?
+        .reshape((total, NUM_HEADS, HEAD_DIM))?
+        .to_dtype(DType::F16)?;
+    let k = (&base * 0.75)?;
+    let v = (&base * 0.5)?;
+    let q = base;
+    let seqlens = Tensor::new(&[0u32, 3u32, 8u32], &device)?;
+
+    let (_output, lse) = atoma_kernels::flash_attn_varlen_with_lse(
+        &q,
+        &k,
+        &v,
+        &seqlens,
+        &seqlens,
+        *LENGTHS.iter().max().expect("lengths are non-empty"),
+        *LENGTHS.iter().max().expect("lengths are non-empty"),
+        0.5,
+        true,
+    )?;
+    assert_eq!(lse.dims(), &[NUM_HEADS, total]);
+
+    let mut start = 0;
+    for (sequence_index, &len) in LENGTHS.iter().enumerate() {
+        // [len, h, d] -> [h, len, d] for the reference; columns start..start+len in the LSE.
+        let q_seq = q.i(start..start + len)?.transpose(0, 1)?.contiguous()?;
+        let k_seq = k.i(start..start + len)?.transpose(0, 1)?.contiguous()?;
+        let reference = lse_reference(&q_seq, &k_seq, 0.5, true)?;
+        let lse_seq = lse.i((.., start..start + len))?;
+        let diff = max_abs_diff(&lse_seq, &reference)?;
+        assert!(
+            diff < 5e-3,
+            "sequence {sequence_index}: lse diverges by {diff}"
+        );
+        start += len;
+    }
+    Ok(())
+}
+
+/// The exact-size check is what turns a mis-allocated LSE buffer into a loud error: before the
+/// oracle existed, halving this buffer wrote out of bounds without any test noticing, and the
+/// historical `* 128` over-allocation was equally invisible (#166). The internal buffer of the
+/// non-LSE entry points is still unobservable — that is exactly why the `_with_lse` paths carry
+/// the caller's tensor instead.
+#[test]
+#[serial]
+fn flash_attn_rejects_a_mis_sized_lse_buffer() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let (q, k, v) = qkv(&device, 3, 6, 64)?;
+    let q = q.transpose(1, 2)?;
+    let k = k.transpose(1, 2)?;
+    let v = v.transpose(1, 2)?;
+
+    // Required: 1 * 3 * 6 = 18 elements. Halving and the `* 128` inflation must both fail.
+    for wrong_elems in [9usize, 18 * 128] {
+        let wrong = Tensor::zeros(wrong_elems, DType::F32, &device)?;
+        let op = atoma_kernels::FlashAttention {
+            softmax_lse: Some(wrong),
+            softmax_scale: 0.5,
+            alibi_slopes: None,
+            window_size_left: None,
+            window_size_right: None,
+            softcap: None,
+        };
+        let error = q
+            .apply_op3(&k, &v, op)
+            .expect_err("a mis-sized LSE buffer must be rejected before the launch")
+            .to_string();
+        assert!(
+            error.contains("softmax_lse must hold exactly 18 elements"),
+            "{error}"
+        );
+    }
+    Ok(())
+}

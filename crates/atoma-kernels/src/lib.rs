@@ -22,5 +22,5 @@ pub use flash_attention::{
     flash_attn_kv_cache_alibi_windowed, flash_attn_kv_cache_full, flash_attn_kv_cache_windowed,
     flash_attn_varlen, flash_attn_varlen_alibi, flash_attn_varlen_alibi_windowed,
     flash_attn_varlen_full, flash_attn_varlen_windowed, flash_attn_varlen_with_block_table,
-    flash_attn_windowed, FlashAttention,
+    flash_attn_varlen_with_lse, flash_attn_windowed, flash_attn_with_lse, FlashAttention,
 };
