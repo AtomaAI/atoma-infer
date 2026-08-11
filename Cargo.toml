@@ -36,9 +36,9 @@ cudarc = { version = "0.19.8", features = [
     "cuda-12000",
     "curand",
     "driver",
-    "dynamic-loading",
     "f16",
     "f8",
+    "fallback-dynamic-loading",
     "nvrtc",
     "std",
 ], default-features = false }
