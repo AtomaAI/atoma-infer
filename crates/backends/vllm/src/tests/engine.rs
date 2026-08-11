@@ -241,6 +241,63 @@ impl ModelExecutor for MockModel {
     }
 }
 
+/// A model whose forward pass always fails, so its worker thread dies on the first scheduled
+/// batch — the dead-worker scenario of #177.
+struct FailingMockModel(MockModel);
+
+impl ModelLoader for FailingMockModel {
+    type C = MockConfig;
+
+    fn fetch<T: AsRef<Path>>(
+        api_key: String,
+        cache_dir: T,
+        model_id: String,
+        revision: String,
+    ) -> Result<ModelFilePaths, ModelLoaderError> {
+        MockModel::fetch(api_key, cache_dir, model_id, revision)
+    }
+
+    #[cfg(not(feature = "nccl"))]
+    fn load(
+        config: Self::C,
+        device: &Device,
+        dtype: DType,
+        file_paths: &ModelFilePaths,
+    ) -> Result<Self, ModelLoaderError> {
+        MockModel::load(config, device, dtype, file_paths).map(Self)
+    }
+
+    #[cfg(feature = "nccl")]
+    fn load(
+        config: Self::C,
+        device: &Device,
+        dtype: DType,
+        file_paths: &ModelFilePaths,
+        comm: &Rc<Comm>,
+    ) -> Result<Self, ModelLoaderError> {
+        MockModel::load(config, device, dtype, file_paths, comm).map(Self)
+    }
+}
+
+impl ModelExecutor for FailingMockModel {
+    fn forward(
+        &mut self,
+        _: &Tensor,
+        _: &Tensor,
+        _: &Tensor,
+        _: Vec<&mut Tensor>,
+        _: FlashAttentionMetadata,
+    ) -> Result<Tensor, ModelExecutorError> {
+        Err(ModelExecutorError::CandleError(candle_core::Error::Msg(
+            "injected worker death".to_string(),
+        )))
+    }
+
+    fn config(&self) -> &Self::C {
+        self.0.config()
+    }
+}
+
 /// The prompt of the request with this index. Prompts differ per request so that a response
 /// carrying the wrong prompt is a crossed output rather than a coincidence.
 fn prompt_of(request_index: usize) -> String {
@@ -495,4 +552,99 @@ async fn test_engine_survives_a_disconnected_streaming_client() {
     }
 
     shutdown_signal_sender.send(()).await.unwrap();
+}
+
+/// A dead model worker is unrecoverable: instead of leaving clients waiting forever (#177, where
+/// the engine loop spun on a closed channel for over an hour), every pending request fails
+/// promptly — streaming clients receive an explicit error before their stream closes, waiting
+/// completion clients see their channel close without an output — and the engine's error reaches
+/// the service.
+#[tokio::test]
+async fn test_a_dead_worker_fails_every_pending_request() {
+    init_tracing();
+
+    const NUM_REQUESTS: usize = 8;
+    // Generous bound: the point is "seconds, not forever".
+    const FAILURE_DEADLINE: Duration = Duration::from_secs(120);
+
+    let (service_request_sender, service_request_receiver) = mpsc::unbounded_channel();
+    let (_shutdown_signal_sender, shutdown_signal_receiver) = mpsc::channel(1);
+    let service = LlmService::start::<FailingMockModel, PathBuf>(
+        service_request_receiver,
+        config_path("test_config_disable_chunked_prefill.toml"),
+        shutdown_signal_receiver,
+    )
+    .await
+    .expect("Failed to start LLM service");
+    let service_handle = tokio::spawn(service.run());
+
+    let (streaming_sender, streaming_receiver) = flume::unbounded();
+    service_request_sender
+        .send(ServiceRequest::GenerateStreamingRequest(
+            generate_request(0),
+            streaming_sender,
+        ))
+        .expect("Failed to send streaming request");
+    let mut completion_receivers = Vec::with_capacity(NUM_REQUESTS - 1);
+    for request_index in 1..NUM_REQUESTS {
+        let (sender, receiver) = oneshot::channel();
+        service_request_sender
+            .send(ServiceRequest::GenerateRequest(
+                generate_request(request_index),
+                sender,
+            ))
+            .expect("Failed to send request");
+        completion_receivers.push((request_index, receiver));
+    }
+
+    let failures = async {
+        for (request_index, receiver) in completion_receivers {
+            assert!(
+                receiver.await.is_err(),
+                "request {request_index} got an output from a dead worker"
+            );
+        }
+        loop {
+            match streaming_receiver.recv_async().await {
+                Ok(StreamResponse::Error(error)) => {
+                    assert!(
+                        error.contains("model worker died"),
+                        "unexpected stream error: {error}"
+                    );
+                    break;
+                }
+                // Chunks generated before the worker died are fine; the error must still follow.
+                Ok(StreamResponse::Chunk(_)) => {}
+                Ok(StreamResponse::Finished) => {
+                    panic!("the stream finished cleanly on a dead worker")
+                }
+                Err(_) => panic!("the stream closed without reporting the worker error"),
+            }
+        }
+        assert!(
+            streaming_receiver.recv_async().await.is_err(),
+            "the stream must close after the error"
+        );
+    };
+    tokio::time::timeout(FAILURE_DEADLINE, failures)
+        .await
+        .expect("requests were left hanging after the worker died");
+
+    // The engine closed its request channel on the way out, so the next forwarded request makes
+    // the service fail loudly instead of queueing work for a dead engine.
+    let (sender, _receiver) = oneshot::channel();
+    service_request_sender
+        .send(ServiceRequest::GenerateRequest(
+            generate_request(NUM_REQUESTS),
+            sender,
+        ))
+        .expect("the service request channel closed before the service noticed the dead engine");
+    let service_result = tokio::time::timeout(FAILURE_DEADLINE, service_handle)
+        .await
+        .expect("the service kept running with a dead worker")
+        .expect("the service task panicked");
+    assert!(
+        service_result.is_err(),
+        "the service must surface the dead-worker failure"
+    );
 }

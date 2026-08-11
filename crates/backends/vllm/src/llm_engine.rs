@@ -129,7 +129,13 @@ impl LlmEngine {
                     }
                 },
                 Some(outputs) = self.model_thread_dispatcher.responses.next() => {
-                    self.handle_outputs(outputs.map_err(EngineError::RecvError)).await?;
+                    match outputs {
+                        Ok(outputs) => self.handle_outputs(outputs).await?,
+                        // A response sender only drops without sending when its model thread is
+                        // gone, and a dead worker is unrecoverable: stop the loop, fail every
+                        // pending request, and surface the worker's error.
+                        Err(_) => return Err(self.fail_on_worker_death().await),
+                    }
                 }
                 else => {
                     continue;
@@ -146,13 +152,10 @@ impl LlmEngine {
     /// 2. Schedules new requests.
     /// 3. Sends the finished outputs to the Atoma client service.
     ///
-    /// If an error occurs while processing the outputs, it logs the error and continues to
-    /// schedule new requests to maintain the system's liveness.
-    ///
     /// # Arguments
     ///
-    /// * `outputs` - A `Result` containing a vector of `SequenceGroupOutput` on success, or an
-    ///   `EngineError` on failure.
+    /// * `outputs` - The vector of `SequenceGroupOutput` the model produced for the scheduled
+    ///   batch.
     ///
     /// # Returns
     ///
@@ -161,39 +164,62 @@ impl LlmEngine {
     #[instrument(skip_all)]
     async fn handle_outputs(
         &mut self,
-        outputs: Result<Vec<SequenceGroupOutput>, EngineError>,
+        outputs: Vec<SequenceGroupOutput>,
     ) -> Result<(), EngineError> {
         let span = self.span.clone();
         let _enter = span.enter();
 
-        match outputs {
-            Ok(outputs) => {
-                // 1. Processes the newly AI generated outputs
-                let request_outputs = self.process_generated_outputs(outputs)?;
+        // 1. Processes the newly AI generated outputs
+        let request_outputs = self.process_generated_outputs(outputs)?;
 
-                // 2. Schedules new requests
-                self.step()?;
+        // 2. Schedules new requests
+        self.step()?;
 
-                // 3. After scheduling new requests to the `ModelExecutor` we can send the finished
-                //    outputs back to the OpenAI API service.
-                // NOTE: This is after scheduling new sequences above,
-                //    we do so to optimize GPU utilization. This is
-                //    supposed to be safe
-                //
-                // A client that hung up before its output was ready costs that request its
-                // channels and nothing more: the other outputs in this batch still go out.
-                for request_output in request_outputs {
-                    self.response_senders.complete(request_output);
-                }
-            }
-            Err(e) => {
-                error!("Invalid generated outputs with error: {e}");
-                // NOTE: In order to maintain the system live, we need to keep calling
-                // the `self.step()` method, even in possible scenarios of failure.
-                self.step()?;
-            }
+        // 3. After scheduling new requests to the `ModelExecutor` we can send the finished outputs
+        //    back to the OpenAI API service.
+        // NOTE: This is after scheduling new sequences above,
+        //    we do so to optimize GPU utilization. This is
+        //    supposed to be safe
+        //
+        // A client that hung up before its output was ready costs that request its
+        // channels and nothing more: the other outputs in this batch still go out.
+        for request_output in request_outputs {
+            self.response_senders.complete(request_output);
         }
         Ok(())
+    }
+
+    /// The dead-worker path: collects the error the model thread left behind, stops accepting
+    /// new work, and fails every request the engine knows about — queued on the request channel,
+    /// waiting in the scheduler, or mid-generation — so no client waits on an engine that can no
+    /// longer serve.
+    #[instrument(skip_all)]
+    async fn fail_on_worker_death(&mut self) -> EngineError {
+        let worker_error = self.model_thread_dispatcher.worker_error().await;
+        error!("Model worker died: {worker_error}; failing every pending request");
+        let message = format!("model worker died: {worker_error}");
+
+        // Requests sent to the engine but not yet admitted: closing the channel stops new
+        // arrivals, then whatever is already queued is failed straight off the channel.
+        self.request_receiver.close();
+        while let Ok(engine_request) = self.request_receiver.try_recv() {
+            match engine_request {
+                EngineRequest::GenerateRequest(_sequence_group, response_sender) => {
+                    // A oneshot completion channel carries no error payload; dropping it makes
+                    // the client's receive fail immediately.
+                    drop(response_sender);
+                }
+                EngineRequest::GenerateStreamingRequest(_sequence_group, response_sender) => {
+                    let _ = response_sender.send(StreamResponse::Error(message.clone()));
+                }
+            }
+        }
+
+        // Everything already registered — scheduled or mid-generation — fails through its
+        // client channels.
+        self.response_senders.fail_all(&message);
+
+        EngineError::ModelWorkerDead(worker_error)
     }
 
     /// Main scheduling method of `LlmEngine`.

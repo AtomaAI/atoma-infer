@@ -477,8 +477,12 @@ impl ModelThreadDispatcher {
                     };
                     if let Err(e) = model_thread.run() {
                         error!("Model thread error: {e}");
+                        // Returned rather than panicked: a panic in spawn_blocking does not
+                        // stop the process, it only turns the typed error into a JoinError
+                        // string. The engine collects this through the join handle when the
+                        // response stream breaks.
                         if !matches!(e, ModelThreadError::Shutdown(_)) {
-                            panic!("Fatal error occurred: {e}");
+                            return Err(e);
                         }
                     }
 
@@ -539,6 +543,33 @@ impl ModelThreadDispatcher {
         }
 
         self.responses.push(receiver);
+    }
+
+    /// Collects the cause of death once the response stream broke: a response sender only drops
+    /// without sending when its model thread is gone.
+    ///
+    /// Closing every command channel first unblocks any surviving rank's `blocking_recv`, then
+    /// each join handle gets a bounded wait: the first returned error or panic becomes the
+    /// reported cause.
+    pub async fn worker_error(&mut self) -> String {
+        /// How long a surviving thread gets to drain and exit after its channel closes.
+        const WORKER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        self.to_workers_senders.clear();
+        let mut cause = None;
+        for join_handle in self.join_handles.drain(..) {
+            let failure = match tokio::time::timeout(WORKER_EXIT_TIMEOUT, join_handle).await {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(thread_error))) => Some(thread_error.to_string()),
+                Ok(Err(join_error)) => Some(format!("model thread panicked: {join_error}")),
+                Err(_) => Some(format!(
+                    "a model thread did not exit within {WORKER_EXIT_TIMEOUT:?} of its command \
+                     channel closing"
+                )),
+            };
+            cause = cause.or(failure);
+        }
+        cause.unwrap_or_else(|| "model thread exited without reporting an error".to_string())
     }
 }
 
