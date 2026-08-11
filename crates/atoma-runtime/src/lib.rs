@@ -6,8 +6,8 @@
 //! nothing about models, attention, or kernels; the layer whose allocation-freedom must be
 //! provable stays small enough to prove.
 //!
-//! The crate links cudarc unconditionally under the workspace's `dynamic-loading` pin, so it
-//! compiles, links, and runs `cargo test` on a machine with no CUDA toolkit, driver, or GPU.
+//! The crate links cudarc unconditionally under the workspace's `fallback-dynamic-loading` pin, so
+//! it compiles, links, and runs `cargo test` on a machine with no CUDA toolkit, driver, or GPU.
 //! Only paths that call the driver require one, and they fail loudly at the call.
 //!
 //! Layout rule: `#[repr(C)]` (or `#[repr(transparent)]`) is required for exactly the types whose
