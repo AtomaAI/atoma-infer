@@ -106,7 +106,10 @@ fn main() -> Result<()> {
         Ok(build_dir) => {
             let build_dir = PathBuf::from(build_dir);
             std::fs::create_dir_all(&build_dir).with_context(|| {
-                format!("Failed to create ATOMA_FLASH_ATTN_BUILD_DIR {}", build_dir.display())
+                format!(
+                    "Failed to create ATOMA_FLASH_ATTN_BUILD_DIR {}",
+                    build_dir.display()
+                )
             })?;
             build_dir.canonicalize().with_context(|| {
                 format!(
