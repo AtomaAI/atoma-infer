@@ -61,6 +61,15 @@ export ATOMA_FLASH_ATTN_BUILD_DIR="$HOME/.cache/atoma-flash-attn-build"
 
 Multi-GPU builds additionally enable `nccl`, which is compile-checked with `cargo check --workspace --features cuda,nccl`. Running tensor-parallel inference is not verified in this checkout.
 
+## GPU verification
+
+GPU verification is manual by design: no GPU CI runner is registered, and GPU hardware is rented
+per campaign rather than kept standing. `scripts/gpu-verify.sh` is the entry point — run it from a
+checkout on a CUDA rig. It preflights the machine (driver, CUDA toolkit, NCCL, OpenSSL build
+dependencies, CUTLASS submodule), builds the `cuda` feature, runs the `cuda` and `cuda,nccl` test
+suites without fail-fast, runs clippy over all features, and prints an evidence block to paste
+into the tracking ticket.
+
 ## Benchmarks
 
 `crates/bench` holds the benchmark harness (`atoma-bench`). It offers an open-loop Poisson workload
