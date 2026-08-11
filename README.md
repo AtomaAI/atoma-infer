@@ -51,7 +51,7 @@ Building the `cuda` feature requires a CUDA toolkit providing `nvcc`, but not a 
 CUDA_COMPUTE_CAP=80 cargo check --workspace --features cuda
 ```
 
-The toolkit must be CUDA 13.0 or older. `candle-core 0.11` pulls in `cudarc 0.17`, which supports up to CUDA 13.0, and the build resolves against that lower ceiling even though the workspace's own `cudarc 0.19` supports up to 13.3. NVIDIA's `cuda-toolkit` metapackage currently installs 13.3, so request a specific version instead — for example `cuda-toolkit-12-9` on Ubuntu 24.04. A newer toolkit fails inside `cudarc`'s build script, not in this workspace.
+Use a CUDA 12.x toolkit. The workspace pins `cudarc`'s `cuda-12000` feature as its API baseline, and 12.x is the range GPU verification runs against; newer toolkits are unverified. NVIDIA's `cuda-toolkit` metapackage currently installs 13.3, so request a specific version instead — for example `cuda-toolkit-12-9` on Ubuntu 24.04.
 
 Compiling the kernels takes considerably longer than the Rust build. Set `ATOMA_FLASH_ATTN_BUILD_DIR` to an absolute path outside `target/` to cache the compiled kernel archive across builds:
 
