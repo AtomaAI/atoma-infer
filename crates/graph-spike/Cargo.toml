@@ -1,0 +1,20 @@
+[package]
+description = "Throwaway CUDA-graph capture spike for issue #143; delete after the findings land"
+edition     = { workspace = true }
+license     = "Apache-2.0"
+name        = "graph-spike"
+version     = { workspace = true }
+
+[dependencies]
+anyhow        = { workspace = true }
+atoma-kernels = { workspace = true, optional = true }
+atoma-runtime = { workspace = true }
+clap          = { workspace = true, features = [ "derive" ] }
+cudarc        = { workspace = true }
+half          = { workspace = true }
+serde         = { workspace = true, features = [ "derive" ] }
+serde_json    = { workspace = true }
+
+[features]
+cuda = [ "atoma-kernels/cuda", "dep:atoma-kernels" ]
+nccl = [ "atoma-runtime/nccl", "cudarc/nccl" ]
