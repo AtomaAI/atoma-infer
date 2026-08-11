@@ -30,7 +30,9 @@ preflight() {
 	command -v nvidia-smi >/dev/null || die "nvidia-smi not found — NVIDIA driver is not installed"
 	nvidia-smi >/dev/null || die "nvidia-smi failed — no visible GPU"
 	command -v nvcc >/dev/null || die "nvcc not on PATH — install a CUDA 12.x toolkit"
-	command -v cargo >/dev/null || die "cargo not found — install rustup; rust-toolchain.toml pins the version"
+	nvcc --version >/dev/null || die "nvcc --version failed — the CUDA toolkit install is broken"
+	command -v cargo >/dev/null ||
+		die "cargo not found — install rustup; rust-toolchain.toml pins the version"
 
 	local candidate
 	for candidate in /usr/include/nccl.h /usr/local/include/nccl.h /usr/local/cuda/include/nccl.h; do
@@ -39,8 +41,11 @@ preflight() {
 			break
 		fi
 	done
-	[[ -n $nccl_header ]] || die "nccl.h not found — install libnccl-dev (the cuda,nccl test run needs it to link)"
-	ldconfig -p | grep -q libnccl || die "libnccl not in the linker cache — install libnccl2"
+	[[ -n $nccl_header ]] ||
+		die "nccl.h not found — install libnccl-dev (the cuda,nccl test run needs it to link)"
+	# Not grep -q: under pipefail an early -q exit can kill ldconfig with SIGPIPE and fail
+	# the pipeline even when libnccl is present.
+	ldconfig -p | grep libnccl >/dev/null || die "libnccl not in the linker cache — install libnccl2"
 
 	# Without pkg-config and the OpenSSL headers the build dies in openssl-sys before any
 	# kernel compiles.
@@ -52,7 +57,8 @@ preflight() {
 		echo "==> CUTLASS submodule is empty; fetching"
 		git submodule update --init --depth 1 crates/atoma-kernels/cutlass
 	fi
-	[[ -f $cutlass_header ]] || die "CUTLASS submodule checkout failed — $cutlass_header is still missing"
+	[[ -f $cutlass_header ]] ||
+		die "CUTLASS submodule checkout failed — $cutlass_header is still missing"
 
 	echo "==> preflight ok"
 }
@@ -95,12 +101,16 @@ suite_results() {
 	' "$log_dir/$1.log"
 }
 
+gpu_field() {
+	nvidia-smi --query-gpu="$1" --format=csv,noheader | sort -u | paste -sd, -
+}
+
 evidence() {
 	local gpu_count gpu_name driver compute_cap cuda_release nccl_version commit
 	gpu_count=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-	gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader | sort -u | paste -sd, -)
-	driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | sort -u | paste -sd, -)
-	compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | sort -u | paste -sd, -)
+	gpu_name=$(gpu_field name)
+	driver=$(gpu_field driver_version)
+	compute_cap=$(gpu_field compute_cap)
 	cuda_release=$(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -n 1)
 	nccl_version=$(awk '
 		/^#define NCCL_MAJOR/ { major = $3 }

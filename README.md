@@ -64,7 +64,7 @@ Multi-GPU builds additionally enable `nccl`, which is compile-checked with `carg
 ## GPU verification
 
 GPU verification is manual by design: no GPU CI runner is registered, and GPU hardware is rented
-per campaign rather than kept standing. `scripts/gpu-verify.sh` is the entry point — run it from a
+for scheduled stints rather than kept standing. `scripts/gpu-verify.sh` is the entry point — run it from a
 checkout on a CUDA rig. It preflights the machine (driver, CUDA toolkit, NCCL, OpenSSL build
 dependencies, CUTLASS submodule), builds the `cuda` feature, runs the `cuda` and `cuda,nccl` test
 suites without fail-fast, runs clippy over all features, and prints an evidence block to paste
