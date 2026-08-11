@@ -425,9 +425,6 @@ async fn test_llm_engine() {
 }
 
 #[tokio::test]
-#[ignore = "chunked prefill builds attention metadata for one sequence while the block table \
-            carries the whole batch (block_table [32, 1] vs expected (1, 1)); the model worker \
-            dies and the engine loop spins instead of failing the requests"]
 async fn test_llm_engine_with_enable_chunking() {
     run_engine_test("test_config_enable_chunked_prefill.toml").await;
 }

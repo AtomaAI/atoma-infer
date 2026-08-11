@@ -84,7 +84,17 @@ pub struct FlashAttentionMetadata {
 }
 
 impl FlashAttentionMetadata {
-    /// Constructor
+    /// Constructor.
+    ///
+    /// The batch is laid out prefill sequences first, then decode sequences, and `block_table`
+    /// carries one row per sequence in that order. Every per-sequence tensor is split at
+    /// `num_prefill_sequences` — a sequence index, never a token count — so each phase's kernel
+    /// call sees exactly its own sequences: a decode call handed the whole batch's block table
+    /// fails its batch-size check (or worse, silently reads another sequence's blocks).
+    ///
+    /// A block table with no rows (profiling, or a prefill-only batch built without per-sequence
+    /// tables) yields `None` on both sides; a prefill row set whose rows are empty (non-chunked
+    /// prefills) reaches the kernels as an empty tensor, which selects the plain varlen path.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         context_lengths: Tensor,
@@ -99,27 +109,28 @@ impl FlashAttentionMetadata {
         sequence_start_locations: Tensor,
         sequence_lengths: Tensor,
         block_table: Tensor,
-        prefix_caching: bool,
     ) -> Result<Self> {
-        let prefill_block_tables = if prefix_caching && num_prefill_tokens > 0 {
-            Some(block_table.i(..num_prefill_tokens)?)
+        let block_table_rows = block_table.dims().first().copied().unwrap_or(0);
+        let prefill_block_tables = if num_prefill_sequences > 0 && block_table_rows > 0 {
+            Some(block_table.i(..num_prefill_sequences)?)
         } else {
             None
         };
-        let decoding_block_tables = if prefix_caching && num_decoding_tokens > 0 {
-            Some(block_table.i(num_prefill_tokens..)?)
+        let decoding_block_tables = if num_decoding_tokens > 0 && block_table_rows > 0 {
+            Some(block_table.i(num_prefill_sequences..)?)
         } else {
-            Some(block_table)
+            None
         };
         let prefill_metadata = if num_prefill_tokens > 0 {
             Some(FlashAttentionPrefillMetadata {
                 block_tables: prefill_block_tables,
                 max_query_length: Some(max_query_length),
                 max_prefill_sequence_length,
-                query_start_locations: Some(query_start_locations.i(..num_prefill_sequences)?),
+                // Cumulative lengths carry one entry more than the batch has sequences.
+                query_start_locations: Some(query_start_locations.i(..num_prefill_sequences + 1)?),
                 sequence_start_locations: Some(
                     sequence_start_locations.i(..num_prefill_sequences + 1)?,
-                ), // cumulative sequence lengths, so has size `batch_size + 1`
+                ),
                 sequence_lengths: Some(sequence_lengths.i(..num_prefill_sequences)?),
             })
         } else {
