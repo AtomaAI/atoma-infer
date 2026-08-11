@@ -26,7 +26,7 @@ use crate::{
         ExecuteModelRequest, Sequence, SequenceGroupMetadata, SequenceGroupOutput, SequenceOutput,
         SequenceStatus,
     },
-    types::{ReadLock, WriteLock},
+    types::WriteLock,
     validation::StoppingCriteriaParameters,
 };
 
