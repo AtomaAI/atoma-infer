@@ -103,9 +103,21 @@ fn main() -> Result<()> {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR not set")?);
     let build_dir = match std::env::var("ATOMA_FLASH_ATTN_BUILD_DIR") {
         Err(_) => out_dir.clone(),
-        Ok(build_dir) => PathBuf::from(build_dir)
-            .canonicalize()
-            .context("Failed to canonicalize build directory")?,
+        Ok(build_dir) => {
+            let build_dir = PathBuf::from(build_dir);
+            std::fs::create_dir_all(&build_dir).with_context(|| {
+                format!(
+                    "Failed to create ATOMA_FLASH_ATTN_BUILD_DIR {}",
+                    build_dir.display()
+                )
+            })?;
+            build_dir.canonicalize().with_context(|| {
+                format!(
+                    "Failed to canonicalize ATOMA_FLASH_ATTN_BUILD_DIR {}",
+                    build_dir.display()
+                )
+            })?
+        }
     };
     println!("cargo:warning=Build directory: {:?}", build_dir.display());
 

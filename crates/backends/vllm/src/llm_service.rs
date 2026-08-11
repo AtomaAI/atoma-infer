@@ -10,9 +10,10 @@ use crate::{
     model_executor::{Config, ModelExecutor, ModelThreadDispatcher},
     request::{EngineRequest, ServiceRequest},
     scheduler::Scheduler,
+    sequence::SequenceGroup,
     tokenizer::TokenizerWorker,
     types::GenerateRequest,
-    validation::Validation,
+    validation::{ValidGenerateRequest, Validation},
 };
 #[cfg(feature = "cuda")]
 use candle_core::DType;

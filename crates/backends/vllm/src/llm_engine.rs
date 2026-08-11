@@ -26,7 +26,7 @@ use crate::{
         ExecuteModelRequest, Sequence, SequenceGroupMetadata, SequenceGroupOutput, SequenceOutput,
         SequenceStatus,
     },
-    types::{ReadLock, WriteLock},
+    types::WriteLock,
     validation::StoppingCriteriaParameters,
 };
 
@@ -380,12 +380,10 @@ impl LlmEngine {
         sequence_group_metadata: &SequenceGroupMetadata,
         stopping_criteria_params: &StoppingCriteriaParameters,
     ) -> Result<ClientState, EngineError> {
-        let sequence_id = { sequence.read_lock()?.sequence_id() };
         let request_id = &sequence_group_metadata.request_id;
         let mut client_state = ClientState::Connected;
         // 1. Get the AI generated next output token id.
         let generated_token_id = sequence_output.output_token;
-        let is_stop_token = sequence_output.is_stop_token;
 
         if sequence_group_metadata.do_sample {
             let mut sequence_guard_lock = sequence.write_lock()?;

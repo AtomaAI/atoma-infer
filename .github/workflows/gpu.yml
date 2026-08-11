@@ -1,3 +1,6 @@
+# TODO: register self-hosted GPU runners once a standing dev rig exists. No runner is registered
+# today, so this workflow cannot run; GPU verification is manual via scripts/gpu-verify.sh, which
+# becomes this job's body when a runner is registered.
 name: GPU CI
 
 on:
