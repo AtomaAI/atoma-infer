@@ -1,6 +1,6 @@
 use candle_core::{DTypeParseError, Error as CandleError};
 use thiserror::Error;
-use tokio::sync::{mpsc::error::SendError, oneshot::error::RecvError};
+use tokio::sync::mpsc::error::SendError;
 
 use crate::{
     config::{CacheConfigError, SchedulerConfigError},
@@ -27,8 +27,8 @@ pub enum EngineError {
     TokenizerError(String),
     #[error("Send error: `{0}`")]
     SendError(#[from] SendError<Vec<GenerateRequestOutput>>),
-    #[error("Recv error: `{0}`")]
-    RecvError(#[from] RecvError),
+    #[error("Model worker died, every pending request was failed: `{0}`")]
+    ModelWorkerDead(String),
 }
 
 #[derive(Debug, Error)]
