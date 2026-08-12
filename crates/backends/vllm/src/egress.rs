@@ -109,6 +109,20 @@ impl ResponseSenders {
         self.streams.remove(request_id);
     }
 
+    /// Fails every in-flight request at once, for unrecoverable engine failures (a dead model
+    /// worker): streaming clients receive `error` and then their stream closes; non-streaming
+    /// clients see their channel close before any output was sent, which their receive reports
+    /// as an error.
+    pub fn fail_all(&mut self, error: &str) {
+        for (request_id, sender) in self.streams.drain() {
+            info!("Failing streaming request {request_id}: {error}");
+            let _ = sender.send(StreamResponse::Error(error.to_string()));
+        }
+        for (request_id, _sender) in self.completions.drain() {
+            info!("Failing request {request_id}: {error}");
+        }
+    }
+
     /// Whether any request still holds a client channel. No production caller needs this; it is
     /// how the tests below assert that a finished or aborted request leaves nothing behind.
     #[cfg(test)]
@@ -350,6 +364,38 @@ mod tests {
             ClientState::Connected
         );
         assert!(senders.is_empty());
+    }
+
+    /// The dead-worker path: every client of every request learns its request failed — streams
+    /// through an explicit error message, completions through their channel closing — and no
+    /// channel survives to leave a client waiting.
+    #[tokio::test]
+    async fn test_fail_all_reaches_every_client_and_leaves_nothing_behind() {
+        let mut senders = ResponseSenders::default();
+        let (completion_sender, completion_receiver) = oneshot::channel();
+        let (stream_sender, stream_receiver) = flume::unbounded();
+        senders.register_completion("completion".to_string(), completion_sender);
+        senders.register_stream("stream".to_string(), stream_sender);
+
+        senders.fail_all("model worker died");
+
+        assert!(senders.is_empty());
+        match stream_receiver
+            .recv()
+            .expect("the error message was not streamed")
+        {
+            StreamResponse::Error(error) => assert_eq!(error, "model worker died"),
+            StreamResponse::Chunk(_) => panic!("expected StreamResponse::Error, got a chunk"),
+            StreamResponse::Finished => panic!("expected StreamResponse::Error, got Finished"),
+        }
+        assert!(
+            stream_receiver.recv().is_err(),
+            "the stream must close after the error"
+        );
+        assert!(
+            completion_receiver.await.is_err(),
+            "the completion channel must close without an output"
+        );
     }
 
     #[tokio::test]

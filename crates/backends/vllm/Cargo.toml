@@ -22,7 +22,7 @@ serde_json          = { workspace = true }
 sys-info            = { workspace = true }
 thiserror           = { workspace = true }
 tokenizers          = { workspace = true }
-tokio               = { workspace = true, features = [ "fs", "macros" ] }
+tokio               = { workspace = true, features = [ "fs", "macros", "sync", "time" ] }
 tracing             = { workspace = true }
 
 [dev-dependencies]
