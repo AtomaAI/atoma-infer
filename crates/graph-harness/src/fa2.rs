@@ -10,8 +10,12 @@
 //! the `cuda` feature the same API compiles to loud runtime errors so the rest of the harness
 //! still builds and unit-tests.
 
+// Only the stubs at the bottom of the file need these; the real seam imports its own inside
+// `mod real`, so a cuda build would leave both unused.
+#[cfg(not(feature = "cuda"))]
 use anyhow::Result;
 
+#[cfg(not(feature = "cuda"))]
 use crate::dims::ModelDims;
 
 /// One paged decode attention call: every device address plus the shapes `run_mha` bakes.
