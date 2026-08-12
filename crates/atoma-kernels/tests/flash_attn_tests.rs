@@ -543,12 +543,9 @@ fn lse_reference(q: &Tensor, k: &Tensor, softmax_scale: f32, causal: bool) -> Re
     } else {
         scores
     };
-    let row_max = scores.max_keepdim(candle_core::D::Minus1)?;
-    let sum = scores
-        .broadcast_sub(&row_max)?
-        .exp()?
-        .sum(candle_core::D::Minus1)?;
-    let lse = (sum.log()? + row_max.squeeze(candle_core::D::Minus1)?)?;
+    let row_max = scores.max_keepdim(D::Minus1)?;
+    let sum = scores.broadcast_sub(&row_max)?.exp()?.sum(D::Minus1)?;
+    let lse = (sum.log()? + row_max.squeeze(D::Minus1)?)?;
     Ok(lse)
 }
 
