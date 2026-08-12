@@ -17,12 +17,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, Error as CandleError, Tensor};
 use futures::{stream::FuturesUnordered, StreamExt};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use models::{FlashAttention, FlashAttentionMetadata};
 use serde::Deserialize;
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::timeout,
+};
 use tracing::info;
 
 use crate::{
@@ -288,7 +291,7 @@ impl ModelExecutor for FailingMockModel {
         _: Vec<&mut Tensor>,
         _: FlashAttentionMetadata,
     ) -> Result<Tensor, ModelExecutorError> {
-        Err(ModelExecutorError::CandleError(candle_core::Error::Msg(
+        Err(ModelExecutorError::CandleError(CandleError::Msg(
             "injected worker death".to_string(),
         )))
     }
@@ -626,7 +629,7 @@ async fn test_a_dead_worker_fails_every_pending_request() {
             "the stream must close after the error"
         );
     };
-    tokio::time::timeout(FAILURE_DEADLINE, failures)
+    timeout(FAILURE_DEADLINE, failures)
         .await
         .expect("requests were left hanging after the worker died");
 
@@ -639,7 +642,7 @@ async fn test_a_dead_worker_fails_every_pending_request() {
             sender,
         ))
         .expect("the service request channel closed before the service noticed the dead engine");
-    let service_result = tokio::time::timeout(FAILURE_DEADLINE, service_handle)
+    let service_result = timeout(FAILURE_DEADLINE, service_handle)
         .await
         .expect("the service kept running with a dead worker")
         .expect("the service task panicked");
