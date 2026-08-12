@@ -1,4 +1,4 @@
-//! The #143 tensor-path graph spike: capture a full Llama-8B-shaped decode step with
+//! The #143 tensor-path capture probe: capture a full Llama-8B-shaped decode step with
 //! `atoma-runtime`, replay it against varying inputs, and compare bit-for-bit with the same ops
 //! run eagerly.
 //!
@@ -8,7 +8,7 @@
 //! vendored FA2 kernels; the `nccl` feature adds the in-graph all-reduce cells.
 //!
 //! This crate is deliberately throwaway: it exists to produce the findings note and the per-graph
-//! memory calibration constant for the rung-2 spec, and is deleted once #143 closes.
+//! memory calibration constant for the production design, and is deleted once #143 closes.
 //!
 //! | Module | Responsibility |
 //! |---|---|

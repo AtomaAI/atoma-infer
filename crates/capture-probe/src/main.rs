@@ -1,19 +1,19 @@
-//! CLI for the #143 graph spike: `plan` prints the matrix and memory budget on any machine;
+//! CLI for the #143 capture probe: `plan` prints the matrix and memory budget on any machine;
 //! `run` executes the capture matrix on a CUDA rig.
 
 use std::path::PathBuf;
 use std::process::exit;
 
 use anyhow::Result;
+use capture_probe::dims::ModelDims;
+use capture_probe::gpu::harness::{self, RunConfig};
+use capture_probe::layout::{build_arena, kv_cache_bytes_each, StaticSizes};
+use capture_probe::matrix::capture_matrix;
+use capture_probe::splits;
 use clap::{Args, Parser, Subcommand};
-use graph_spike::dims::ModelDims;
-use graph_spike::gpu::harness::{self, RunConfig};
-use graph_spike::layout::{build_arena, kv_cache_bytes_each, StaticSizes};
-use graph_spike::matrix::capture_matrix;
-use graph_spike::splits;
 
 #[derive(Parser)]
-#[command(about = "CUDA-graph capture spike for the tensor path (#143)")]
+#[command(about = "CUDA-graph capture probe for the tensor path (#143)")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -29,7 +29,7 @@ enum Command {
 
 #[derive(Args)]
 struct CommonArgs {
-    /// Transformer layers in the shaped step (the runsheet says 2–4).
+    /// Transformer layers in the shaped step (2–4 reproduce the full op mix).
     #[arg(long, default_value_t = 4)]
     layers: usize,
     /// Capture-matrix buckets (batch sizes).
@@ -66,7 +66,7 @@ struct RunArgs {
     #[command(flatten)]
     common: CommonArgs,
     /// Output directory for findings.md, measurements.json, and the .dot topology dumps.
-    #[arg(long, default_value = ".scratch/graph-spike")]
+    #[arg(long, default_value = ".scratch/capture-probe")]
     out: PathBuf,
     #[arg(long, default_value_t = 0)]
     device: usize,
@@ -92,7 +92,7 @@ fn plan(args: &CommonArgs) -> Result<()> {
     let kv_bytes = 2 * dims.num_layers * kv_cache_bytes_each(&dims, total_blocks, args.page_block);
 
     let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
-    println!("# graph-spike plan\n");
+    println!("# capture-probe plan\n");
     println!(
         "model: {} layers, hidden {}, {}q/{}kv heads, head_dim {}, ffn {}, vocab {}",
         dims.num_layers,

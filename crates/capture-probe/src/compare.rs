@@ -1,4 +1,4 @@
-//! Bit-identity comparison: the spike's acceptance criterion is byte equality between replayed
+//! Bit-identity comparison: the probe's acceptance criterion is byte equality between replayed
 //! and eager outputs, with a bf16-aware description of the first divergence when they differ.
 
 use serde::Serialize;

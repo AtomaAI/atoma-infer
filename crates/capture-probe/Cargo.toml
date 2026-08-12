@@ -1,8 +1,8 @@
 [package]
-description = "Throwaway CUDA-graph capture spike for issue #143; delete after the findings land"
+description = "Throwaway CUDA-graph capture probe for issue #143; delete after the findings land"
 edition     = { workspace = true }
 license     = "Apache-2.0"
-name        = "graph-spike"
+name        = "capture-probe"
 version     = { workspace = true }
 
 [dependencies]

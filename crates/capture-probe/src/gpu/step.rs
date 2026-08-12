@@ -7,8 +7,8 @@ use cudarc::driver::{result, sys};
 
 use crate::dims::ModelDims;
 use crate::fa2::{self, AttentionCall, KvWriteCall};
-use crate::gpu::blas::SpikeBlas;
-use crate::gpu::kernels::SpikeKernels;
+use crate::gpu::blas::ProbeBlas;
+use crate::gpu::kernels::ProbeKernels;
 use crate::layout::{Role, StaticSizes};
 
 /// Device addresses of one layer's weights and its paged KV caches.
@@ -58,8 +58,8 @@ pub struct StagingPtrs {
 
 /// Everything a step launch needs besides addresses.
 pub struct StepContext<'a> {
-    pub kernels: &'a SpikeKernels,
-    pub blas: &'a SpikeBlas,
+    pub kernels: &'a ProbeKernels,
+    pub blas: &'a ProbeBlas,
     pub dims: &'a ModelDims,
     pub arena: &'a CaptureArena,
     pub bucket: BucketIdx,

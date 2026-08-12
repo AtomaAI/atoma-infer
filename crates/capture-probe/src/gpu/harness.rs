@@ -1,4 +1,4 @@
-//! The spike driver: setup, warmup, capture, replay-vs-eager comparison, soak, and measurement
+//! The probe driver: setup, warmup, capture, replay-vs-eager comparison, soak, and measurement
 //! for every capture-matrix cell.
 //!
 //! Ownership follows the harness rules: everything is allocated strictly before the first
@@ -26,8 +26,8 @@ use cudarc::nccl::{Comm, Id, ReduceOp};
 
 use crate::compare::first_bf16_divergence;
 use crate::dims::{ModelDims, BF16_BYTES};
-use crate::gpu::blas::SpikeBlas;
-use crate::gpu::kernels::SpikeKernels;
+use crate::gpu::blas::ProbeBlas;
+use crate::gpu::kernels::ProbeKernels;
 use crate::gpu::step::{self, LayerPtrs, StagingPtrs, StepContext, StepPtrs};
 use crate::layout::{build_arena, kv_cache_bytes_each, StaticSizes};
 #[cfg(feature = "nccl")]
@@ -64,8 +64,8 @@ struct Deps<'a> {
     cfg: &'a RunConfig,
     dims: &'a ModelDims,
     arena: &'a CaptureArena,
-    kernels: &'a SpikeKernels,
-    blas: &'a SpikeBlas,
+    kernels: &'a ProbeKernels,
+    blas: &'a ProbeBlas,
     capture: &'a CaptureStream,
     setup_stream: &'a Arc<CudaStream>,
     stream: sys::CUstream,
@@ -144,8 +144,8 @@ pub fn run(cfg: RunConfig) -> Result<Vec<CellReport>> {
     let capture_stream = CaptureStream::new(&ctx)?;
     let stream = capture_stream.cu_stream();
     let setup_stream = ctx.cuda().default_stream();
-    let kernels = SpikeKernels::compile_and_load(&ctx).context("compiling spike kernels")?;
-    let blas = SpikeBlas::new(stream).context("creating the cuBLAS handle")?;
+    let kernels = ProbeKernels::compile_and_load(&ctx).context("compiling probe kernels")?;
+    let blas = ProbeBlas::new(stream).context("creating the cuBLAS handle")?;
 
     // Shared device state; declared before `states` so every graph drops first.
     let (model_slices, model) = alloc_model(&kernels, &setup_stream, &dims, cfg.seed)
@@ -245,7 +245,7 @@ pub fn run(cfg: RunConfig) -> Result<Vec<CellReport>> {
 
 /// Allocates and fills every weight tensor, returning the owning slices and the address table.
 fn alloc_model(
-    kernels: &SpikeKernels,
+    kernels: &ProbeKernels,
     stream: &Arc<CudaStream>,
     dims: &ModelDims,
     seed: u64,
@@ -329,7 +329,7 @@ type KvPool = (Vec<CudaSlice<u8>>, Vec<(u64, u64)>);
 /// Allocates the per-layer paged K and V caches, pre-filled with unit-scale randoms so
 /// "historical" positions hold deterministic data both runs share.
 fn alloc_kv(
-    kernels: &SpikeKernels,
+    kernels: &ProbeKernels,
     stream: &Arc<CudaStream>,
     dims: &ModelDims,
     total_blocks: usize,

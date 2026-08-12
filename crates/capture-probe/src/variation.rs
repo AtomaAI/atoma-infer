@@ -8,7 +8,7 @@
 
 use anyhow::{bail, Result};
 
-/// SplitMix64: a tiny deterministic generator so the spike needs no RNG dependency.
+/// SplitMix64: a tiny deterministic generator so the probe needs no RNG dependency.
 #[derive(Debug, Clone)]
 pub struct SplitMix64(u64);
 

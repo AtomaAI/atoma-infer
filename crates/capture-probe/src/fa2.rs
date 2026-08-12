@@ -7,7 +7,7 @@
 //! present, per-sequence lengths in non-cumulative `cu_seqlens_k`, `force_split_kernel = true`.
 //!
 //! This is the one module a GPU-free machine cannot type-check against its link target; without
-//! the `cuda` feature the same API compiles to loud runtime errors so the rest of the spike
+//! the `cuda` feature the same API compiles to loud runtime errors so the rest of the probe
 //! still builds and unit-tests.
 
 use anyhow::Result;
@@ -286,7 +286,7 @@ mod real {
 #[cfg(feature = "cuda")]
 pub use real::{paged_decode_attention, write_kv};
 
-/// Loud stub: the spike binary built without the `cuda` feature cannot run attention.
+/// Loud stub: the probe binary built without the `cuda` feature cannot run attention.
 ///
 /// # Safety
 /// Never dereferences anything; the signature matches the real seam.
@@ -298,7 +298,7 @@ pub unsafe fn paged_decode_attention(_call: &AttentionCall, _dims: &ModelDims) -
     )
 }
 
-/// Loud stub: the spike binary built without the `cuda` feature cannot write the KV cache.
+/// Loud stub: the probe binary built without the `cuda` feature cannot write the KV cache.
 ///
 /// # Safety
 /// Never dereferences anything; the signature matches the real seam.

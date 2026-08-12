@@ -513,6 +513,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "capture-probe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "atoma-kernels",
+ "atoma-runtime",
+ "clap",
+ "cudarc 0.19.8",
+ "half",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1646,20 +1660,6 @@ name = "glob"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2fabcfbdc87f4758337ca535fb41a6d701b65693ce38287d856d1674551ec9b"
-
-[[package]]
-name = "graph-spike"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "atoma-kernels",
- "atoma-runtime",
- "clap",
- "cudarc 0.19.8",
- "half",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "h2"

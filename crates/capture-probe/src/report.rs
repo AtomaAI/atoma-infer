@@ -1,5 +1,6 @@
 //! The findings note: capture matrix table, host timings, and the per-graph memory measurement
-//! (the rung-2 ladder-budget calibration constant), rendered as markdown plus raw JSON.
+//! (the calibration constant for bucket-ladder memory budgeting), rendered as markdown plus raw
+//! JSON.
 
 use crate::compare::Bf16Divergence;
 use serde::Serialize;
@@ -106,7 +107,7 @@ fn fmt_bytes(bytes: Option<i64>) -> String {
 /// Renders the findings note. `header_lines` carries run metadata (device, dims, seed) the
 /// harness knows and this module does not.
 pub fn render_markdown(header_lines: &[String], reports: &[CellReport]) -> String {
-    let mut out = String::from("# #143 graph spike findings\n\n");
+    let mut out = String::from("# #143 capture probe findings\n\n");
     for line in header_lines {
         out.push_str(&format!("- {line}\n"));
     }

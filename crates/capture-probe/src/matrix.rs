@@ -1,4 +1,4 @@
-//! The capture matrix: which (bucket, step-contents) cells the spike captures and replays.
+//! The capture matrix: which (bucket, step-contents) cells the probe captures and replays.
 
 use serde::Serialize;
 

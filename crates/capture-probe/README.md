@@ -1,4 +1,4 @@
-# graph-spike
+# capture-probe
 
 A disposable experiment answering one question before the real CUDA-graph implementation is
 built: **can this workspace's exact kernel set be captured into a CUDA graph and replayed
@@ -47,16 +47,16 @@ Everything except the FlashAttention-2 FFI seam (`src/fa2.rs`) type-checks and u
 machine with no GPU, no CUDA toolkit, and no driver:
 
 ```sh
-cargo test -p graph-spike --features nccl
-cargo run -p graph-spike -- plan --nccl        # prints the matrix and memory budget anywhere
+cargo test -p capture-probe --features nccl
+cargo run -p capture-probe -- plan --nccl        # prints the matrix and memory budget anywhere
 ```
 
 The real run needs a CUDA rig (the `cuda` feature links the vendored FA2 kernels; `nccl` adds
 the all-reduce cells):
 
 ```sh
-cargo build -p graph-spike --features cuda,nccl --release
-target/release/graph-spike run --nccl --out .scratch/graph-spike/run1
+cargo build -p capture-probe --features cuda,nccl --release
+target/release/capture-probe run --nccl --out .scratch/capture-probe/run1
 ```
 
 Outputs land in `--out`: `findings.md` (capture matrix table, timings, memory), a raw
