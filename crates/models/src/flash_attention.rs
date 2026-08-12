@@ -431,7 +431,9 @@ impl FlashAttention {
                 } else {
                     candle_core::bail!("Missing sequence lengths tensor for prefill inference, with prefix enabled attention")
                 };
-                let max_sequence_length_k = sequence_lengths.max(0)?.to_scalar::<i64>()? as usize;
+                // The worker builds every length tensor as u32; reading this one as i64 made the
+                // prefix-enabled prefill path fail the moment anything reached it.
+                let max_sequence_length_k = sequence_lengths.max(0)?.to_scalar::<u32>()? as usize;
                 let query_start_locations = if let Some(query_start_locations) =
                     prefill_metadata.query_start_locations.as_ref()
                 {
