@@ -70,6 +70,11 @@ mod real {
     use std::ptr;
 
     use anyhow::{bail, Result};
+    // The extern block below resolves against the FA2 static library that atoma-kernels' build
+    // script links. Nothing else in this crate names atoma-kernels, and an unreferenced dependency
+    // is dropped from the link graph together with its native-library directives, so this import is
+    // what makes the symbols resolve.
+    use atoma_kernels as _;
 
     use super::{AttentionCall, KvWriteCall};
     use crate::dims::{ModelDims, BF16_BYTES};
