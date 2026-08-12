@@ -1,12 +1,14 @@
 //! Llama-8B-shaped model dimensions and the sizes the spike derives from them.
 
+use serde::Serialize;
+
 /// Size of one bf16 element in bytes; every weight and activation the step touches is bf16.
 pub const BF16_BYTES: usize = 2;
 
 /// The model shape every spike step runs: Llama-8B-shaped per the #143 runsheet, with the layer
 /// count the only configurable axis — 2–4 layers reproduce the full op mix without the full
 /// memory bill.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct ModelDims {
     pub num_layers: usize,
     pub hidden: usize,

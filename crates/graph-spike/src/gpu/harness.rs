@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use std::{fs, mem};
 
 use anyhow::{anyhow, bail, Context, Result};
 use atoma_runtime::arena::{BucketIdx, CaptureArena};
@@ -20,6 +21,8 @@ use atoma_runtime::graph_entry::GraphEntry;
 use atoma_runtime::stream::CaptureStream;
 use cudarc::driver::sys::CUdevice_attribute;
 use cudarc::driver::{result, sys, CudaSlice, CudaStream, DevicePtr};
+#[cfg(feature = "nccl")]
+use cudarc::nccl::{Comm, Id, ReduceOp};
 
 use crate::compare::first_bf16_divergence;
 use crate::dims::{ModelDims, BF16_BYTES};
@@ -27,8 +30,10 @@ use crate::gpu::blas::SpikeBlas;
 use crate::gpu::kernels::SpikeKernels;
 use crate::gpu::step::{self, LayerPtrs, StagingPtrs, StepContext, StepPtrs};
 use crate::layout::{build_arena, kv_cache_bytes_each, StaticSizes};
+#[cfg(feature = "nccl")]
+use crate::matrix::StepContents;
 use crate::matrix::{capture_matrix, CaptureCell};
-use crate::report::{CellReport, DivergenceReport, Stats};
+use crate::report::{render_markdown, CellReport, DivergenceReport, Stats};
 use crate::splits;
 use crate::variation::{PlanConfig, StepInputs, VariationPlan};
 
@@ -71,7 +76,7 @@ struct Deps<'a> {
 /// the `nccl` build can run them.
 pub struct AllReduce<'a> {
     #[cfg(feature = "nccl")]
-    pub comm: &'a cudarc::nccl::Comm,
+    pub comm: &'a Comm,
     pub buffer: &'a mut CudaSlice<f32>,
     pub buffer_ptr: u64,
 }
@@ -99,7 +104,7 @@ struct CellBuffers {
     statics: Vec<CudaSlice<u8>>,
     staging: Vec<CudaSlice<u8>>,
     #[cfg(feature = "nccl")]
-    comm: Option<cudarc::nccl::Comm>,
+    comm: Option<Comm>,
 }
 
 /// Runs the full capture matrix and writes `findings.md`, `measurements.json`, and per-cell
@@ -115,7 +120,7 @@ pub fn run(cfg: RunConfig) -> Result<Vec<CellReport>> {
             cfg.page_block
         );
     }
-    std::fs::create_dir_all(&cfg.out_dir)
+    fs::create_dir_all(&cfg.out_dir)
         .with_context(|| format!("creating out dir {}", cfg.out_dir.display()))?;
 
     let dims = ModelDims::llama_8b_shaped(cfg.layers);
@@ -229,10 +234,10 @@ pub fn run(cfg: RunConfig) -> Result<Vec<CellReport>> {
             cfg.page_block, cfg.max_seqlen, cfg.start_seqlen, cfg.seed
         ),
     ];
-    let markdown = crate::report::render_markdown(&header, &reports);
-    std::fs::write(cfg.out_dir.join("findings.md"), markdown)?;
+    let markdown = render_markdown(&header, &reports);
+    fs::write(cfg.out_dir.join("findings.md"), markdown)?;
     let json = serde_json::to_string_pretty(&reports)?;
-    std::fs::write(cfg.out_dir.join("measurements.json"), json)?;
+    fs::write(cfg.out_dir.join("measurements.json"), json)?;
     drop(model_slices);
     drop(kv_slices);
     Ok(reports)
@@ -458,9 +463,9 @@ fn prepare_cell(
     };
 
     #[cfg(feature = "nccl")]
-    let comm = if cell.contents == crate::matrix::StepContents::DecodeAllReduce {
+    let comm = if cell.contents == StepContents::DecodeAllReduce {
         // NCCL init allocates, so it happens here — strictly before the first capture.
-        let id = cudarc::nccl::Id::new().map_err(|e| anyhow!("ncclGetUniqueId: {:?}", e.0))?;
+        let id = Id::new().map_err(|e| anyhow!("ncclGetUniqueId: {:?}", e.0))?;
         Some(deps.capture.nccl_comm(0, 1, id)?)
     } else {
         None
@@ -571,7 +576,7 @@ fn run_cell(
     unsafe { capture::debug_dot_print(graph.cu_graph(), &dot_path, 0) }?;
     report.graph_node_count = Some(unsafe { capture::graph_nodes(graph.cu_graph()) }?.len());
 
-    let statics = std::mem::take(&mut buffers.statics);
+    let statics = mem::take(&mut buffers.statics);
     let mut statics = statics.into_iter();
     let inputs: Vec<CudaSlice<u8>> = statics.by_ref().take(4).collect();
     let outputs: Vec<CudaSlice<u8>> = statics.by_ref().take(2).collect();
@@ -584,7 +589,7 @@ fn run_cell(
     };
     let mut state = CellState {
         entry,
-        staging: std::mem::take(&mut buffers.staging),
+        staging: mem::take(&mut buffers.staging),
     };
 
     if let Err(err) = exercise(
@@ -730,7 +735,7 @@ fn step_with_hook(
             let mut hook = |o_proj: u64, elements: usize| -> Result<()> {
                 unsafe { kernels.bf16_to_f32(stream, o_proj, buffer_ptr, elements) }?;
                 let mut view = buffer.slice_mut(0..elements);
-                comm.all_reduce_in_place(&mut view, &cudarc::nccl::ReduceOp::Sum)
+                comm.all_reduce_in_place(&mut view, &ReduceOp::Sum)
                     .map_err(|e| anyhow!("ncclAllReduce: {:?}", e.0))?;
                 unsafe { kernels.f32_to_bf16(stream, buffer_ptr, o_proj, elements) }?;
                 Ok(())

@@ -1,7 +1,9 @@
 //! The capture matrix: which (bucket, step-contents) cells the spike captures and replays.
 
+use serde::Serialize;
+
 /// What one captured step contains, beyond the full decode step every cell runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum StepContents {
     /// Full decode step including the KV write.
     Decode,
@@ -11,7 +13,7 @@ pub enum StepContents {
 }
 
 /// One cell of the capture matrix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CaptureCell {
     pub batch_size: usize,
     pub contents: StepContents,

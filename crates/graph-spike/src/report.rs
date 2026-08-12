@@ -2,9 +2,10 @@
 //! (the rung-2 ladder-budget calibration constant), rendered as markdown plus raw JSON.
 
 use crate::compare::Bf16Divergence;
+use serde::Serialize;
 
 /// Order statistics of one timing series, in microseconds.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Stats {
     pub samples: usize,
     pub median_us: f64,
@@ -35,7 +36,7 @@ impl Stats {
 }
 
 /// A bit-identity failure: which step diverged and how.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DivergenceReport {
     pub step: usize,
     pub divergence: Bf16Divergence,
@@ -43,7 +44,7 @@ pub struct DivergenceReport {
 
 /// Everything one capture-matrix cell produced. Fields are `Option` because a failure in any
 /// phase leaves the later phases unmeasured; `failure` carries the classification text.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CellReport {
     pub label: String,
     /// Classification of the first failure (kernel capture-illegal / cudarc behavior / FFI

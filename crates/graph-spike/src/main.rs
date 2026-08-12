@@ -2,6 +2,7 @@
 //! `run` executes the capture matrix on a CUDA rig.
 
 use std::path::PathBuf;
+use std::process::exit;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
@@ -171,7 +172,7 @@ fn run(args: RunArgs) -> Result<()> {
         args.out.join("findings.md").display()
     );
     if failed > 0 {
-        std::process::exit(1);
+        exit(1);
     }
     Ok(())
 }

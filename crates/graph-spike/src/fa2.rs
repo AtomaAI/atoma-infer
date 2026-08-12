@@ -65,6 +65,9 @@ pub struct KvWriteCall {
 #[cfg(feature = "cuda")]
 mod real {
     use core::ffi::{c_int, c_void};
+    use std::f32::consts::LOG2_E;
+    use std::ffi::CStr;
+    use std::ptr;
 
     use anyhow::{bail, Result};
 
@@ -162,7 +165,7 @@ mod real {
             return Ok(());
         }
         // SAFETY: cudaGetErrorString returns a static string for every input.
-        let message = unsafe { std::ffi::CStr::from_ptr(flash_cuda_error_string(status)) }
+        let message = unsafe { CStr::from_ptr(flash_cuda_error_string(status)) }
             .to_string_lossy()
             .into_owned();
         bail!("{kernel} launch failed with cudaError {status}: {message}");
@@ -188,8 +191,8 @@ mod real {
                 call.v_cache as *const c_void,
                 call.out as *const c_void,
                 call.softmax_lse as *const c_void,
-                /* alibi_slopes_ptr */ std::ptr::null(),
-                /* cu_seqlens_q_ptr */ std::ptr::null(),
+                /* alibi_slopes_ptr */ ptr::null(),
+                /* cu_seqlens_q_ptr */ ptr::null(),
                 call.seqlens_k as *const i32,
                 /* is_seqlens_k_cumulative */ false,
                 /* q_batch_stride */ qkv_row,
@@ -212,11 +215,11 @@ mod real {
                 /* d */ head_dim,
                 /* d_rounded */ head_dim,
                 call.softmax_scale,
-                call.softmax_scale * std::f32::consts::LOG2_E,
+                call.softmax_scale * LOG2_E,
                 call.block_table as *const c_int,
                 call.max_blocks_per_seq as u32,
                 call.page_block as c_int,
-                /* seqused_k */ std::ptr::null(),
+                /* seqused_k */ ptr::null(),
                 /* seqlen_q */ 1,
                 seqlen_k as u32,
                 /* total_q */ call.batch_size as u32,
@@ -232,12 +235,12 @@ mod real {
                 if split_accums {
                     call.lse_accum as *const c_void
                 } else {
-                    std::ptr::null()
+                    ptr::null()
                 },
                 if split_accums {
                     call.o_accum as *const c_void
                 } else {
-                    std::ptr::null()
+                    ptr::null()
                 },
                 call.stream.cast::<c_void>(),
             );

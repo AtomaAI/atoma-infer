@@ -1,8 +1,10 @@
 //! Bit-identity comparison: the spike's acceptance criterion is byte equality between replayed
 //! and eager outputs, with a bf16-aware description of the first divergence when they differ.
 
+use serde::Serialize;
+
 /// The first differing element between two bf16 buffers, with both values decoded.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Bf16Divergence {
     pub element_index: usize,
     pub replay_bits: u16,

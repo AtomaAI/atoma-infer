@@ -1,7 +1,7 @@
 //! The decode step: one function enqueues every op of the Llama-shaped step onto a raw stream,
 //! so the eager run and the captured recording are the same code path by construction.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use atoma_runtime::arena::{BucketIdx, CaptureArena, LayerIdx};
 use cudarc::driver::{result, sys};
 
@@ -104,7 +104,7 @@ pub unsafe fn copy_inputs(
         (ptrs.slot_mapping, staging.slot_mapping, sizes.slot_mapping),
     ] {
         unsafe { result::memcpy_dtod_async(dst, src, bytes, stream) }
-            .map_err(|e| anyhow::anyhow!("copy-in D2D failed: {:?}", e.0))?;
+            .map_err(|e| anyhow!("copy-in D2D failed: {:?}", e.0))?;
     }
     Ok(())
 }

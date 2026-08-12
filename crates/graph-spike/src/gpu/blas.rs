@@ -4,6 +4,8 @@
 //! allocate its workspace and select algorithms before any capture begins — a lazy workspace
 //! allocation inside a captured region is one of the predicted capture killers.
 
+use std::ffi::c_void;
+
 use anyhow::{anyhow, Result};
 use cudarc::cublas::{result as cublas, sys};
 
@@ -51,14 +53,14 @@ impl SpikeBlas {
                 n,
                 k,
                 (&raw const alpha).cast(),
-                w as *const std::ffi::c_void,
+                w as *const c_void,
                 sys::cudaDataType_t::CUDA_R_16BF,
                 k,
-                x as *const std::ffi::c_void,
+                x as *const c_void,
                 sys::cudaDataType_t::CUDA_R_16BF,
                 k,
                 (&raw const beta).cast(),
-                y as *mut std::ffi::c_void,
+                y as *mut c_void,
                 sys::cudaDataType_t::CUDA_R_16BF,
                 m,
                 sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,

@@ -1,6 +1,7 @@
 //! Arena roles, static buffer sizes, and the device memory budget of the spike step.
 
 use atoma_runtime::arena::{CaptureArena, Dtype, TensorRole};
+use serde::Serialize;
 
 use crate::dims::{ModelDims, BF16_BYTES};
 
@@ -70,7 +71,7 @@ pub fn build_arena(dims: &ModelDims, buckets: &[usize]) -> CaptureArena {
 
 /// Byte sizes of one cell's per-graph buffers: the graph's static inputs, outputs, and
 /// workspaces, each of which the harness allocates before capture and `GraphEntry` then owns.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct StaticSizes {
     pub token_ids: usize,
     pub seqlens_k: usize,
