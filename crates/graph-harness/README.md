@@ -1,4 +1,4 @@
-# capture-probe
+# graph-harness
 
 A disposable experiment answering one question before the real CUDA-graph implementation is
 built: **can this workspace's exact kernel set be captured into a CUDA graph and replayed
@@ -47,16 +47,16 @@ Everything except the FlashAttention-2 FFI seam (`src/fa2.rs`) type-checks and u
 machine with no GPU, no CUDA toolkit, and no driver:
 
 ```sh
-cargo test -p capture-probe --features nccl
-cargo run -p capture-probe -- plan --nccl        # prints the matrix and memory budget anywhere
+cargo test -p graph-harness --features nccl
+cargo run -p graph-harness -- plan --nccl        # prints the matrix and memory budget anywhere
 ```
 
 The real run needs a CUDA rig (the `cuda` feature links the vendored FA2 kernels; `nccl` adds
 the all-reduce cells):
 
 ```sh
-cargo build -p capture-probe --features cuda,nccl --release
-target/release/capture-probe run --nccl --out .scratch/capture-probe/run1
+cargo build -p graph-harness --features cuda,nccl --release
+target/release/graph-harness run --nccl --out .scratch/graph-harness/run1
 ```
 
 Outputs land in `--out`: `findings.md` (capture matrix table, timings, memory), a raw
@@ -78,5 +78,5 @@ deterministic from the seed.
 | `splits` | The FA2 split-KV heuristic, mirrored so accumulators allocate before capture |
 | `compare` | Bit-identity comparison and bf16 divergence reporting |
 | `report` | Findings note: matrix table, timings, memory measurements |
-| `gpu` | Device harness: NVRTC kernels, cuBLAS, the step function, capture and replay |
+| `gpu` | Device runner: NVRTC kernels, cuBLAS, the step function, capture and replay |
 | `fa2` | Paged decode attention + KV write over the FA2 FFI (`cuda` feature only) |

@@ -1,7 +1,7 @@
 //! The FA2 split-KV heuristic, mirrored from `atoma-kernels`' private `compute_num_splits` so
-//! the probe can size split accumulators and bake `num_splits` before capture.
+//! the harness can size split accumulators and bake `num_splits` before capture.
 //!
-//! The probe calls `run_mha` directly with an explicit `num_splits`, so this copy — not the
+//! The harness calls `run_mha` directly with an explicit `num_splits`, so this copy — not the
 //! kernels-crate original — decides the accumulator allocation; the kernel then trusts the
 //! accumulators to be large enough. Decode always has `seqlen_q = 1`, so `num_m_blocks` is 1.
 

@@ -10,11 +10,11 @@ use anyhow::{anyhow, Result};
 use cudarc::cublas::{result as cublas, sys};
 
 /// Raw cuBLAS handle whose GEMMs enqueue on the stream given at construction.
-pub struct ProbeBlas {
+pub struct StepBlas {
     handle: sys::cublasHandle_t,
 }
 
-impl ProbeBlas {
+impl StepBlas {
     /// Creates the handle and binds it to `stream` (the capture stream's raw handle).
     pub fn new(stream: cudarc::driver::sys::CUstream) -> Result<Self> {
         let handle = cublas::create_handle().map_err(|e| anyhow!("cublasCreate: {e:?}"))?;
@@ -71,7 +71,7 @@ impl ProbeBlas {
     }
 }
 
-impl Drop for ProbeBlas {
+impl Drop for StepBlas {
     fn drop(&mut self) {
         // Best-effort: the process is exiting or the harness is tearing down after every graph
         // is gone; a destroy failure has nothing actionable left.

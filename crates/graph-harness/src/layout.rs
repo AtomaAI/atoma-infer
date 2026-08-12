@@ -1,4 +1,4 @@
-//! Arena roles, static buffer sizes, and the device memory budget of the probe step.
+//! Arena roles, static buffer sizes, and the device memory budget of the harness step.
 
 use atoma_runtime::arena::{CaptureArena, Dtype, TensorRole};
 use serde::Serialize;

@@ -1,19 +1,19 @@
-//! CLI for the #143 capture probe: `plan` prints the matrix and memory budget on any machine;
+//! CLI for the #143 graph harness: `plan` prints the matrix and memory budget on any machine;
 //! `run` executes the capture matrix on a CUDA rig.
 
 use std::path::PathBuf;
 use std::process::exit;
 
 use anyhow::Result;
-use capture_probe::dims::ModelDims;
-use capture_probe::gpu::harness::{self, RunConfig};
-use capture_probe::layout::{build_arena, kv_cache_bytes_each, StaticSizes};
-use capture_probe::matrix::capture_matrix;
-use capture_probe::splits;
 use clap::{Args, Parser, Subcommand};
+use graph_harness::dims::ModelDims;
+use graph_harness::gpu::runner::{self, RunConfig};
+use graph_harness::layout::{build_arena, kv_cache_bytes_each, StaticSizes};
+use graph_harness::matrix::capture_matrix;
+use graph_harness::splits;
 
 #[derive(Parser)]
-#[command(about = "CUDA-graph capture probe for the tensor path (#143)")]
+#[command(about = "CUDA-graph graph harness for the tensor path (#143)")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -66,7 +66,7 @@ struct RunArgs {
     #[command(flatten)]
     common: CommonArgs,
     /// Output directory for findings.md, measurements.json, and the .dot topology dumps.
-    #[arg(long, default_value = ".scratch/capture-probe")]
+    #[arg(long, default_value = ".scratch/graph-harness")]
     out: PathBuf,
     #[arg(long, default_value_t = 0)]
     device: usize,
@@ -92,7 +92,7 @@ fn plan(args: &CommonArgs) -> Result<()> {
     let kv_bytes = 2 * dims.num_layers * kv_cache_bytes_each(&dims, total_blocks, args.page_block);
 
     let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
-    println!("# capture-probe plan\n");
+    println!("# graph-harness plan\n");
     println!(
         "model: {} layers, hidden {}, {}q/{}kv heads, head_dim {}, ffn {}, vocab {}",
         dims.num_layers,
@@ -150,7 +150,7 @@ fn plan(args: &CommonArgs) -> Result<()> {
 #[allow(clippy::print_stdout)]
 fn run(args: RunArgs) -> Result<()> {
     let common = args.common;
-    let reports = harness::run(RunConfig {
+    let reports = runner::run(RunConfig {
         device_ordinal: args.device,
         layers: common.layers,
         buckets: common.buckets,

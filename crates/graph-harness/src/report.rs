@@ -107,7 +107,7 @@ fn fmt_bytes(bytes: Option<i64>) -> String {
 /// Renders the findings note. `header_lines` carries run metadata (device, dims, seed) the
 /// harness knows and this module does not.
 pub fn render_markdown(header_lines: &[String], reports: &[CellReport]) -> String {
-    let mut out = String::from("# #143 capture probe findings\n\n");
+    let mut out = String::from("# #143 graph harness findings\n\n");
     for line in header_lines {
         out.push_str(&format!("- {line}\n"));
     }

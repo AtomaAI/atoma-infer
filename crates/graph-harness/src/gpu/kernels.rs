@@ -1,9 +1,9 @@
-//! NVRTC compilation and raw launches of the throwaway probe kernels.
+//! NVRTC compilation and raw launches of the throwaway step kernels.
 //!
 //! Everything is raw (`sys::CUfunction`, `result::launch_kernel`) because the capture stream
 //! only exposes its raw handle: `CaptureStream`'s safe surface deliberately has no launch, and
 //! cudarc's safe launcher requires the `Arc<CudaStream>` it hides. How much raw plumbing this
-//! costs is itself a probe finding for the production executor API.
+//! costs is itself a harness finding for the production executor API.
 
 use std::ffi::{c_int, c_void, CString};
 
@@ -20,7 +20,7 @@ fn grid_1d(n: usize) -> u32 {
     u32::try_from(n.div_ceil(THREADS as usize)).expect("grid fits u32")
 }
 
-/// The NVRTC arch string for a compute capability, when it is one the probe knows; `None` falls
+/// The NVRTC arch string for a compute capability, when it is one the harness knows; `None` falls
 /// back to NVRTC's baseline PTX, which the driver JITs.
 fn arch_for(major: i32, minor: i32) -> Option<&'static str> {
     match (major, minor) {
@@ -32,9 +32,9 @@ fn arch_for(major: i32, minor: i32) -> Option<&'static str> {
     }
 }
 
-/// The compiled probe kernels. The module is never unloaded: captured graphs reference its
+/// The compiled step kernels. The module is never unloaded: captured graphs reference its
 /// functions for the process lifetime.
-pub struct ProbeKernels {
+pub struct StepKernels {
     fill_random_bf16: sys::CUfunction,
     embedding_gather: sys::CUfunction,
     rmsnorm_bf16: sys::CUfunction,
@@ -46,7 +46,7 @@ pub struct ProbeKernels {
     f32_to_bf16_arr: sys::CUfunction,
 }
 
-impl ProbeKernels {
+impl StepKernels {
     /// Compiles `kernels.cu` for the context's device and loads every kernel.
     pub fn compile_and_load(ctx: &RuntimeContext) -> Result<Self> {
         let (major, minor) = ctx
@@ -65,7 +65,7 @@ impl ProbeKernels {
             .bind_to_thread()
             .map_err(|e| anyhow!("binding context: {:?}", e.0))?;
         let module = unsafe { result::module::load_data(image.as_ptr().cast::<c_void>()) }
-            .map_err(|e| anyhow!("loading probe PTX module: {:?}", e.0))?;
+            .map_err(|e| anyhow!("loading step-kernel PTX module: {:?}", e.0))?;
 
         let function = |name: &str| -> Result<sys::CUfunction> {
             let c_name = CString::new(name).expect("kernel names have no NUL");

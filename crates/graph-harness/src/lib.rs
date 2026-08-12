@@ -1,4 +1,4 @@
-//! The #143 tensor-path capture probe: capture a full Llama-8B-shaped decode step with
+//! The #143 tensor-path graph harness: capture a full Llama-8B-shaped decode step with
 //! `atoma-runtime`, replay it against varying inputs, and compare bit-for-bit with the same ops
 //! run eagerly.
 //!
@@ -19,7 +19,7 @@
 //! | [`splits`] | The FA2 split-KV heuristic, precomputed so accumulators allocate pre-capture |
 //! | [`compare`] | Bit-identity comparison and bf16 divergence reporting |
 //! | [`report`] | Findings note: capture matrix table, timings, memory measurements |
-//! | [`gpu`] | Device harness: NVRTC kernels, cuBLAS, the step function, capture and replay |
+//! | [`gpu`] | Device runner: NVRTC kernels, cuBLAS, the step function, capture and replay |
 //! | [`fa2`] | Paged decode attention + KV write over the FA2 FFI (`cuda` feature only) |
 
 pub mod compare;

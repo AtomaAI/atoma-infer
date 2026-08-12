@@ -1,4 +1,4 @@
-// Throwaway naive kernels for the #143 capture probe: correctness only, no performance intent.
+// Throwaway naive kernels for the #143 graph harness: correctness only, no performance intent.
 // bf16 travels as raw u16 with explicit conversions so NVRTC needs no CUDA headers; every kernel
 // reduces in f32 with a fixed order, so eager and replayed launches are bit-identical.
 
@@ -10,8 +10,8 @@ __device__ __forceinline__ float bf16_to_f32(bf16_t x) {
     return __uint_as_float(((u32)x) << 16);
 }
 
-// Round-to-nearest-even, matching hardware bf16 conversion for the finite values the probe
-// generates (NaN payloads are not preserved; the probe never produces NaN on purpose).
+// Round-to-nearest-even, matching hardware bf16 conversion for the finite values the harness
+// generates (NaN payloads are not preserved; the harness never produces NaN on purpose).
 __device__ __forceinline__ bf16_t f32_to_bf16(float f) {
     u32 u = __float_as_uint(f);
     u32 bias = 0x7fffu + ((u >> 16) & 1u);
