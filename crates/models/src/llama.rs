@@ -811,7 +811,6 @@ mod tests {
             sequence_start_locations,
             sequence_lengths,
             block_tables,
-            false,
         )
         .expect("Failed to create `FlashAttentionMetadata` instance");
         let logits = llama_model.forward(
@@ -868,7 +867,6 @@ mod tests {
                 sequence_start_locations,
                 sequence_lengths,
                 block_tables,
-                false,
             )
             .expect("Failed to create the `FlashAttentionMetadata` instance");
             let logits = llama_model
@@ -1030,7 +1028,6 @@ mod tests {
             sequence_start_locations,
             sequence_lengths,
             block_tables,
-            false,
         )
         .expect("Failed to create `FlashAttentionMetadata` instance");
         let logits = llama_model.forward(
@@ -1104,7 +1101,6 @@ mod tests {
                 sequence_start_locations,
                 sequence_lengths,
                 block_tables,
-                false,
             )
             .expect("Failed to create the `FlashAttentionMetadata` instance");
             let logits = llama_model
@@ -1276,7 +1272,6 @@ mod tests {
             sequence_start_locations,
             sequence_lengths,
             block_tables,
-            false,
         )
         .expect("Failed to create `FlashAttentionMetadata` instance");
         let logits = llama_model.forward(
@@ -1350,7 +1345,6 @@ mod tests {
                 sequence_start_locations,
                 sequence_lengths,
                 block_tables,
-                false,
             )
             .expect("Failed to create the `FlashAttentionMetadata` instance");
             let logits = llama_model
