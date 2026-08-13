@@ -121,6 +121,20 @@ pub enum RuntimeError {
          choose a different output path"
     )]
     DotPrintPathHasNul,
+
+    #[error(
+        "NCCL call failed ({0:?}): the communicator could not be created or the collective was \
+         rejected; check rank and world_size, and that libnccl is loadable"
+    )]
+    #[cfg(feature = "nccl")]
+    Nccl(cudarc::nccl::sys::ncclResult_t),
+}
+
+#[cfg(feature = "nccl")]
+impl From<cudarc::nccl::result::NcclError> for RuntimeError {
+    fn from(err: cudarc::nccl::result::NcclError) -> Self {
+        Self::Nccl(err.0)
+    }
 }
 
 impl From<DriverError> for RuntimeError {
@@ -202,5 +216,16 @@ mod tests {
         // DriverError's own Display and Debug ask libcuda for the error string; ours must not.
         let unclassified = classified(CUresult::CUDA_ERROR_UNKNOWN);
         assert!(unclassified.to_string().contains("CUDA_ERROR_UNKNOWN"));
+    }
+
+    #[test]
+    #[cfg(feature = "nccl")]
+    fn nccl_errors_carry_the_raw_status_and_remediation() {
+        use cudarc::nccl::result::NcclError;
+        use cudarc::nccl::sys::ncclResult_t;
+
+        let err = RuntimeError::from(NcclError(ncclResult_t::ncclInvalidArgument));
+        assert!(err.to_string().contains("ncclInvalidArgument"));
+        assert!(err.to_string().contains("world_size"));
     }
 }

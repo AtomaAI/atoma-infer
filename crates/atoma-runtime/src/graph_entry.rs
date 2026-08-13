@@ -53,6 +53,13 @@ impl GraphEntry {
         self
     }
 
+    /// The communicator the captured collectives run on, for eager (non-replay) steps that must
+    /// issue the same collective outside the graph.
+    #[cfg(feature = "nccl")]
+    pub fn comm(&self) -> Option<&cudarc::nccl::Comm> {
+        self.comm.as_ref()
+    }
+
     /// The captured graph, for replay and the diagnostic wrappers.
     pub fn graph(&self) -> &CapturedGraph {
         &self.graph

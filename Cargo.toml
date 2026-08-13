@@ -6,6 +6,7 @@ members = [
     "crates/backends",
     "crates/backends/vllm",
     "crates/bench",
+    "crates/graph-harness",
     "crates/models",
 ]
 resolver = "2"

@@ -59,4 +59,27 @@ impl CaptureStream {
     pub(crate) fn cudarc_stream(&self) -> &Arc<CudaStream> {
         &self.stream
     }
+
+    /// Creates the NCCL communicator whose collectives enqueue on this capture stream, so an
+    /// all-reduce issued during capture is recorded into the graph instead of landing on a
+    /// foreign stream and invalidating the recording.
+    ///
+    /// Communicator creation allocates device memory, so it must happen strictly before the
+    /// first capture, like every other allocation. After capture, hand the communicator to
+    /// [`GraphEntry::with_comm`](crate::graph_entry::GraphEntry::with_comm) so teardown ordering
+    /// holds: abort blocks until no live graph references the communicator.
+    #[cfg(feature = "nccl")]
+    pub fn nccl_comm(
+        &self,
+        rank: usize,
+        world_size: usize,
+        id: cudarc::nccl::Id,
+    ) -> Result<cudarc::nccl::Comm, RuntimeError> {
+        Ok(cudarc::nccl::Comm::from_rank(
+            self.stream.clone(),
+            rank,
+            world_size,
+            id,
+        )?)
+    }
 }
