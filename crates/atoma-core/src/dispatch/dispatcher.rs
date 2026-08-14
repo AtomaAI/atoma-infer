@@ -72,24 +72,14 @@ impl Dispatcher {
         }
     }
 
-    /// Admits `batch` without counting: exactly one key, or exactly one rejection reason.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`RejectionReason`] naming the first failed admission check, carrying the
-    /// numbers that caused it.
-    pub fn admit(&self, batch: LiveBatch) -> Result<GraphKey, RejectionReason> {
-        admit(
+    /// Decides how `batch` runs, counting and logging the fallback when no graph serves it.
+    pub fn dispatch(&mut self, batch: LiveBatch) -> DispatchDecision {
+        match admit(
             batch,
             self.support_level,
             self.captured_max_requests,
             &self.lookup,
-        )
-    }
-
-    /// Decides how `batch` runs, counting and logging the fallback when no graph serves it.
-    pub fn dispatch(&mut self, batch: LiveBatch) -> DispatchDecision {
-        match self.admit(batch) {
+        ) {
             Ok(key) => match self.capture_kind {
                 CaptureKind::Full => DispatchDecision::FullReplay(key),
                 CaptureKind::Segmented => DispatchDecision::SegmentedReplay(key),
@@ -127,22 +117,23 @@ mod tests {
     #[test]
     fn full_captured_set_replays_fully_with_the_admitted_key() {
         let mut dispatcher = dispatcher(SupportLevel::Always, CaptureKind::Full);
-        let expected = dispatcher.admit(batch(5, 5, true)).unwrap();
-        assert_eq!(
-            dispatcher.dispatch(batch(5, 5, true)),
-            DispatchDecision::FullReplay(expected)
-        );
+        let DispatchDecision::FullReplay(key) = dispatcher.dispatch(batch(5, 5, true)) else {
+            panic!("a full captured set must replay fully");
+        };
+        assert_eq!(key.padded_token_count(), nonzero(8));
+        assert_eq!(key.request_count(), nonzero(5));
+        assert!(key.uniform_decode());
         assert_eq!(dispatcher.fallbacks(), EagerFallbackCounters::default());
     }
 
     #[test]
     fn segmented_captured_set_replays_segments_with_the_admitted_key() {
         let mut dispatcher = dispatcher(SupportLevel::Always, CaptureKind::Segmented);
-        let expected = dispatcher.admit(batch(5, 5, true)).unwrap();
-        assert_eq!(
-            dispatcher.dispatch(batch(5, 5, true)),
-            DispatchDecision::SegmentedReplay(expected)
-        );
+        let DispatchDecision::SegmentedReplay(key) = dispatcher.dispatch(batch(5, 5, true)) else {
+            panic!("a segmented captured set must replay segments");
+        };
+        assert_eq!(key.padded_token_count(), nonzero(8));
+        assert_eq!(key.request_count(), nonzero(5));
     }
 
     #[test]
