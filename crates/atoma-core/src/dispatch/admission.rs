@@ -2,6 +2,7 @@
 
 use std::num::NonZeroUsize;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::dispatch::{GraphKey, PaddingLookup};
@@ -18,7 +19,8 @@ pub struct LiveBatch {
 }
 
 /// The live batches a backend's captured routine is valid for, weakest to strongest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SupportLevel {
     /// The captured routine is never valid.
     Never,

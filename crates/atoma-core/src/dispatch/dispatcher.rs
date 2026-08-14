@@ -2,6 +2,7 @@
 
 use std::num::NonZeroUsize;
 
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::dispatch::{
@@ -10,7 +11,8 @@ use crate::dispatch::{
 };
 
 /// How the captured set was recorded: whole forward passes, or segments around eager regions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CaptureKind {
     /// Each bucket's graph records the whole forward pass.
     Full,
@@ -19,7 +21,8 @@ pub enum CaptureKind {
 }
 
 /// Everything the dispatcher is built from, fixed for the process lifetime.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DispatchConfig {
     /// The buckets the engine captured.
     pub bucket_ladder: BucketLadder,
@@ -146,6 +149,42 @@ mod tests {
                 bucket_ladder_maximum: Some(nonzero(512)),
             })
         );
+    }
+
+    #[test]
+    fn dispatch_config_round_trips_through_config_json() {
+        let config: DispatchConfig = serde_json::from_str(
+            r#"{
+                "bucket_ladder": [1, 2, 4, 8],
+                "captured_max_requests": 16,
+                "support_level": "uniform_single_token_decode",
+                "capture_kind": "full"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.bucket_ladder.buckets(), [1, 2, 4, 8]);
+        assert_eq!(config.captured_max_requests, nonzero(16));
+        assert_eq!(config.support_level, SupportLevel::UniformSingleTokenDecode);
+        assert_eq!(config.capture_kind, CaptureKind::Full);
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DispatchConfig>(&json).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn zero_captured_max_requests_is_rejected_in_config() {
+        let error = serde_json::from_str::<DispatchConfig>(
+            r#"{
+                "bucket_ladder": [1],
+                "captured_max_requests": 0,
+                "support_level": "always",
+                "capture_kind": "full"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("nonzero"));
     }
 
     #[test]
