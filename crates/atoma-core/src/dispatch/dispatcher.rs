@@ -19,7 +19,7 @@ pub enum CaptureKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchConfig {
     /// The buckets the engine captured.
-    pub ladder: BucketLadder,
+    pub bucket_ladder: BucketLadder,
     /// The largest request count any captured graph serves.
     pub captured_max_requests: usize,
     /// The minimum support level across the active backends, settled at startup.
@@ -42,8 +42,8 @@ pub enum DispatchDecision {
 /// Eager fallbacks so far, by rejection reason.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EagerFallbackCounters {
-    /// Batches whose token count exceeded the ladder maximum.
-    pub tokens_above_ladder_maximum: u64,
+    /// Batches whose token count exceeded the bucket-ladder maximum.
+    pub tokens_above_bucket_ladder_maximum: u64,
     /// Batches with more requests than any captured graph serves.
     pub requests_above_captured_maximum: u64,
     /// Batches the backends' declared support level could not serve.
@@ -55,11 +55,11 @@ pub struct EagerFallbackCounters {
 impl EagerFallbackCounters {
     fn count(&mut self, reason: &RejectionReason) {
         match reason {
-            RejectionReason::TokensAboveLadderMaximum {
+            RejectionReason::TokensAboveBucketLadderMaximum {
                 token_count: _,
-                ladder_maximum: _,
+                bucket_ladder_maximum: _,
             } => {
-                self.tokens_above_ladder_maximum += 1;
+                self.tokens_above_bucket_ladder_maximum += 1;
             }
             RejectionReason::RequestsAboveCapturedMaximum {
                 request_count: _,
@@ -87,11 +87,11 @@ impl EagerFallbackCounters {
 
 /// Owns dispatch truth: which captured graph serves a live batch, or why none does.
 ///
-/// Built once at startup and never modified afterwards — no method changes the ladder, the
-/// captured set or the support level, so no code path recaptures at runtime. Dispatch priority is
-/// full-graph replay, then segmented replay, then eager: an admitted batch replays the whole pass
-/// when the captured set records whole passes, replays segments when it is split, and every
-/// rejected batch runs eagerly.
+/// Built once at startup and never modified afterwards — no method changes the bucket ladder,
+/// the captured set or the support level, so no code path recaptures at runtime.
+/// Dispatch priority is full-graph replay, then segmented replay, then eager: an admitted batch
+/// replays the whole pass when the captured set records whole passes, replays segments when it is
+/// split, and every rejected batch runs eagerly.
 #[derive(Debug)]
 pub struct Dispatcher {
     lookup: PaddingLookup,
@@ -102,11 +102,12 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
-    /// Builds the dispatcher, deriving the dense padding lookup from the configured ladder.
+    /// Builds the dispatcher, deriving the dense padding lookup from the configured bucket
+    /// ladder.
     #[must_use]
     pub fn new(config: &DispatchConfig) -> Self {
         Self {
-            lookup: PaddingLookup::new(&config.ladder),
+            lookup: PaddingLookup::new(&config.bucket_ladder),
             captured_max_requests: config.captured_max_requests,
             support_level: config.support_level,
             capture_kind: config.capture_kind,
@@ -172,7 +173,7 @@ mod tests {
 
     fn dispatcher(support_level: SupportLevel, capture_kind: CaptureKind) -> Dispatcher {
         Dispatcher::new(&DispatchConfig {
-            ladder: BucketLadder::default_for(Platform::Hopper),
+            bucket_ladder: BucketLadder::default_for(Platform::Hopper),
             captured_max_requests: 512,
             support_level,
             capture_kind,
@@ -205,9 +206,9 @@ mod tests {
         let mut dispatcher = dispatcher(SupportLevel::Always, CaptureKind::Full);
         assert_eq!(
             dispatcher.dispatch(batch(600, 600, true)),
-            DispatchDecision::Eager(RejectionReason::TokensAboveLadderMaximum {
+            DispatchDecision::Eager(RejectionReason::TokensAboveBucketLadderMaximum {
                 token_count: count(600),
-                ladder_maximum: 512,
+                bucket_ladder_maximum: 512,
             })
         );
     }
@@ -224,7 +225,7 @@ mod tests {
         assert_eq!(
             full_support.fallbacks(),
             EagerFallbackCounters {
-                tokens_above_ladder_maximum: 2,
+                tokens_above_bucket_ladder_maximum: 2,
                 requests_above_captured_maximum: 1,
                 support_level_insufficient: 0,
                 not_uniform_decode: 1,

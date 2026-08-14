@@ -34,12 +34,14 @@ pub enum SupportLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum RejectionReason {
     /// No bucket holds this many tokens.
-    #[error("token count {token_count} is above the ladder maximum {ladder_maximum}")]
-    TokensAboveLadderMaximum {
+    #[error(
+        "token count {token_count} is above the bucket-ladder maximum {bucket_ladder_maximum}"
+    )]
+    TokensAboveBucketLadderMaximum {
         /// Tokens in the rejected batch before padding.
         token_count: NonZeroUsize,
-        /// The largest captured bucket; zero for an empty ladder.
-        ladder_maximum: usize,
+        /// The largest captured bucket; zero for an empty bucket ladder.
+        bucket_ladder_maximum: usize,
     },
     /// More live requests than any captured graph was built to serve.
     #[error("request count {request_count} is above the captured maximum {captured_maximum}")]
@@ -77,9 +79,9 @@ pub enum RejectionReason {
 /// Admits `batch` to exactly one graph key, or rejects it for exactly one reason.
 ///
 /// Checks run in a fixed order, so a batch failing several lands on the first: token count
-/// against the ladder, request count against the captured maximum, uniform decode, then backend
-/// support level against the batch shape. Uniform decode comes before support so a rejection
-/// never names a support gap that closing would not actually fix.
+/// against the bucket ladder, request count against the captured maximum, uniform decode,
+/// then backend support level against the batch shape. Uniform decode comes before support so a
+/// rejection never names a support gap that closing would not actually fix.
 ///
 /// # Errors
 ///
@@ -92,9 +94,9 @@ pub fn admit(
     lookup: &PaddingLookup,
 ) -> Result<GraphKey, RejectionReason> {
     let Some(padded_token_count) = lookup.bucket_for(batch.token_count) else {
-        return Err(RejectionReason::TokensAboveLadderMaximum {
+        return Err(RejectionReason::TokensAboveBucketLadderMaximum {
             token_count: batch.token_count,
-            ladder_maximum: lookup.ladder_maximum(),
+            bucket_ladder_maximum: lookup.bucket_ladder_maximum(),
         });
     };
     if batch.request_count.get() > captured_max_requests {
@@ -184,15 +186,15 @@ mod tests {
     }
 
     #[test]
-    fn ladder_boundary_admits_exactly_and_rejects_one_past() {
+    fn bucket_ladder_boundary_admits_exactly_and_rejects_one_past() {
         let lookup = hopper_lookup();
         let at_max = admit(batch(512, 512, true), SupportLevel::Always, 512, &lookup).unwrap();
         assert_eq!(at_max.padded_token_count(), count(512));
         assert_eq!(
             admit(batch(513, 513, true), SupportLevel::Always, 1024, &lookup),
-            Err(RejectionReason::TokensAboveLadderMaximum {
+            Err(RejectionReason::TokensAboveBucketLadderMaximum {
                 token_count: count(513),
-                ladder_maximum: 512,
+                bucket_ladder_maximum: 512,
             })
         );
     }
@@ -291,7 +293,7 @@ mod tests {
 
     #[test]
     fn batch_failing_every_check_lands_on_the_first_reason() {
-        // Above the ladder, above the captured maximum, unsupported and not uniform.
+        // Above the bucket ladder, above the captured maximum, unsupported and not uniform.
         assert_eq!(
             admit(
                 batch(600, 600, false),
@@ -299,21 +301,21 @@ mod tests {
                 4,
                 &hopper_lookup()
             ),
-            Err(RejectionReason::TokensAboveLadderMaximum {
+            Err(RejectionReason::TokensAboveBucketLadderMaximum {
                 token_count: count(600),
-                ladder_maximum: 512,
+                bucket_ladder_maximum: 512,
             })
         );
     }
 
     #[test]
-    fn empty_ladder_rejects_everything_with_zero_maximum() {
+    fn empty_bucket_ladder_rejects_everything_with_zero_maximum() {
         let lookup = PaddingLookup::new(&BucketLadder::new(Vec::new()).unwrap());
         assert_eq!(
             admit(batch(1, 1, true), SupportLevel::Always, 512, &lookup),
-            Err(RejectionReason::TokensAboveLadderMaximum {
+            Err(RejectionReason::TokensAboveBucketLadderMaximum {
                 token_count: count(1),
-                ladder_maximum: 0,
+                bucket_ladder_maximum: 0,
             })
         );
     }
@@ -329,7 +331,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             reason.to_string(),
-            "token count 600 is above the ladder maximum 512"
+            "token count 600 is above the bucket-ladder maximum 512"
         );
     }
 

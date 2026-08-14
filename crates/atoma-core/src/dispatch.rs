@@ -7,15 +7,15 @@
 //! then eager.
 
 mod admission;
+mod bucket_ladder;
 mod dispatcher;
 mod key;
-mod ladder;
 mod lookup;
 
 pub use admission::{admit, BatchShape, RejectionReason, SupportLevel};
+pub use bucket_ladder::{BucketLadder, BucketLadderError, Platform};
 pub use dispatcher::{
     CaptureKind, DispatchConfig, DispatchDecision, Dispatcher, EagerFallbackCounters,
 };
 pub use key::GraphKey;
-pub use ladder::{BucketLadder, LadderError, Platform};
 pub use lookup::PaddingLookup;

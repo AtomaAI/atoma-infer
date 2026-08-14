@@ -7,24 +7,24 @@ use crate::dispatch::BucketLadder;
 /// Maps every token count in range to the next captured bucket — the smallest bucket that holds
 /// at least that many tokens.
 ///
-/// Built once from the bucket ladder as a dense table, so a lookup on the step path is one bounds
-/// check and one load.
+/// Built once from the bucket ladder as a dense table, so a lookup on the step path is one
+/// bounds check and one load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaddingLookup {
-    /// `next_bucket[tokens]` is the smallest bucket holding `tokens`, for counts up to the ladder
-    /// maximum.
+    /// `next_bucket[tokens]` is the smallest bucket holding `tokens`, for counts up to the
+    /// bucket-ladder maximum.
     next_bucket: Box<[Option<NonZeroUsize>]>,
-    ladder_maximum: usize,
+    bucket_ladder_maximum: usize,
 }
 
 impl PaddingLookup {
-    /// Builds the dense table for `ladder`.
+    /// Builds the dense table for `bucket_ladder`.
     #[must_use]
-    pub fn new(ladder: &BucketLadder) -> Self {
-        let ladder_maximum = ladder.maximum();
-        let next_bucket = (0..=ladder_maximum)
+    pub fn new(bucket_ladder: &BucketLadder) -> Self {
+        let bucket_ladder_maximum = bucket_ladder.maximum();
+        let next_bucket = (0..=bucket_ladder_maximum)
             .map(|tokens| {
-                let smallest_holding = ladder
+                let smallest_holding = bucket_ladder
                     .buckets()
                     .iter()
                     .copied()
@@ -35,7 +35,7 @@ impl PaddingLookup {
             .collect();
         Self {
             next_bucket,
-            ladder_maximum,
+            bucket_ladder_maximum,
         }
     }
 
@@ -45,10 +45,11 @@ impl PaddingLookup {
         self.next_bucket.get(tokens.get()).copied().flatten()
     }
 
-    /// The largest bucket in the ladder this lookup was built from; zero for an empty ladder.
+    /// The largest bucket in the bucket ladder this lookup was built from; zero for an empty
+    /// bucket ladder.
     #[must_use]
-    pub fn ladder_maximum(&self) -> usize {
-        self.ladder_maximum
+    pub fn bucket_ladder_maximum(&self) -> usize {
+        self.bucket_ladder_maximum
     }
 }
 
@@ -66,8 +67,8 @@ mod tests {
     }
 
     /// Test-side oracle: linear scan for the smallest bucket holding `count`.
-    fn naive_next_bucket(ladder: &BucketLadder, count: usize) -> Option<usize> {
-        ladder
+    fn naive_next_bucket(bucket_ladder: &BucketLadder, count: usize) -> Option<usize> {
+        bucket_ladder
             .buckets()
             .iter()
             .copied()
@@ -76,11 +77,11 @@ mod tests {
     }
 
     #[test]
-    fn every_bucket_edge_maps_exactly_for_both_default_ladders() {
+    fn every_bucket_edge_maps_exactly_for_both_default_bucket_ladders() {
         for platform in [Platform::Hopper, Platform::DataCenterBlackwell] {
-            let ladder = BucketLadder::default_for(platform);
-            let lookup = PaddingLookup::new(&ladder);
-            for &bucket in ladder.buckets() {
+            let bucket_ladder = BucketLadder::default_for(platform);
+            let lookup = PaddingLookup::new(&bucket_ladder);
+            for &bucket in bucket_ladder.buckets() {
                 // A bucket-sized batch pads to exactly its own bucket.
                 assert_eq!(
                     lookup.bucket_for(tokens(bucket)).map(NonZeroUsize::get),
@@ -89,7 +90,7 @@ mod tests {
                 // One past a bucket pads to the next bucket up, or to nothing at the top.
                 assert_eq!(
                     lookup.bucket_for(tokens(bucket + 1)).map(NonZeroUsize::get),
-                    naive_next_bucket(&ladder, bucket + 1)
+                    naive_next_bucket(&bucket_ladder, bucket + 1)
                 );
                 // One short of a bucket never overshoots it.
                 if bucket > 1 {
@@ -125,9 +126,9 @@ mod tests {
     }
 
     #[test]
-    fn unsorted_ladder_with_duplicates_maps_between_entries() {
-        let ladder = BucketLadder::new(vec![64, 8, 8, 32]).unwrap();
-        let lookup = PaddingLookup::new(&ladder);
+    fn unsorted_bucket_ladder_with_duplicates_maps_between_entries() {
+        let bucket_ladder = BucketLadder::new(vec![64, 8, 8, 32]).unwrap();
+        let lookup = PaddingLookup::new(&bucket_ladder);
         assert_eq!(lookup.bucket_for(tokens(1)).map(NonZeroUsize::get), Some(8));
         assert_eq!(lookup.bucket_for(tokens(8)).map(NonZeroUsize::get), Some(8));
         assert_eq!(
@@ -143,15 +144,15 @@ mod tests {
             Some(64)
         );
         assert_eq!(lookup.bucket_for(tokens(65)), None);
-        assert_eq!(lookup.ladder_maximum(), 64);
+        assert_eq!(lookup.bucket_ladder_maximum(), 64);
     }
 
     #[test]
-    fn empty_ladder_serves_nothing() {
-        let ladder = BucketLadder::new(Vec::new()).unwrap();
-        let lookup = PaddingLookup::new(&ladder);
+    fn empty_bucket_ladder_serves_nothing() {
+        let bucket_ladder = BucketLadder::new(Vec::new()).unwrap();
+        let lookup = PaddingLookup::new(&bucket_ladder);
         assert_eq!(lookup.bucket_for(tokens(1)), None);
-        assert_eq!(lookup.ladder_maximum(), 0);
+        assert_eq!(lookup.bucket_ladder_maximum(), 0);
     }
 
     proptest! {
@@ -160,11 +161,11 @@ mod tests {
             buckets in proptest::collection::vec(1_usize..=256, 0..=24),
             count in 1_usize..=300,
         ) {
-            let ladder = BucketLadder::new(buckets).expect("nonzero buckets are always valid");
-            let lookup = PaddingLookup::new(&ladder);
+            let bucket_ladder = BucketLadder::new(buckets).expect("nonzero buckets are always valid");
+            let lookup = PaddingLookup::new(&bucket_ladder);
             prop_assert_eq!(
                 lookup.bucket_for(tokens(count)).map(NonZeroUsize::get),
-                naive_next_bucket(&ladder, count)
+                naive_next_bucket(&bucket_ladder, count)
             );
         }
     }
