@@ -136,6 +136,9 @@ impl EagerFallbackCounters {
 /// then backend support level against the live batch. Uniform decode comes before support so a
 /// rejection never names a support gap that closing would not actually fix.
 ///
+/// The uniform-decode check trusts no flag alone: a token count that does not divide evenly
+/// among the requests cannot be uniform decode, so such a batch is rejected whatever it claims.
+///
 /// # Errors
 ///
 /// Returns the [`RejectionReason`] naming the first failed check, carrying the numbers that
@@ -158,7 +161,7 @@ pub(crate) fn admit(
             captured_maximum: captured_max_requests,
         });
     }
-    if !batch.uniform_decode {
+    if !batch.uniform_decode || batch.token_count.get() % batch.request_count.get() != 0 {
         return Err(RejectionReason::NotUniformDecode {
             token_count: batch.token_count,
             request_count: batch.request_count,
@@ -382,6 +385,27 @@ mod tests {
                 request_count: nonzero(4),
             })
         );
+    }
+
+    #[test]
+    fn tokens_that_cannot_divide_evenly_are_rejected_as_not_uniform() {
+        // Five tokens over two requests, or two tokens over four, cannot be uniform decode
+        // whatever the flag claims.
+        let lookup = hopper_lookup();
+        for (token_count, request_count) in [(5, 2), (2, 4)] {
+            assert_eq!(
+                admit(
+                    batch(token_count, request_count, true),
+                    SupportLevel::Always,
+                    nonzero(512),
+                    &lookup
+                ),
+                Err(RejectionReason::NotUniformDecode {
+                    token_count: nonzero(token_count),
+                    request_count: nonzero(request_count),
+                })
+            );
+        }
     }
 
     #[test]
