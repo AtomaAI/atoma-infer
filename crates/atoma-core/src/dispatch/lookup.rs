@@ -57,22 +57,20 @@ impl PaddingLookup {
 mod tests {
     use std::num::NonZeroUsize;
 
+    use proptest::collection::vec;
     use proptest::prelude::*;
 
     use super::PaddingLookup;
+    use crate::dispatch::test_support::count;
     use crate::dispatch::{BucketLadder, Platform};
 
-    fn tokens(count: usize) -> NonZeroUsize {
-        NonZeroUsize::new(count).expect("test token counts are nonzero")
-    }
-
-    /// Test-side oracle: linear scan for the smallest bucket holding `count`.
-    fn naive_next_bucket(bucket_ladder: &BucketLadder, count: usize) -> Option<usize> {
+    /// Test-side oracle: linear scan for the smallest bucket holding `token_count`.
+    fn naive_next_bucket(bucket_ladder: &BucketLadder, token_count: usize) -> Option<usize> {
         bucket_ladder
             .buckets()
             .iter()
             .copied()
-            .filter(|&bucket| bucket >= count)
+            .filter(|&bucket| bucket >= token_count)
             .min()
     }
 
@@ -84,17 +82,17 @@ mod tests {
             for &bucket in bucket_ladder.buckets() {
                 // A bucket-sized batch pads to exactly its own bucket.
                 assert_eq!(
-                    lookup.bucket_for(tokens(bucket)).map(NonZeroUsize::get),
+                    lookup.bucket_for(count(bucket)).map(NonZeroUsize::get),
                     Some(bucket)
                 );
                 // One past a bucket pads to the next bucket up, or to nothing at the top.
                 assert_eq!(
-                    lookup.bucket_for(tokens(bucket + 1)).map(NonZeroUsize::get),
+                    lookup.bucket_for(count(bucket + 1)).map(NonZeroUsize::get),
                     naive_next_bucket(&bucket_ladder, bucket + 1)
                 );
                 // One short of a bucket never overshoots it.
                 if bucket > 1 {
-                    let below = lookup.bucket_for(tokens(bucket - 1)).map(NonZeroUsize::get);
+                    let below = lookup.bucket_for(count(bucket - 1)).map(NonZeroUsize::get);
                     assert!(below.expect("below the maximum, so in range") <= bucket);
                 }
             }
@@ -116,11 +114,11 @@ mod tests {
             (512, Some(512)),
             (513, None),
         ];
-        for (count, expected) in cases {
+        for (token_count, expected) in cases {
             assert_eq!(
-                lookup.bucket_for(tokens(count)).map(NonZeroUsize::get),
+                lookup.bucket_for(count(token_count)).map(NonZeroUsize::get),
                 expected,
-                "token count {count}"
+                "token count {token_count}"
             );
         }
     }
@@ -129,21 +127,18 @@ mod tests {
     fn unsorted_bucket_ladder_with_duplicates_maps_between_entries() {
         let bucket_ladder = BucketLadder::new(vec![64, 8, 8, 32]).unwrap();
         let lookup = PaddingLookup::new(&bucket_ladder);
-        assert_eq!(lookup.bucket_for(tokens(1)).map(NonZeroUsize::get), Some(8));
-        assert_eq!(lookup.bucket_for(tokens(8)).map(NonZeroUsize::get), Some(8));
+        assert_eq!(lookup.bucket_for(count(1)).map(NonZeroUsize::get), Some(8));
+        assert_eq!(lookup.bucket_for(count(8)).map(NonZeroUsize::get), Some(8));
+        assert_eq!(lookup.bucket_for(count(9)).map(NonZeroUsize::get), Some(32));
         assert_eq!(
-            lookup.bucket_for(tokens(9)).map(NonZeroUsize::get),
-            Some(32)
-        );
-        assert_eq!(
-            lookup.bucket_for(tokens(33)).map(NonZeroUsize::get),
+            lookup.bucket_for(count(33)).map(NonZeroUsize::get),
             Some(64)
         );
         assert_eq!(
-            lookup.bucket_for(tokens(64)).map(NonZeroUsize::get),
+            lookup.bucket_for(count(64)).map(NonZeroUsize::get),
             Some(64)
         );
-        assert_eq!(lookup.bucket_for(tokens(65)), None);
+        assert_eq!(lookup.bucket_for(count(65)), None);
         assert_eq!(lookup.bucket_ladder_maximum(), 64);
     }
 
@@ -151,21 +146,21 @@ mod tests {
     fn empty_bucket_ladder_serves_nothing() {
         let bucket_ladder = BucketLadder::new(Vec::new()).unwrap();
         let lookup = PaddingLookup::new(&bucket_ladder);
-        assert_eq!(lookup.bucket_for(tokens(1)), None);
+        assert_eq!(lookup.bucket_for(count(1)), None);
         assert_eq!(lookup.bucket_ladder_maximum(), 0);
     }
 
     proptest! {
         #[test]
         fn dense_table_agrees_with_naive_scan(
-            buckets in proptest::collection::vec(1_usize..=256, 0..=24),
-            count in 1_usize..=300,
+            buckets in vec(1_usize..=256, 0..=24),
+            token_count in 1_usize..=300,
         ) {
             let bucket_ladder = BucketLadder::new(buckets).expect("nonzero buckets are always valid");
             let lookup = PaddingLookup::new(&bucket_ladder);
             prop_assert_eq!(
-                lookup.bucket_for(tokens(count)).map(NonZeroUsize::get),
-                naive_next_bucket(&bucket_ladder, count)
+                lookup.bucket_for(count(token_count)).map(NonZeroUsize::get),
+                naive_next_bucket(&bucket_ladder, token_count)
             );
         }
     }

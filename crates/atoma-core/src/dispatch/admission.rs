@@ -144,22 +144,9 @@ fn required_support(batch: BatchShape) -> SupportLevel {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-
-    use super::{admit, BatchShape, RejectionReason, SupportLevel};
+    use super::{admit, RejectionReason, SupportLevel};
+    use crate::dispatch::test_support::{batch, count};
     use crate::dispatch::{BucketLadder, PaddingLookup, Platform};
-
-    fn count(value: usize) -> NonZeroUsize {
-        NonZeroUsize::new(value).expect("test counts are nonzero")
-    }
-
-    fn batch(token_count: usize, request_count: usize, uniform_decode: bool) -> BatchShape {
-        BatchShape {
-            token_count: count(token_count),
-            request_count: count(request_count),
-            uniform_decode,
-        }
-    }
 
     fn hopper_lookup() -> PaddingLookup {
         PaddingLookup::new(&BucketLadder::default_for(Platform::Hopper))

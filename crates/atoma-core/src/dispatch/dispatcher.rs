@@ -154,22 +154,9 @@ impl Dispatcher {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-
     use super::{CaptureKind, DispatchConfig, DispatchDecision, Dispatcher, EagerFallbackCounters};
-    use crate::dispatch::{BatchShape, BucketLadder, Platform, RejectionReason, SupportLevel};
-
-    fn count(value: usize) -> NonZeroUsize {
-        NonZeroUsize::new(value).expect("test counts are nonzero")
-    }
-
-    fn batch(token_count: usize, request_count: usize, uniform_decode: bool) -> BatchShape {
-        BatchShape {
-            token_count: count(token_count),
-            request_count: count(request_count),
-            uniform_decode,
-        }
-    }
+    use crate::dispatch::test_support::{batch, count};
+    use crate::dispatch::{BucketLadder, Platform, RejectionReason, SupportLevel};
 
     fn dispatcher(support_level: SupportLevel, capture_kind: CaptureKind) -> Dispatcher {
         Dispatcher::new(&DispatchConfig {

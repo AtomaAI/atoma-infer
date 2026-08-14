@@ -20,3 +20,26 @@ pub use dispatcher::{
 };
 pub use key::GraphKey;
 pub use lookup::PaddingLookup;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::num::NonZeroUsize;
+
+    use crate::dispatch::BatchShape;
+
+    pub(crate) fn count(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).expect("test counts are nonzero")
+    }
+
+    pub(crate) fn batch(
+        token_count: usize,
+        request_count: usize,
+        uniform_decode: bool,
+    ) -> BatchShape {
+        BatchShape {
+            token_count: count(token_count),
+            request_count: count(request_count),
+            uniform_decode,
+        }
+    }
+}
