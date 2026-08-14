@@ -77,8 +77,9 @@ pub enum RejectionReason {
 /// Admits `batch` to exactly one graph key, or rejects it for exactly one reason.
 ///
 /// Checks run in a fixed order, so a batch failing several lands on the first: token count
-/// against the ladder, request count against the captured maximum, backend support level against
-/// the batch shape, then uniform decode.
+/// against the ladder, request count against the captured maximum, uniform decode, then backend
+/// support level against the batch shape. Uniform decode comes before support so a rejection
+/// never names a support gap that closing would not actually fix.
 ///
 /// # Errors
 ///
@@ -102,17 +103,17 @@ pub fn admit(
             captured_maximum: captured_max_requests,
         });
     }
+    if !batch.uniform_decode {
+        return Err(RejectionReason::NotUniformDecode {
+            token_count: batch.token_count,
+            request_count: batch.request_count,
+        });
+    }
     let required = required_support(batch);
     if support_level < required {
         return Err(RejectionReason::SupportLevelInsufficient {
             support_level,
             required,
-            token_count: batch.token_count,
-            request_count: batch.request_count,
-        });
-    }
-    if !batch.uniform_decode {
-        return Err(RejectionReason::NotUniformDecode {
             token_count: batch.token_count,
             request_count: batch.request_count,
         });
@@ -124,11 +125,12 @@ pub fn admit(
     ))
 }
 
-/// The weakest support level whose captured routine is valid for `batch`.
+/// The weakest support level whose captured routine is valid for a uniform-decode `batch`.
+///
+/// Non-uniform batches are rejected before support is judged, so no batch ever requires
+/// [`SupportLevel::Always`] here.
 fn required_support(batch: BatchShape) -> SupportLevel {
-    if !batch.uniform_decode {
-        SupportLevel::Always
-    } else if batch.token_count == batch.request_count {
+    if batch.token_count == batch.request_count {
         SupportLevel::UniformSingleTokenDecode
     } else {
         SupportLevel::UniformBatch
@@ -270,7 +272,9 @@ mod tests {
     }
 
     #[test]
-    fn non_uniform_batch_without_full_support_names_the_support_gap_first() {
+    fn non_uniform_batch_is_rejected_as_not_uniform_regardless_of_support() {
+        // Not a support gap: no support level admits a non-uniform batch, so the reason must
+        // name the uniformity, not a level that closing would not fix.
         assert_eq!(
             admit(
                 batch(16, 4, false),
@@ -278,9 +282,7 @@ mod tests {
                 512,
                 &hopper_lookup()
             ),
-            Err(RejectionReason::SupportLevelInsufficient {
-                support_level: SupportLevel::UniformBatch,
-                required: SupportLevel::Always,
+            Err(RejectionReason::NotUniformDecode {
                 token_count: count(16),
                 request_count: count(4),
             })
