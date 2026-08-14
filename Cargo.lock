@@ -182,6 +182,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atoma-core"
+version = "0.1.0"
+
+[[package]]
 name = "atoma-kernels"
 version = "0.1.0"
 dependencies = [
