@@ -13,7 +13,7 @@ mod key;
 mod lookup;
 
 pub(crate) use admission::admit;
-pub use admission::{BatchShape, RejectionReason, SupportLevel};
+pub use admission::{LiveBatch, RejectionReason, SupportLevel};
 pub use bucket_ladder::{BucketLadder, BucketLadderError, Platform};
 pub use dispatcher::{
     CaptureKind, DispatchConfig, DispatchDecision, Dispatcher, EagerFallbackCounters,
@@ -25,7 +25,7 @@ pub use lookup::PaddingLookup;
 pub(crate) mod test_support {
     use std::num::NonZeroUsize;
 
-    use crate::dispatch::BatchShape;
+    use crate::dispatch::LiveBatch;
 
     pub(crate) fn count(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("test counts are nonzero")
@@ -35,8 +35,8 @@ pub(crate) mod test_support {
         token_count: usize,
         request_count: usize,
         uniform_decode: bool,
-    ) -> BatchShape {
-        BatchShape {
+    ) -> LiveBatch {
+        LiveBatch {
             token_count: count(token_count),
             request_count: count(request_count),
             uniform_decode,

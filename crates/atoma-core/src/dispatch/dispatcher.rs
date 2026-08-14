@@ -3,7 +3,7 @@
 use tracing::debug;
 
 use crate::dispatch::{
-    admit, BatchShape, BucketLadder, GraphKey, PaddingLookup, RejectionReason, SupportLevel,
+    admit, BucketLadder, GraphKey, LiveBatch, PaddingLookup, RejectionReason, SupportLevel,
 };
 
 /// How the captured set was recorded: whole forward passes, or segments around eager regions.
@@ -121,7 +121,7 @@ impl Dispatcher {
     ///
     /// Returns the [`RejectionReason`] naming the first failed admission check, carrying the
     /// numbers that caused it.
-    pub fn admit(&self, batch: BatchShape) -> Result<GraphKey, RejectionReason> {
+    pub fn admit(&self, batch: LiveBatch) -> Result<GraphKey, RejectionReason> {
         admit(
             batch,
             self.support_level,
@@ -131,7 +131,7 @@ impl Dispatcher {
     }
 
     /// Decides how `batch` runs, counting and logging the fallback when no graph serves it.
-    pub fn dispatch(&mut self, batch: BatchShape) -> DispatchDecision {
+    pub fn dispatch(&mut self, batch: LiveBatch) -> DispatchDecision {
         match self.admit(batch) {
             Ok(key) => match self.capture_kind {
                 CaptureKind::Full => DispatchDecision::FullReplay(key),

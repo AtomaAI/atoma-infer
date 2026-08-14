@@ -8,7 +8,7 @@ use crate::dispatch::{GraphKey, PaddingLookup};
 
 /// What the scheduler reports about the live batch it wants served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BatchShape {
+pub struct LiveBatch {
     /// Tokens in the batch before padding.
     pub token_count: NonZeroUsize,
     /// Live requests in the batch.
@@ -17,7 +17,7 @@ pub struct BatchShape {
     pub uniform_decode: bool,
 }
 
-/// The batch shapes a backend's captured routine is valid for, weakest to strongest.
+/// The live batches a backend's captured routine is valid for, weakest to strongest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SupportLevel {
     /// The captured routine is never valid.
@@ -26,7 +26,7 @@ pub enum SupportLevel {
     UniformSingleTokenDecode,
     /// Valid for any uniform batch.
     UniformBatch,
-    /// Valid for any batch shape.
+    /// Valid for any live batch.
     Always,
 }
 
@@ -51,7 +51,7 @@ pub enum RejectionReason {
         /// The largest request count any captured graph serves.
         captured_maximum: usize,
     },
-    /// The backends' captured routines are not valid for this batch shape.
+    /// The backends' captured routines are not valid for this live batch.
     #[error(
         "backend support level {support_level:?} is insufficient for a batch of {token_count} \
          tokens over {request_count} requests, which requires {required:?}"
@@ -83,7 +83,7 @@ pub enum RejectionReason {
 ///
 /// Checks run in a fixed order, so a batch failing several lands on the first: token count
 /// against the bucket ladder, request count against the captured maximum, uniform decode,
-/// then backend support level against the batch shape. Uniform decode comes before support so a
+/// then backend support level against the live batch. Uniform decode comes before support so a
 /// rejection never names a support gap that closing would not actually fix.
 ///
 /// # Errors
@@ -91,7 +91,7 @@ pub enum RejectionReason {
 /// Returns the [`RejectionReason`] naming the first failed check, carrying the numbers that
 /// caused it.
 pub(crate) fn admit(
-    batch: BatchShape,
+    batch: LiveBatch,
     support_level: SupportLevel,
     captured_max_requests: usize,
     lookup: &PaddingLookup,
@@ -134,7 +134,7 @@ pub(crate) fn admit(
 ///
 /// Non-uniform batches are rejected before support is judged, so no batch ever requires
 /// [`SupportLevel::Always`] here.
-fn required_support(batch: BatchShape) -> SupportLevel {
+fn required_support(batch: LiveBatch) -> SupportLevel {
     if batch.token_count == batch.request_count {
         SupportLevel::UniformSingleTokenDecode
     } else {
