@@ -13,11 +13,9 @@ mod key;
 mod lookup;
 
 pub(crate) use admission::admit;
-pub use admission::{LiveBatch, RejectionReason, SupportLevel};
+pub use admission::{EagerFallbackCounters, LiveBatch, RejectionReason, SupportLevel};
 pub use bucket_ladder::{BucketLadder, BucketLadderError, Platform};
-pub use dispatcher::{
-    CaptureKind, DispatchConfig, DispatchDecision, Dispatcher, EagerFallbackCounters,
-};
+pub use dispatcher::{CaptureKind, DispatchConfig, DispatchDecision, Dispatcher};
 pub use key::GraphKey;
 pub use lookup::PaddingLookup;
 

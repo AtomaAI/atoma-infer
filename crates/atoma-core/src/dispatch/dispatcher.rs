@@ -5,7 +5,8 @@ use std::num::NonZeroUsize;
 use tracing::debug;
 
 use crate::dispatch::{
-    admit, BucketLadder, GraphKey, LiveBatch, PaddingLookup, RejectionReason, SupportLevel,
+    admit, BucketLadder, EagerFallbackCounters, GraphKey, LiveBatch, PaddingLookup,
+    RejectionReason, SupportLevel,
 };
 
 /// How the captured set was recorded: whole forward passes, or segments around eager regions.
@@ -39,52 +40,6 @@ pub enum DispatchDecision {
     SegmentedReplay(GraphKey),
     /// Run the whole step eagerly.
     Eager(RejectionReason),
-}
-
-/// Eager fallbacks so far, by rejection reason.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct EagerFallbackCounters {
-    /// Batches whose token count exceeded the bucket-ladder maximum.
-    pub tokens_above_bucket_ladder_maximum: u64,
-    /// Batches with more requests than any captured graph serves.
-    pub requests_above_captured_maximum: u64,
-    /// Batches the backends' declared support level could not serve.
-    pub support_level_insufficient: u64,
-    /// Batches that were not uniform decode.
-    pub not_uniform_decode: u64,
-}
-
-impl EagerFallbackCounters {
-    fn count(&mut self, reason: &RejectionReason) {
-        match reason {
-            RejectionReason::TokensAboveBucketLadderMaximum {
-                token_count: _,
-                bucket_ladder_maximum: _,
-            } => {
-                self.tokens_above_bucket_ladder_maximum += 1;
-            }
-            RejectionReason::RequestsAboveCapturedMaximum {
-                request_count: _,
-                captured_maximum: _,
-            } => {
-                self.requests_above_captured_maximum += 1;
-            }
-            RejectionReason::SupportLevelInsufficient {
-                support_level: _,
-                required: _,
-                token_count: _,
-                request_count: _,
-            } => {
-                self.support_level_insufficient += 1;
-            }
-            RejectionReason::NotUniformDecode {
-                token_count: _,
-                request_count: _,
-            } => {
-                self.not_uniform_decode += 1;
-            }
-        }
-    }
 }
 
 /// Owns dispatch truth: which captured graph serves a live batch, or why none does.
