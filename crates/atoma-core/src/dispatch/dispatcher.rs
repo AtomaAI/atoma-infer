@@ -104,9 +104,46 @@ impl Dispatcher {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tracing::subscriber::set_global_default;
+    use tracing::Level;
+
     use super::{CaptureKind, DispatchConfig, DispatchDecision, Dispatcher, EagerFallbackCounters};
     use crate::dispatch::test_support::{batch, nonzero};
     use crate::dispatch::{BucketLadder, Platform, RejectionReason, SupportLevel};
+
+    /// Log output collected behind the process-global subscriber.
+    ///
+    /// A thread-scoped subscriber is unreliable here: with a single registered dispatcher,
+    /// tracing computes a callsite's cached interest on whichever thread first hits it, and a
+    /// sibling test's thread without a subscriber caches a no-op interest for everyone. The
+    /// global subscriber sees every test's events, so assertions must match on batch numbers
+    /// unique to their own test.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().expect("log capture lock").clone();
+            String::from_utf8(bytes).expect("log output is utf-8")
+        }
+    }
+
+    impl Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn dispatcher(support_level: SupportLevel, capture_kind: CaptureKind) -> Dispatcher {
         Dispatcher::new(&DispatchConfig {
@@ -148,6 +185,43 @@ mod tests {
                 token_count: nonzero(600),
                 bucket_ladder_maximum: Some(nonzero(512)),
             })
+        );
+    }
+
+    fn captured_log() -> &'static CapturedLog {
+        static LOG: OnceLock<CapturedLog> = OnceLock::new();
+        LOG.get_or_init(|| {
+            let log = CapturedLog::default();
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(Level::DEBUG)
+                .with_writer(move || writer.clone())
+                .finish();
+            set_global_default(subscriber).expect("no other test installs a subscriber");
+            log
+        })
+    }
+
+    #[test]
+    fn eager_fallback_logs_once_with_its_reason() {
+        let log = captured_log();
+        // 3 and 601 appear in no other test, so the captured lines below are this test's own.
+        let mut dispatcher = dispatcher(SupportLevel::Always, CaptureKind::Full);
+        dispatcher.dispatch(batch(3, 3, true));
+        dispatcher.dispatch(batch(601, 601, true));
+        let output = log.contents();
+        let fallback_lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.contains("token count 601"))
+            .collect();
+        assert_eq!(fallback_lines.len(), 1, "one fallback, one log line");
+        assert!(fallback_lines[0].contains("eager fallback"));
+        assert!(fallback_lines[0].contains(
+            "token count 601 exceeds every captured bucket; the bucket-ladder maximum is 512"
+        ));
+        assert!(
+            !output.contains("token count 3 "),
+            "admitted batches log nothing"
         );
     }
 
