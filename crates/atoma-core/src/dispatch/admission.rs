@@ -163,7 +163,12 @@ pub(crate) fn admit(
             captured_maximum: captured_max_requests,
         });
     }
-    if !batch.uniform_decode || batch.token_count.get() % batch.request_count.get() != 0 {
+    if !batch.uniform_decode
+        || !batch
+            .token_count
+            .get()
+            .is_multiple_of(batch.request_count.get())
+    {
         return Err(RejectionReason::NotUniformDecode {
             token_count: batch.token_count,
             request_count: batch.request_count,
