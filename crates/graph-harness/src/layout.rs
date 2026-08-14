@@ -92,13 +92,7 @@ impl Role {
     }
 }
 
-/// Builds the arena for `buckets` (batch sizes; decode steps have one token per sequence), with
-/// the extra layer row for the final residual.
-///
-/// The layout is explicitly no-reuse: these offsets are the ones the H100 stint verified
-/// bit-identical under capture and replay, so the reuse layout's device debut is a rig decision,
-/// not a side effect of building this arena.
-pub fn build_arena(dims: &ModelDims, buckets: &[usize]) -> CaptureArena {
+fn role_table(dims: &ModelDims) -> RoleTable {
     let roles = Role::ALL
         .iter()
         .map(|r| RoleDeclaration {
@@ -106,16 +100,41 @@ pub fn build_arena(dims: &ModelDims, buckets: &[usize]) -> CaptureArena {
             lifetime: r.lifetime(),
         })
         .collect();
+    RoleTable {
+        ops_per_layer: OPS_PER_LAYER,
+        roles,
+    }
+}
+
+/// Builds the arena for `buckets` (batch sizes; decode steps have one token per sequence), with
+/// the extra layer row for the final residual.
+///
+/// The layout is explicitly no-reuse: these offsets are the ones the H100 stint verified
+/// bit-identical under capture and replay, so the reuse layout's device debut is a rig decision,
+/// not a side effect of building this arena.
+pub fn build_arena(dims: &ModelDims, buckets: &[usize]) -> CaptureArena {
     CaptureArena::new(
         dims.num_layers + 1,
-        RoleTable {
-            ops_per_layer: OPS_PER_LAYER,
-            roles,
-        },
+        role_table(dims),
         buckets,
         ArenaLayout::NoReuse,
     )
     .expect("harness role lifetimes are declared valid")
+}
+
+/// Total arena bytes under each selectable layout, comparing the reuse layout against the
+/// reference at any model dimensions with no device present.
+pub fn arena_sizes_by_layout(dims: &ModelDims, buckets: &[usize]) -> [(ArenaLayout, usize); 3] {
+    [
+        ArenaLayout::Greedy,
+        ArenaLayout::NoReuse,
+        ArenaLayout::Poison,
+    ]
+    .map(|layout| {
+        let arena = CaptureArena::new(dims.num_layers + 1, role_table(dims), buckets, layout)
+            .expect("harness role lifetimes are declared valid");
+        (layout, arena.total_size())
+    })
 }
 
 /// Byte sizes of one cell's per-graph buffers: the graph's static inputs, outputs, and
@@ -202,6 +221,24 @@ mod tests {
         // The final residual row exists: layer index num_layers is valid.
         let final_hidden = arena.offset(BucketIdx(0), LayerIdx(2), Role::Hidden.tensor_role());
         assert!(final_hidden > 0);
+    }
+
+    #[test]
+    fn arena_sizes_by_layout_at_production_dimensions() {
+        // Production dimensions: the full 32-layer 8B shape over the harness bucket ladder.
+        // No-reuse and poison place one slot per layer per role: 33 rows (32 layers plus the
+        // final-residual row) * 64 tokens * 147456 bytes per token = 297 MiB. Greedy's
+        // footprint no longer scales with layer count: 7602176 bytes (7.25 MiB, 41x less) is
+        // the deterministic placement output at these dimensions, bounded below by the peak
+        // live set — Mid, Gate, Up and FfnAct at op 10 are 94208 bytes per token, or 6029312
+        // bytes at bucket 64 — and above it only by earliest-fit fragmentation.
+        let dims = ModelDims::llama_8b_shaped(32);
+        let sizes = arena_sizes_by_layout(&dims, &[1, 8, 32, 64]);
+
+        let [greedy, no_reuse, poison] = sizes;
+        assert_eq!(no_reuse, (ArenaLayout::NoReuse, 33 * 64 * 147_456));
+        assert_eq!(poison, (ArenaLayout::Poison, 33 * 64 * 147_456));
+        assert_eq!(greedy, (ArenaLayout::Greedy, 7_602_176));
     }
 
     #[test]
