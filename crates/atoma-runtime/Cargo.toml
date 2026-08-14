@@ -10,3 +10,6 @@ thiserror = { workspace = true }
 
 [features]
 nccl = [ "cudarc/nccl" ]
+
+[dev-dependencies]
+proptest = { workspace = true }

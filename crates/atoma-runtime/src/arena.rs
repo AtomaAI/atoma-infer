@@ -99,9 +99,21 @@ pub struct RoleTable {
 /// How slots are placed behind the [`CaptureArena::offset`] lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArenaLayout {
+    /// Greedy earliest-fit over declared lifetimes: a role takes the lowest offset whose bytes
+    /// are free for its whole lifetime. Two roles whose lifetimes are disjoint may share bytes,
+    /// so activation memory stops scaling with layer count.
+    Greedy,
     /// One slot per layer per role, no sharing: the reference layout that reuse layouts are
     /// checked against.
     NoReuse,
+}
+
+impl Default for ArenaLayout {
+    /// Greedy earliest-fit is the layout to build unless a run is checking against the
+    /// reference layout.
+    fn default() -> Self {
+        ArenaLayout::Greedy
+    }
 }
 
 /// Rejected arena constructions.
@@ -169,12 +181,63 @@ impl CaptureArena {
         for bucket in 0..arena.bucket_ladder.len() {
             let bucket = BucketIdx(bucket);
             let (table, extent) = match layout {
+                ArenaLayout::Greedy => arena.place_greedy(bucket),
                 ArenaLayout::NoReuse => arena.place_no_reuse(bucket),
             };
             arena.offsets.push(table);
             arena.bucket_extents.push(extent);
         }
         Ok(arena)
+    }
+
+    /// The global lifetime of one slot: the declared frame-relative lifetime shifted by its
+    /// layer's position in the step-wide op timeline.
+    fn slot_lifetime(&self, slot: usize) -> (isize, isize) {
+        let (layer, role) = (slot / self.num_roles(), slot % self.num_roles());
+        let Lifetime {
+            first_use,
+            last_use,
+        } = self.role_table.roles[role].lifetime;
+        let base = isize::try_from(layer * self.role_table.ops_per_layer)
+            .expect("op timeline fits in isize");
+        (base + first_use, base + last_use)
+    }
+
+    /// Greedy earliest-fit over declared lifetimes: slots are processed in order of first use,
+    /// and each takes the lowest offset whose bytes are free for its whole lifetime. Two slots
+    /// whose lifetimes overlap never share bytes; two whose lifetimes are disjoint may.
+    fn place_greedy(&self, bucket: BucketIdx) -> (Vec<usize>, usize) {
+        let num_slots = self.num_layers * self.num_roles();
+        let mut order: Vec<usize> = (0..num_slots).collect();
+        order.sort_by_key(|&slot| (self.slot_lifetime(slot).0, slot));
+
+        let mut table = vec![0; num_slots];
+        // Placed slots as (live_from, live_until, offset, size).
+        let mut placed: Vec<(isize, isize, usize, usize)> = Vec::new();
+        let mut extent = 0;
+        for slot in order {
+            let (live_from, live_until) = self.slot_lifetime(slot);
+            let size = self.slot_size(bucket, TensorRole(slot % self.num_roles()));
+            let mut busy: Vec<(usize, usize)> = placed
+                .iter()
+                .filter(|&&(from, until, _, _)| from < live_until && live_from < until)
+                .map(|&(_, _, offset, size)| (offset, offset + size))
+                .collect();
+            busy.sort_unstable();
+            // Busy ranges may overlap each other (two placed slots share bytes when their
+            // lifetimes are disjoint), so the scan keeps the running maximum end.
+            let mut offset = 0;
+            for (busy_from, busy_until) in busy {
+                if offset + size <= busy_from {
+                    break;
+                }
+                offset = offset.max(busy_until);
+            }
+            table[slot] = offset;
+            placed.push((live_from, live_until, offset, size));
+            extent = extent.max(offset + size);
+        }
+        (table, extent)
     }
 
     /// One slot per layer per role, ordered by declaration: the layout with no sharing.
@@ -516,5 +579,218 @@ mod tests {
     #[should_panic(expected = "bucket index 2 out of range")]
     fn offset_rejects_out_of_range_bucket() {
         two_role_arena().offset(BucketIdx(2), LayerIdx(0), TensorRole(0));
+    }
+
+    fn declared(width_bytes: usize, first_use: isize, last_use: isize) -> RoleDeclaration {
+        RoleDeclaration {
+            width_bytes,
+            lifetime: Lifetime {
+                first_use,
+                last_use,
+            },
+        }
+    }
+
+    fn greedy(
+        num_layers: usize,
+        ops_per_layer: usize,
+        roles: Vec<RoleDeclaration>,
+        ladder: &[usize],
+    ) -> CaptureArena {
+        CaptureArena::new(
+            num_layers,
+            RoleTable {
+                ops_per_layer,
+                roles,
+            },
+            ladder,
+            ArenaLayout::Greedy,
+        )
+        .expect("test role tables declare valid lifetimes")
+    }
+
+    /// Every (layer, role) slot of `bucket` with its global lifetime and byte range.
+    fn live_ranges(
+        arena: &CaptureArena,
+        bucket: BucketIdx,
+    ) -> Vec<((isize, isize), (usize, usize))> {
+        let mut ranges = Vec::new();
+        for layer in 0..arena.num_layers {
+            for role in 0..arena.num_roles() {
+                let live = arena.slot_lifetime(layer * arena.num_roles() + role);
+                let start = arena.offset(bucket, LayerIdx(layer), TensorRole(role));
+                let size = arena.slot_size(bucket, TensorRole(role));
+                ranges.push((live, (start, start + size)));
+            }
+        }
+        ranges
+    }
+
+    /// The greedy invariant: two slots whose global lifetimes overlap never share bytes.
+    fn assert_live_slots_never_share_bytes(arena: &CaptureArena, bucket: BucketIdx) {
+        let ranges = live_ranges(arena, bucket);
+        for (i, &((a_from, a_until), (a_start, a_end))) in ranges.iter().enumerate() {
+            for &((b_from, b_until), (b_start, b_end)) in &ranges[i + 1..] {
+                let live_together = a_from < b_until && b_from < a_until;
+                let share_bytes = a_start < b_end && b_start < a_end;
+                assert!(
+                    !(live_together && share_bytes),
+                    "slots live [{a_from}, {a_until}) at bytes [{a_start}, {a_end}) and \
+                     [{b_from}, {b_until}) at [{b_start}, {b_end}) overlap under bucket {}",
+                    bucket.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn greedy_shares_an_offset_between_disjoint_lifetimes() {
+        let arena = greedy(1, 4, vec![declared(100, 0, 2), declared(100, 2, 4)], &[2]);
+
+        assert_eq!(
+            arena.offset(BucketIdx(0), LayerIdx(0), TensorRole(0)),
+            arena.offset(BucketIdx(0), LayerIdx(0), TensorRole(1)),
+        );
+        assert_eq!(arena.bucket_footprint(BucketIdx(0)), 256);
+    }
+
+    #[test]
+    fn greedy_never_overlaps_two_live_roles() {
+        let arena = greedy(1, 4, vec![declared(100, 0, 3), declared(100, 1, 4)], &[2]);
+
+        assert_live_slots_never_share_bytes(&arena, BucketIdx(0));
+        assert_eq!(arena.bucket_footprint(BucketIdx(0)), 512);
+    }
+
+    #[test]
+    fn greedy_reuse_stops_scaling_with_layer_count() {
+        // One role live for a single op: every layer's slot is dead before the next layer's is
+        // live, so the whole ladder of layers shares one slot and the footprint is flat.
+        let shallow = greedy(4, 1, vec![declared(100, 0, 1)], &[2]);
+        let deep = greedy(32, 1, vec![declared(100, 0, 1)], &[2]);
+
+        assert_eq!(shallow.total_size(), deep.total_size());
+        assert_eq!(deep.total_size(), 256);
+    }
+
+    #[test]
+    fn greedy_layers_chain_through_a_residual_role() {
+        // A residual role live from the previous layer's last op (-1) through the whole next
+        // frame overlaps its neighbouring layers' instances, so consecutive layers must not
+        // share its slot — but layers two apart may, giving a ping-pong at constant footprint.
+        let roles = vec![declared(100, -1, 3), declared(100, 0, 1)];
+        let arena = greedy(8, 3, roles, &[2]);
+
+        assert_live_slots_never_share_bytes(&arena, BucketIdx(0));
+        let first = arena.offset(BucketIdx(0), LayerIdx(0), TensorRole(0));
+        let second = arena.offset(BucketIdx(0), LayerIdx(1), TensorRole(0));
+        assert_ne!(first, second);
+        // Layer 2's residual is free to reuse layer 0's slot: the footprint stays flat at depth.
+        assert_eq!(
+            arena.offset(BucketIdx(0), LayerIdx(2), TensorRole(0)),
+            first
+        );
+    }
+
+    #[test]
+    fn bridge_role_spanning_a_break_point_is_never_overlapped_while_live() {
+        // One layer, op order 0..12, break point between ops 5 and 6: the bridge is written in
+        // the first segment (op 3) and read in the second (through op 8), so its lifetime spans
+        // the break. Every role live anywhere in [3, 9) must leave its bytes alone; the role
+        // live entirely after it may reuse them.
+        let bridge = declared(100, 3, 9);
+        let segment_a = declared(100, 0, 4);
+        let segment_a_tail = declared(100, 4, 6);
+        let segment_b_head = declared(100, 6, 9);
+        let after_bridge = declared(100, 9, 12);
+        let arena = greedy(
+            1,
+            12,
+            vec![
+                bridge,
+                segment_a,
+                segment_a_tail,
+                segment_b_head,
+                after_bridge,
+            ],
+            &[2],
+        );
+
+        assert_live_slots_never_share_bytes(&arena, BucketIdx(0));
+        let bridge_offset = arena.offset(BucketIdx(0), LayerIdx(0), TensorRole(0));
+        for live_across_break in [1, 2, 3] {
+            assert_ne!(
+                arena.offset(BucketIdx(0), LayerIdx(0), TensorRole(live_across_break)),
+                bridge_offset,
+                "role {live_across_break} is live while the bridge holds data across the break"
+            );
+        }
+        // Reuse still happens around the bridge: the whole table fits in two slots.
+        assert_eq!(arena.bucket_footprint(BucketIdx(0)), 512);
+    }
+
+    #[test]
+    fn greedy_total_size_is_the_largest_bucket_extent() {
+        let roles = vec![declared(100, 0, 2), declared(300, 1, 3)];
+        let arena = greedy(2, 3, roles, &[2, 8, 4]);
+
+        let largest = (0..3)
+            .map(|b| arena.bucket_footprint(BucketIdx(b)))
+            .max()
+            .expect("three buckets");
+        assert_eq!(arena.total_size(), largest);
+        assert_eq!(arena.total_size(), arena.bucket_footprint(BucketIdx(1)));
+    }
+
+    #[test]
+    fn greedy_ladder_order_does_not_change_a_bucket_addressing() {
+        let roles = vec![declared(100, -1, 2), declared(300, 0, 3)];
+        let sorted = greedy(2, 3, roles.clone(), &[2, 8]);
+        let reversed = greedy(2, 3, roles, &[8, 2]);
+
+        for layer in 0..2 {
+            for role in 0..2 {
+                assert_eq!(
+                    reversed.offset(BucketIdx(0), LayerIdx(layer), TensorRole(role)),
+                    sorted.offset(BucketIdx(1), LayerIdx(layer), TensorRole(role)),
+                );
+            }
+        }
+        assert_eq!(reversed.total_size(), sorted.total_size());
+    }
+
+    mod greedy_properties {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        prop_compose! {
+            fn role_declarations()(
+                width_bytes in 1usize..4096,
+                first_use in -16isize..16,
+                span in 1isize..24,
+            ) -> RoleDeclaration {
+                declared(width_bytes, first_use, first_use + span)
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn overlapping_lifetimes_never_share_bytes(
+                num_layers in 1usize..6,
+                ops_per_layer in 1usize..16,
+                roles in prop::collection::vec(role_declarations(), 1..12),
+                ladder in prop::collection::vec(1usize..64, 1..4),
+            ) {
+                let arena = greedy(num_layers, ops_per_layer, roles, &ladder);
+                for bucket in 0..ladder.len() {
+                    let bucket = BucketIdx(bucket);
+                    assert_live_slots_never_share_bytes(&arena, bucket);
+                    for (_, (_, end)) in live_ranges(&arena, bucket) {
+                        prop_assert!(end <= arena.bucket_footprint(bucket));
+                    }
+                }
+            }
+        }
     }
 }
