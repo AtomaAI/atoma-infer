@@ -68,16 +68,6 @@ _Avoid_: split, boundary, cut
 A fixed-address buffer through which an eager operation passes data between two segments.
 _Avoid_: intermediate buffer, staging buffer
 
-**Tier**:
-A residence class for a block's bytes. Device is the only tier built; host is the
-first planned addition. A tier is where bytes live, never a preemption mechanism.
-_Avoid_: swap — that names the deleted preemption path
-
-**Residence**:
-Which tier holds a block's bytes at a given moment. Residence is a property of the
-bytes; identity is the block hash and has no tier.
-_Avoid_: location, placement
-
 **Spike**:
 A time-boxed experiment that answers a design question with measurements on real hardware.
 _Avoid_: prototype, proof of concept
