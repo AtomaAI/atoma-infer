@@ -1,9 +1,16 @@
 //! Arena roles, static buffer sizes, and the device memory budget of the harness step.
 
-use atoma_runtime::arena::{CaptureArena, Dtype, TensorRole};
+use atoma_runtime::arena::{
+    ArenaLayout, CaptureArena, Dtype, Lifetime, RoleDeclaration, RoleTable, TensorRole,
+};
 use serde::Serialize;
 
 use crate::dims::{ModelDims, BF16_BYTES};
+
+/// Length of one layer's linear op order in `run_step`: rmsnorm1 (0), qkv gemm (1), rope (2),
+/// kv write (3), attention (4), o gemm (5), attention residual add (6), rmsnorm2 (7),
+/// gate gemm (8), up gemm (9), silu_mul (10), down gemm (11), mlp residual add (12).
+pub const OPS_PER_LAYER: usize = 13;
 
 /// One activation tensor the step produces per layer, addressed through the capture arena.
 ///
@@ -60,13 +67,55 @@ impl Role {
             Role::Gate | Role::Up | Role::FfnAct => Dtype::Bf16.width_bytes(dims.ffn),
         }
     }
+
+    /// Lifetime in the [`OPS_PER_LAYER`] op order, read off `run_step`'s enqueue order; keep the
+    /// two in step. `Hidden` enters at -1 because the previous layer's mlp residual add (op 12,
+    /// frame-relative -1) writes it; `Normed` is the hull of its two live intervals, written at
+    /// op 0 and again at op 7.
+    pub fn lifetime(self) -> Lifetime {
+        let (first_use, last_use) = match self {
+            Role::Hidden => (-1, 7),
+            Role::Normed => (0, 10),
+            Role::Qkv => (1, 5),
+            Role::AttnOut => (4, 6),
+            Role::OProj => (5, 7),
+            Role::Mid => (6, 13),
+            Role::Gate => (8, 11),
+            Role::Up => (9, 11),
+            Role::FfnAct => (10, 12),
+            Role::FfnDown => (11, 13),
+        };
+        Lifetime {
+            first_use,
+            last_use,
+        }
+    }
 }
 
 /// Builds the arena for `buckets` (batch sizes; decode steps have one token per sequence), with
 /// the extra layer row for the final residual.
+///
+/// The layout is explicitly no-reuse: these offsets are the ones the H100 stint verified
+/// bit-identical under capture and replay, so the reuse layout's device debut is a rig decision,
+/// not a side effect of building this arena.
 pub fn build_arena(dims: &ModelDims, buckets: &[usize]) -> CaptureArena {
-    let widths: Vec<usize> = Role::ALL.iter().map(|r| r.width_bytes(dims)).collect();
-    CaptureArena::new(dims.num_layers + 1, &widths, buckets)
+    let roles = Role::ALL
+        .iter()
+        .map(|r| RoleDeclaration {
+            width_bytes: r.width_bytes(dims),
+            lifetime: r.lifetime(),
+        })
+        .collect();
+    CaptureArena::new(
+        dims.num_layers + 1,
+        RoleTable {
+            ops_per_layer: OPS_PER_LAYER,
+            roles,
+        },
+        buckets,
+        ArenaLayout::NoReuse,
+    )
+    .expect("harness role lifetimes are declared valid")
 }
 
 /// Byte sizes of one cell's per-graph buffers: the graph's static inputs, outputs, and

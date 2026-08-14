@@ -112,6 +112,9 @@ pub unsafe fn copy_inputs(
 /// Enqueues one full decode step: embedding gather, every layer's attention and MLP blocks, the
 /// final norm, lm head, and device argmax.
 ///
+/// The per-layer enqueue order is the op order [`crate::layout::OPS_PER_LAYER`] counts and
+/// [`Role::lifetime`] indexes; a reordering here must update those declarations.
+///
 /// # Safety
 /// Every address in `ptrs` must be live and match the shapes implied by `ctx`.
 pub unsafe fn run_step(

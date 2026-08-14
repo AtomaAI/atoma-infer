@@ -7,9 +7,16 @@
 //! or write-back copies.
 //!
 //! Addresses are exposed only through [`CaptureArena::offset`] — never an open-coded formula at a
-//! call site — so a smarter allocation plan (e.g. layer-parity ping-pong) can replace the naive
-//! one without touching any caller. The arena has no model knowledge: roles enter as
-//! caller-declared per-token widths and the bucket ladder as uninterpreted entries.
+//! call site — so the placement behind the lookup can change without touching any caller. The
+//! arena has no model knowledge: roles enter as caller-declared per-token widths and lifetimes,
+//! indexed positionally, and the bucket ladder as uninterpreted entries.
+//!
+//! The arena holds only what is sized per bucket: activations and bridge buffers. Buffers sized
+//! once at the ladder maximum — per-step inputs, outputs, and kernel workspaces — are owned by
+//! the [`GraphEntry`](crate::graph_entry::GraphEntry) whose graph baked their addresses, never by
+//! the arena.
+
+use thiserror::Error;
 
 /// Index into the bucket ladder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +63,61 @@ impl Dtype {
     }
 }
 
+/// Half-open range `[first_use, last_use)` of a layer's op order in which a role's slot holds
+/// live data.
+///
+/// Indices are frame-relative and signed: an index below zero or beyond the op order names an op
+/// of an adjacent layer. That is how a residual stream entering a layer — written by the previous
+/// layer's last op — declares that its slot is already live at layer entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lifetime {
+    /// Op index of the first write into the slot.
+    pub first_use: isize,
+    /// One past the op index of the last read of the slot.
+    pub last_use: isize,
+}
+
+/// One role's declaration: everything the arena knows about a tensor role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleDeclaration {
+    /// Per-token width in bytes.
+    pub width_bytes: usize,
+    /// When the role's slot holds live data, indexing the op order declared in
+    /// [`RoleTable::ops_per_layer`].
+    pub lifetime: Lifetime,
+}
+
+/// The caller-declared role table: a linear op order per layer and one declaration per role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleTable {
+    /// Length of one layer's linear op order — the coordinate system every lifetime indexes.
+    pub ops_per_layer: usize,
+    /// One declaration per role, indexed by [`TensorRole`].
+    pub roles: Vec<RoleDeclaration>,
+}
+
+/// How slots are placed behind the [`CaptureArena::offset`] lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArenaLayout {
+    /// One slot per layer per role, no sharing: the reference layout that reuse layouts are
+    /// checked against.
+    NoReuse,
+}
+
+/// Rejected arena constructions.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ArenaError {
+    #[error(
+        "role {role} declares an empty or inverted lifetime [{first_use}, {last_use}): first-use \
+         must come before last-use in the layer op order"
+    )]
+    EmptyOrInvertedLifetime {
+        role: usize,
+        first_use: isize,
+        last_use: isize,
+    },
+}
+
 /// Address layout for every captured step's activations. See the module docs for the invariants.
 ///
 /// The whole offset table is computed once at construction; [`CaptureArena::offset`] is a table
@@ -63,8 +125,7 @@ impl Dtype {
 #[derive(Debug, Clone)]
 pub struct CaptureArena {
     num_layers: usize,
-    /// Per-token width in bytes of each role, indexed by [`TensorRole`].
-    role_widths: Vec<usize>,
+    role_table: RoleTable,
     /// Tokens per bucket, indexed by [`BucketIdx`]. Uninterpreted: never sorted, deduplicated,
     /// or assumed monotonic.
     bucket_ladder: Vec<usize>,
@@ -75,37 +136,62 @@ pub struct CaptureArena {
 }
 
 impl CaptureArena {
-    /// Builds the arena layout from `num_layers` layers, caller-declared per-token role widths
-    /// in bytes, and the bucket ladder in tokens per bucket.
-    pub fn new(num_layers: usize, role_widths: &[usize], bucket_ladder: &[usize]) -> Self {
+    /// Builds the arena layout from `num_layers` layers, the caller-declared role table, and the
+    /// bucket ladder in tokens per bucket, placing slots per `layout`.
+    ///
+    /// Rejects a role table containing an empty or inverted lifetime, naming the offending role.
+    pub fn new(
+        num_layers: usize,
+        role_table: RoleTable,
+        bucket_ladder: &[usize],
+        layout: ArenaLayout,
+    ) -> Result<Self, ArenaError> {
+        for (role, declaration) in role_table.roles.iter().enumerate() {
+            let Lifetime {
+                first_use,
+                last_use,
+            } = declaration.lifetime;
+            if first_use >= last_use {
+                return Err(ArenaError::EmptyOrInvertedLifetime {
+                    role,
+                    first_use,
+                    last_use,
+                });
+            }
+        }
         let mut arena = Self {
             num_layers,
-            role_widths: role_widths.to_vec(),
+            role_table,
             bucket_ladder: bucket_ladder.to_vec(),
             offsets: Vec::new(),
             bucket_extents: Vec::new(),
         };
         for bucket in 0..arena.bucket_ladder.len() {
             let bucket = BucketIdx(bucket);
-            let per_layer = arena.layer_extent(bucket);
-            let mut table = Vec::with_capacity(num_layers * arena.role_widths.len());
-            for layer in 0..num_layers {
-                let mut within_layer = 0;
-                for role in 0..arena.role_widths.len() {
-                    table.push(layer * per_layer + within_layer);
-                    within_layer += arena.slot_size(bucket, TensorRole(role));
-                }
-            }
+            let (table, extent) = match layout {
+                ArenaLayout::NoReuse => arena.place_no_reuse(bucket),
+            };
             arena.offsets.push(table);
-            arena.bucket_extents.push(num_layers * per_layer);
+            arena.bucket_extents.push(extent);
         }
-        arena
+        Ok(arena)
+    }
+
+    /// One slot per layer per role, ordered by declaration: the layout with no sharing.
+    fn place_no_reuse(&self, bucket: BucketIdx) -> (Vec<usize>, usize) {
+        let per_layer = self.layer_extent(bucket);
+        let mut table = Vec::with_capacity(self.num_layers * self.num_roles());
+        for layer in 0..self.num_layers {
+            let mut within_layer = 0;
+            for role in 0..self.num_roles() {
+                table.push(layer * per_layer + within_layer);
+                within_layer += self.slot_size(bucket, TensorRole(role));
+            }
+        }
+        (table, self.num_layers * per_layer)
     }
 
     /// Byte offset of the slot holding `role`'s activation for `layer` under `bucket`.
-    ///
-    /// One slot per layer, no liveness-based reuse: a wrong reuse decision cannot corrupt
-    /// numbers silently inside a replay.
     pub fn offset(&self, bucket: BucketIdx, layer: LayerIdx, role: TensorRole) -> usize {
         assert!(
             bucket.0 < self.bucket_ladder.len(),
@@ -120,12 +206,12 @@ impl CaptureArena {
             self.num_layers
         );
         assert!(
-            role.0 < self.role_widths.len(),
+            role.0 < self.num_roles(),
             "role index {} out of range: {} roles were declared",
             role.0,
-            self.role_widths.len()
+            self.num_roles()
         );
-        self.offsets[bucket.0][layer.0 * self.role_widths.len() + role.0]
+        self.offsets[bucket.0][layer.0 * self.num_roles() + role.0]
     }
 
     /// Size in bytes of the slot holding `role`'s activation under `bucket`.
@@ -137,7 +223,7 @@ impl CaptureArena {
             self.bucket_ladder.len()
         );
         let tokens = self.bucket_ladder[bucket.0];
-        (self.role_widths[role.0] * tokens).next_multiple_of(SLOT_ALIGN)
+        (self.role_table.roles[role.0].width_bytes * tokens).next_multiple_of(SLOT_ALIGN)
     }
 
     /// Total bytes `bucket` addresses: every layer's slots for every role.
@@ -158,9 +244,13 @@ impl CaptureArena {
     }
 
     fn layer_extent(&self, bucket: BucketIdx) -> usize {
-        (0..self.role_widths.len())
+        (0..self.num_roles())
             .map(|r| self.slot_size(bucket, TensorRole(r)))
             .sum()
+    }
+
+    fn num_roles(&self) -> usize {
+        self.role_table.roles.len()
     }
 }
 
@@ -183,11 +273,119 @@ pub trait WorkspaceRequirement {
 mod tests {
     use super::*;
 
+    /// Declares `width_bytes` with a minimal valid lifetime; no-reuse placement ignores
+    /// lifetimes, so tests that only exercise addressing declare the simplest one.
+    fn role(width_bytes: usize) -> RoleDeclaration {
+        RoleDeclaration {
+            width_bytes,
+            lifetime: Lifetime {
+                first_use: 0,
+                last_use: 1,
+            },
+        }
+    }
+
+    fn no_reuse(num_layers: usize, widths: &[usize], ladder: &[usize]) -> CaptureArena {
+        let roles = widths.iter().map(|&w| role(w)).collect();
+        CaptureArena::new(
+            num_layers,
+            RoleTable {
+                ops_per_layer: 1,
+                roles,
+            },
+            ladder,
+            ArenaLayout::NoReuse,
+        )
+        .expect("test role tables declare valid lifetimes")
+    }
+
     /// Two roles at 100 and 300 bytes per token; slot sizes below are hand-computed:
     /// bucket 0 (2 tokens): 200 -> 256, 600 -> 768 (layer extent 1024);
     /// bucket 1 (8 tokens): 800 -> 1024, 2400 -> 2560 (layer extent 3584).
     fn two_role_arena() -> CaptureArena {
-        CaptureArena::new(2, &[100, 300], &[2, 8])
+        no_reuse(2, &[100, 300], &[2, 8])
+    }
+
+    #[test]
+    fn empty_lifetime_is_rejected_naming_the_role() {
+        let roles = vec![
+            role(100),
+            RoleDeclaration {
+                width_bytes: 300,
+                lifetime: Lifetime {
+                    first_use: 5,
+                    last_use: 5,
+                },
+            },
+        ];
+        let err = CaptureArena::new(
+            2,
+            RoleTable {
+                ops_per_layer: 8,
+                roles,
+            },
+            &[2],
+            ArenaLayout::NoReuse,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ArenaError::EmptyOrInvertedLifetime {
+                role: 1,
+                first_use: 5,
+                last_use: 5
+            }
+        );
+        assert!(err.to_string().contains("role 1"), "got: {err}");
+    }
+
+    #[test]
+    fn inverted_lifetime_is_rejected_naming_the_role() {
+        let roles = vec![RoleDeclaration {
+            width_bytes: 100,
+            lifetime: Lifetime {
+                first_use: 7,
+                last_use: 3,
+            },
+        }];
+        let err = CaptureArena::new(
+            1,
+            RoleTable {
+                ops_per_layer: 8,
+                roles,
+            },
+            &[2],
+            ArenaLayout::NoReuse,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("role 0"), "got: {err}");
+        assert!(err.to_string().contains("[7, 3)"), "got: {err}");
+    }
+
+    #[test]
+    fn residual_lifetime_entering_from_the_previous_layer_is_valid() {
+        // A residual stream is written by the previous layer's last op: first_use is -1 in the
+        // consuming layer's frame. That is a declaration the arena must accept.
+        let roles = vec![RoleDeclaration {
+            width_bytes: 100,
+            lifetime: Lifetime {
+                first_use: -1,
+                last_use: 7,
+            },
+        }];
+        let arena = CaptureArena::new(
+            2,
+            RoleTable {
+                ops_per_layer: 13,
+                roles,
+            },
+            &[2],
+            ArenaLayout::NoReuse,
+        );
+
+        assert!(arena.is_ok());
     }
 
     #[test]
@@ -223,7 +421,7 @@ mod tests {
             Dtype::Bf16.width_bytes(4096),
             Dtype::Bf16.width_bytes(14336),
         ];
-        let arena = CaptureArena::new(32, &roles, &[1, 8, 64]);
+        let arena = no_reuse(32, &roles, &[1, 8, 64]);
 
         assert_eq!(arena.total_size(), 75_497_472);
         assert_eq!(arena.total_size(), arena.bucket_footprint(BucketIdx(2)));
@@ -231,8 +429,8 @@ mod tests {
 
     #[test]
     fn total_size_does_not_grow_when_smaller_buckets_are_added() {
-        let largest_alone = CaptureArena::new(2, &[100, 300], &[8]);
-        let with_smaller = CaptureArena::new(2, &[100, 300], &[2, 8, 4]);
+        let largest_alone = no_reuse(2, &[100, 300], &[8]);
+        let with_smaller = no_reuse(2, &[100, 300], &[2, 8, 4]);
 
         assert_eq!(with_smaller.total_size(), largest_alone.total_size());
     }
@@ -283,8 +481,8 @@ mod tests {
 
     #[test]
     fn ladder_order_does_not_change_a_bucket_addressing() {
-        let sorted = CaptureArena::new(2, &[100, 300], &[2, 8]);
-        let reversed = CaptureArena::new(2, &[100, 300], &[8, 2]);
+        let sorted = no_reuse(2, &[100, 300], &[2, 8]);
+        let reversed = no_reuse(2, &[100, 300], &[8, 2]);
 
         // The entry value, not its position, determines the layout: bucket 0 of `reversed`
         // addresses exactly like bucket 1 of `sorted`, and the totals agree.
@@ -297,7 +495,7 @@ mod tests {
 
     #[test]
     fn empty_ladder_needs_no_memory() {
-        let arena = CaptureArena::new(2, &[100, 300], &[]);
+        let arena = no_reuse(2, &[100, 300], &[]);
 
         assert_eq!(arena.total_size(), 0);
     }
