@@ -73,17 +73,18 @@ impl Role {
     /// frame-relative -1) writes it; `Normed` is the hull of its two live intervals, written at
     /// op 0 and again at op 7.
     pub fn lifetime(self) -> Lifetime {
+        let frame_end = isize::try_from(OPS_PER_LAYER).expect("op order fits in isize");
         let (first_use, last_use) = match self {
             Role::Hidden => (-1, 7),
             Role::Normed => (0, 10),
             Role::Qkv => (1, 5),
             Role::AttnOut => (4, 6),
             Role::OProj => (5, 7),
-            Role::Mid => (6, 13),
+            Role::Mid => (6, frame_end),
             Role::Gate => (8, 11),
             Role::Up => (9, 11),
             Role::FfnAct => (10, 12),
-            Role::FfnDown => (11, 13),
+            Role::FfnDown => (11, frame_end),
         };
         Lifetime {
             first_use,
@@ -113,28 +114,23 @@ fn role_table(dims: &ModelDims) -> RoleTable {
 /// bit-identical under capture and replay, so the reuse layout's device debut is a rig decision,
 /// not a side effect of building this arena.
 pub fn build_arena(dims: &ModelDims, buckets: &[usize]) -> CaptureArena {
-    CaptureArena::new(
-        dims.num_layers + 1,
-        role_table(dims),
-        buckets,
-        ArenaLayout::NoReuse,
-    )
-    .expect("harness role lifetimes are declared valid")
+    arena_with_layout(dims, buckets, ArenaLayout::NoReuse)
 }
 
 /// Total arena bytes under each selectable layout, comparing the reuse layout against the
 /// reference at any model dimensions with no device present.
 pub fn arena_sizes_by_layout(dims: &ModelDims, buckets: &[usize]) -> [(ArenaLayout, usize); 3] {
-    [
-        ArenaLayout::Greedy,
-        ArenaLayout::NoReuse,
-        ArenaLayout::Poison,
-    ]
-    .map(|layout| {
-        let arena = CaptureArena::new(dims.num_layers + 1, role_table(dims), buckets, layout)
-            .expect("harness role lifetimes are declared valid");
-        (layout, arena.total_size())
+    ArenaLayout::ALL.map(|layout| {
+        (
+            layout,
+            arena_with_layout(dims, buckets, layout).total_size(),
+        )
     })
+}
+
+fn arena_with_layout(dims: &ModelDims, buckets: &[usize], layout: ArenaLayout) -> CaptureArena {
+    CaptureArena::new(dims.num_layers + 1, role_table(dims), buckets, layout)
+        .expect("harness role lifetimes are declared valid")
 }
 
 /// Byte sizes of one cell's per-graph buffers: the graph's static inputs, outputs, and
@@ -226,19 +222,38 @@ mod tests {
     #[test]
     fn arena_sizes_by_layout_at_production_dimensions() {
         // Production dimensions: the full 32-layer 8B shape over the harness bucket ladder.
-        // No-reuse and poison place one slot per layer per role: 33 rows (32 layers plus the
-        // final-residual row) * 64 tokens * 147456 bytes per token = 297 MiB. Greedy's
-        // footprint no longer scales with layer count: 7602176 bytes (7.25 MiB, 41x less) is
-        // the deterministic placement output at these dimensions, bounded below by the peak
-        // live set — Mid, Gate, Up and FfnAct at op 10 are 94208 bytes per token, or 6029312
-        // bytes at bucket 64 — and above it only by earliest-fit fragmentation.
+        // No-reuse and poison place one slot per layer per role — 33 rows (32 layers plus the
+        // final-residual row) * 64 tokens * 147456 bytes per token = 297 MiB — which is
+        // closed-form, so pinned exactly. Greedy is asserted by its contract rather than its
+        // exact byte count, which would pin the earliest-fit tie-breaking: bounded below by the
+        // peak live set — Mid, Gate, Up and FfnAct at op 10 are 94208 bytes per token, or
+        // 6029312 bytes at bucket 64 — bounded above by fragmentation headroom under twice that
+        // peak, and flat in layer count.
         let dims = ModelDims::llama_8b_shaped(32);
         let sizes = arena_sizes_by_layout(&dims, &[1, 8, 32, 64]);
 
         let [greedy, no_reuse, poison] = sizes;
         assert_eq!(no_reuse, (ArenaLayout::NoReuse, 33 * 64 * 147_456));
         assert_eq!(poison, (ArenaLayout::Poison, 33 * 64 * 147_456));
-        assert_eq!(greedy, (ArenaLayout::Greedy, 7_602_176));
+
+        let (layout, greedy_bytes) = greedy;
+        assert_eq!(layout, ArenaLayout::Greedy);
+        let peak_live_bytes = 64 * (8_192 + 3 * 28_672);
+        assert!(
+            greedy_bytes >= peak_live_bytes,
+            "greedy beat the peak live set: {greedy_bytes}"
+        );
+        assert!(
+            greedy_bytes < 2 * peak_live_bytes,
+            "greedy fragmentation exceeds one extra live set: {greedy_bytes}"
+        );
+
+        let shallow_dims = ModelDims::llama_8b_shaped(8);
+        let [shallow_greedy, _, _] = arena_sizes_by_layout(&shallow_dims, &[1, 8, 32, 64]);
+        assert_eq!(
+            greedy_bytes, shallow_greedy.1,
+            "greedy footprint scales with layer count"
+        );
     }
 
     #[test]

@@ -16,6 +16,8 @@
 //! the [`GraphEntry`](crate::graph_entry::GraphEntry) whose graph baked their addresses, never by
 //! the arena.
 
+use std::fmt;
+
 use thiserror::Error;
 
 /// Index into the bucket ladder.
@@ -114,11 +116,31 @@ pub enum ArenaLayout {
     Poison,
 }
 
+impl ArenaLayout {
+    /// Every selectable layout, in the order size reports list them.
+    pub const ALL: [ArenaLayout; 3] = [
+        ArenaLayout::Greedy,
+        ArenaLayout::NoReuse,
+        ArenaLayout::Poison,
+    ];
+}
+
 impl Default for ArenaLayout {
     /// Greedy earliest-fit is the layout to build unless a run is checking against the
     /// reference layout or poisoning lifetime declarations.
     fn default() -> Self {
         ArenaLayout::Greedy
+    }
+}
+
+impl fmt::Display for ArenaLayout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            ArenaLayout::Greedy => "greedy",
+            ArenaLayout::NoReuse => "no-reuse",
+            ArenaLayout::Poison => "poison",
+        };
+        f.write_str(name)
     }
 }
 
@@ -143,14 +165,24 @@ pub struct PoisonFill {
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ArenaError {
     #[error(
-        "role {role} declares an empty or inverted lifetime [{first_use}, {last_use}): first-use \
-         must come before last-use in the layer op order"
+        "role {} declares an empty or inverted lifetime [{}, {}): first-use must come before \
+         last-use in the layer op order",
+        role.0,
+        lifetime.first_use,
+        lifetime.last_use
     )]
     EmptyOrInvertedLifetime {
-        role: usize,
-        first_use: isize,
-        last_use: isize,
+        role: TensorRole,
+        lifetime: Lifetime,
     },
+}
+
+/// One slot the greedy scan has already placed: its global lifetime and byte range.
+struct PlacedSlot {
+    live_from: isize,
+    live_until: isize,
+    offset: usize,
+    size: usize,
 }
 
 /// Address layout for every captured step's activations. See the module docs for the invariants.
@@ -183,15 +215,11 @@ impl CaptureArena {
         layout: ArenaLayout,
     ) -> Result<Self, ArenaError> {
         for (role, declaration) in role_table.roles.iter().enumerate() {
-            let Lifetime {
-                first_use,
-                last_use,
-            } = declaration.lifetime;
-            if first_use >= last_use {
+            let lifetime = declaration.lifetime;
+            if lifetime.first_use >= lifetime.last_use {
                 return Err(ArenaError::EmptyOrInvertedLifetime {
-                    role,
-                    first_use,
-                    last_use,
+                    role: TensorRole(role),
+                    lifetime,
                 });
             }
         }
@@ -221,7 +249,11 @@ impl CaptureArena {
     ///
     /// The schedule keeps the pattern standing across replays: each step re-poisons every slot
     /// it consumed, so the caller fills the arena with [`POISON_BYTE`] once at allocation and
-    /// from then on only enqueues these fills.
+    /// from then on only enqueues these fills. The fill at first use looks redundant — the same
+    /// slot's last-use fill in the previous replay already re-poisoned it — but only within one
+    /// bucket: buckets share addresses under different slot geometry, so the first-use fill is
+    /// what restores this bucket's slot after a bucket switch, and it keeps every replay's
+    /// schedule correct in isolation.
     pub fn poison_fills(&self, bucket: BucketIdx) -> Vec<PoisonFill> {
         if self.layout != ArenaLayout::Poison {
             return Vec::new();
@@ -229,7 +261,7 @@ impl CaptureArena {
         let mut fills = Vec::with_capacity(2 * self.num_layers * self.num_roles());
         for layer in 0..self.num_layers {
             for role in 0..self.num_roles() {
-                let (live_from, live_until) = self.slot_lifetime(layer * self.num_roles() + role);
+                let (live_from, live_until) = self.slot_lifetime(self.slot_index(layer, role));
                 let offset = self.offset(bucket, LayerIdx(layer), TensorRole(role));
                 let len = self.slot_size(bucket, TensorRole(role));
                 for before_op in [live_from, live_until] {
@@ -267,16 +299,15 @@ impl CaptureArena {
         order.sort_by_key(|&slot| (self.slot_lifetime(slot).0, slot));
 
         let mut table = vec![0; num_slots];
-        // Placed slots as (live_from, live_until, offset, size).
-        let mut placed: Vec<(isize, isize, usize, usize)> = Vec::new();
+        let mut placed: Vec<PlacedSlot> = Vec::new();
         let mut extent = 0;
         for slot in order {
             let (live_from, live_until) = self.slot_lifetime(slot);
             let size = self.slot_size(bucket, TensorRole(slot % self.num_roles()));
             let mut busy: Vec<(usize, usize)> = placed
                 .iter()
-                .filter(|&&(from, until, _, _)| from < live_until && live_from < until)
-                .map(|&(_, _, offset, size)| (offset, offset + size))
+                .filter(|other| other.live_from < live_until && live_from < other.live_until)
+                .map(|other| (other.offset, other.offset + other.size))
                 .collect();
             busy.sort_unstable();
             // Busy ranges may overlap each other (two placed slots share bytes when their
@@ -289,7 +320,12 @@ impl CaptureArena {
                 offset = offset.max(busy_until);
             }
             table[slot] = offset;
-            placed.push((live_from, live_until, offset, size));
+            placed.push(PlacedSlot {
+                live_from,
+                live_until,
+                offset,
+                size,
+            });
             extent = extent.max(offset + size);
         }
         (table, extent)
@@ -311,12 +347,7 @@ impl CaptureArena {
 
     /// Byte offset of the slot holding `role`'s activation for `layer` under `bucket`.
     pub fn offset(&self, bucket: BucketIdx, layer: LayerIdx, role: TensorRole) -> usize {
-        assert!(
-            bucket.0 < self.bucket_ladder.len(),
-            "bucket index {} out of range: the bucket ladder has {} buckets",
-            bucket.0,
-            self.bucket_ladder.len()
-        );
+        self.assert_bucket_in_range(bucket);
         assert!(
             layer.0 < self.num_layers,
             "layer index {} out of range: the arena was built for {} layers",
@@ -329,17 +360,12 @@ impl CaptureArena {
             role.0,
             self.num_roles()
         );
-        self.offsets[bucket.0][layer.0 * self.num_roles() + role.0]
+        self.offsets[bucket.0][self.slot_index(layer.0, role.0)]
     }
 
     /// Size in bytes of the slot holding `role`'s activation under `bucket`.
     pub fn slot_size(&self, bucket: BucketIdx, role: TensorRole) -> usize {
-        assert!(
-            bucket.0 < self.bucket_ladder.len(),
-            "bucket index {} out of range: the bucket ladder has {} buckets",
-            bucket.0,
-            self.bucket_ladder.len()
-        );
+        self.assert_bucket_in_range(bucket);
         let tokens = self.bucket_ladder[bucket.0];
         (self.role_table.roles[role.0].width_bytes * tokens).next_multiple_of(SLOT_ALIGN)
     }
@@ -347,13 +373,22 @@ impl CaptureArena {
     /// Total bytes `bucket` addresses: the extent of its placed slots, with bytes shared
     /// between lifetime-disjoint slots counted once.
     pub fn bucket_footprint(&self, bucket: BucketIdx) -> usize {
+        self.assert_bucket_in_range(bucket);
+        self.bucket_extents[bucket.0]
+    }
+
+    fn assert_bucket_in_range(&self, bucket: BucketIdx) {
         assert!(
             bucket.0 < self.bucket_ladder.len(),
             "bucket index {} out of range: the bucket ladder has {} buckets",
             bucket.0,
             self.bucket_ladder.len()
         );
-        self.bucket_extents[bucket.0]
+    }
+
+    /// Row-major index of `(layer, role)` into a bucket's offset table.
+    fn slot_index(&self, layer: usize, role: usize) -> usize {
+        layer * self.num_roles() + role
     }
 
     /// Bytes of device memory backing the arena: the largest bucket's footprint, since every
@@ -451,9 +486,11 @@ mod tests {
         assert_eq!(
             err,
             ArenaError::EmptyOrInvertedLifetime {
-                role: 1,
-                first_use: 5,
-                last_use: 5
+                role: TensorRole(1),
+                lifetime: Lifetime {
+                    first_use: 5,
+                    last_use: 5
+                }
             }
         );
         assert!(err.to_string().contains("role 1"), "got: {err}");
@@ -673,7 +710,7 @@ mod tests {
         let mut ranges = Vec::new();
         for layer in 0..arena.num_layers {
             for role in 0..arena.num_roles() {
-                let live = arena.slot_lifetime(layer * arena.num_roles() + role);
+                let live = arena.slot_lifetime(arena.slot_index(layer, role));
                 let start = arena.offset(bucket, LayerIdx(layer), TensorRole(role));
                 let size = arena.slot_size(bucket, TensorRole(role));
                 ranges.push((live, (start, start + size)));
@@ -756,34 +793,38 @@ mod tests {
     #[test]
     fn bridge_role_spanning_a_break_point_is_never_overlapped_while_live() {
         // One layer, op order 0..12, break point between ops 5 and 6: the bridge is written in
-        // the first segment (op 3) and read in the second (through op 8), so its lifetime spans
-        // the break. Every role live anywhere in [3, 9) must leave its bytes alone; the role
-        // live entirely after it may reuse them.
+        // the first segment (op 3) and read in the second (through op 8), so its declared
+        // lifetime spans the break. The arena knows no break points — model knowledge stays
+        // with the caller — so that lifetime is the whole protection: every role live anywhere
+        // in [3, 9) must leave the bridge's bytes alone, and only a role live entirely outside
+        // it may reuse them.
         let bridge = declared(100, 3, 9);
-        let segment_a = declared(100, 0, 4);
-        let segment_a_tail = declared(100, 4, 6);
-        let segment_b_head = declared(100, 6, 9);
-        let after_bridge = declared(100, 9, 12);
-        let arena = greedy(
-            1,
-            12,
-            vec![
-                bridge,
-                segment_a,
-                segment_a_tail,
-                segment_b_head,
-                after_bridge,
-            ],
-            &[2],
-        );
+        let declarations = vec![
+            bridge,
+            declared(100, 0, 4),  // segment_a
+            declared(100, 4, 6),  // segment_a_tail
+            declared(100, 6, 9),  // segment_b_head
+            declared(100, 9, 12), // after_bridge
+        ];
+        let arena = greedy(1, 12, declarations.clone(), &[2]);
 
         assert_live_slots_never_share_bytes(&arena, BucketIdx(0));
-        let bridge_offset = arena.offset(BucketIdx(0), LayerIdx(0), TensorRole(0));
-        for live_across_break in [1, 2, 3] {
-            assert_ne!(
-                arena.offset(BucketIdx(0), LayerIdx(0), TensorRole(live_across_break)),
-                bridge_offset,
-                "role {live_across_break} is live while the bridge holds data across the break"
+        let bridge_start = arena.offset(BucketIdx(0), LayerIdx(0), TensorRole(0));
+        let bridge_end = bridge_start + arena.slot_size(BucketIdx(0), TensorRole(0));
+        for (role, declaration) in declarations.iter().enumerate().skip(1) {
+            let Lifetime {
+                first_use,
+                last_use,
+            } = declaration.lifetime;
+            let live_with_bridge =
+                first_use < bridge.lifetime.last_use && bridge.lifetime.first_use < last_use;
+            let start = arena.offset(BucketIdx(0), LayerIdx(0), TensorRole(role));
+            let end = start + arena.slot_size(BucketIdx(0), TensorRole(role));
+            let shares_bridge_bytes = start < bridge_end && bridge_start < end;
+            assert!(
+                !(live_with_bridge && shares_bridge_bytes),
+                "role {role} live [{first_use}, {last_use}) is live while the bridge holds data \
+                 across the break yet shares its bytes"
             );
         }
         // Reuse still happens around the bridge: the whole table fits in two slots.
@@ -967,8 +1008,9 @@ mod tests {
                 for bucket in 0..ladder.len() {
                     let bucket = BucketIdx(bucket);
                     assert_live_slots_never_share_bytes(&arena, bucket);
-                    for (_, (_, end)) in live_ranges(&arena, bucket) {
+                    for (_, (start, end)) in live_ranges(&arena, bucket) {
                         prop_assert!(end <= arena.bucket_footprint(bucket));
+                        prop_assert_eq!(start % SLOT_ALIGN, 0, "unaligned offset {}", start);
                     }
                 }
             }

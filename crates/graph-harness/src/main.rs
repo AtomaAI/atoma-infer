@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::process::exit;
 
 use anyhow::Result;
-use atoma_runtime::arena::ArenaLayout;
 use clap::{Args, Parser, Subcommand};
 use graph_harness::dims::ModelDims;
 use graph_harness::gpu::runner::{self, RunConfig};
@@ -113,14 +112,9 @@ fn plan(args: &CommonArgs) -> Result<()> {
         dims.num_layers
     );
     println!("arena: {:.1} MiB (largest bucket)", mib(arena.total_size()));
-    let layout_name = |layout: ArenaLayout| match layout {
-        ArenaLayout::Greedy => "greedy",
-        ArenaLayout::NoReuse => "no-reuse",
-        ArenaLayout::Poison => "poison",
-    };
     let by_layout: Vec<String> = arena_sizes_by_layout(&dims, &ladder)
         .iter()
-        .map(|&(layout, bytes)| format!("{} {:.1} MiB", layout_name(layout), mib(bytes)))
+        .map(|&(layout, bytes)| format!("{layout} {:.1} MiB", mib(bytes)))
         .collect();
     println!("arena by layout: {}", by_layout.join(", "));
     println!("\ncells (execution order):");
