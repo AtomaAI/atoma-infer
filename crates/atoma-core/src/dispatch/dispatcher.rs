@@ -112,13 +112,13 @@ impl Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::{CaptureKind, DispatchConfig, DispatchDecision, Dispatcher, EagerFallbackCounters};
-    use crate::dispatch::test_support::{batch, count};
+    use crate::dispatch::test_support::{batch, nonzero};
     use crate::dispatch::{BucketLadder, Platform, RejectionReason, SupportLevel};
 
     fn dispatcher(support_level: SupportLevel, capture_kind: CaptureKind) -> Dispatcher {
         Dispatcher::new(&DispatchConfig {
             bucket_ladder: BucketLadder::default_for(Platform::Hopper),
-            captured_max_requests: count(512),
+            captured_max_requests: nonzero(512),
             support_level,
             capture_kind,
         })
@@ -151,8 +151,8 @@ mod tests {
         assert_eq!(
             dispatcher.dispatch(batch(600, 600, true)),
             DispatchDecision::Eager(RejectionReason::TokensAboveBucketLadderMaximum {
-                token_count: count(600),
-                bucket_ladder_maximum: Some(count(512)),
+                token_count: nonzero(600),
+                bucket_ladder_maximum: Some(nonzero(512)),
             })
         );
     }

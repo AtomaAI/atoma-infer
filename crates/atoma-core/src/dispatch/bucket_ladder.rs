@@ -107,7 +107,9 @@ pub enum BucketLadderError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::num::NonZeroUsize;
+
+    use super::{BucketLadder, BucketLadderError, Platform};
 
     #[test]
     fn default_hopper_bucket_ladder_is_the_contract_list() {

@@ -25,7 +25,7 @@ pub(crate) mod test_support {
 
     use crate::dispatch::LiveBatch;
 
-    pub(crate) fn count(value: usize) -> NonZeroUsize {
+    pub(crate) fn nonzero(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("test counts are nonzero")
     }
 
@@ -35,8 +35,8 @@ pub(crate) mod test_support {
         uniform_decode: bool,
     ) -> LiveBatch {
         LiveBatch {
-            token_count: count(token_count),
-            request_count: count(request_count),
+            token_count: nonzero(token_count),
+            request_count: nonzero(request_count),
             uniform_decode,
         }
     }
