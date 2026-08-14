@@ -106,14 +106,35 @@ pub enum ArenaLayout {
     /// One slot per layer per role, no sharing: the reference layout that reuse layouts are
     /// checked against.
     NoReuse,
+    /// No-reuse placement plus a fill schedule ([`CaptureArena::poison_fills`]) that writes
+    /// [`POISON_BYTE`] over every slot before its role's first use and after its last use, so a
+    /// read outside a role's lifetime yields deterministic garbage rather than plausible
+    /// numbers. Placement must not share bytes: reuse would put another role's live, plausible
+    /// data where stale reads land.
+    Poison,
 }
 
 impl Default for ArenaLayout {
     /// Greedy earliest-fit is the layout to build unless a run is checking against the
-    /// reference layout.
+    /// reference layout or poisoning lifetime declarations.
     fn default() -> Self {
         ArenaLayout::Greedy
     }
+}
+
+/// The byte every poison fill writes. All-ones bytes decode to NaN in f32, f16, and bf16, so a
+/// stale read of poisoned bytes surfaces as NaN under any float interpretation instead of as
+/// plausible numbers.
+pub const POISON_BYTE: u8 = 0xFF;
+
+/// One entry of the poison fill schedule: fill `len` bytes at `offset` with [`POISON_BYTE`],
+/// enqueued immediately before the op at global index `before_op`. A negative index precedes the
+/// step's first op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoisonFill {
+    pub before_op: isize,
+    pub offset: usize,
+    pub len: usize,
 }
 
 /// Rejected arena constructions.
@@ -141,6 +162,7 @@ pub struct CaptureArena {
     /// Tokens per bucket, indexed by [`BucketIdx`]. Uninterpreted: never sorted, deduplicated,
     /// or assumed monotonic.
     bucket_ladder: Vec<usize>,
+    layout: ArenaLayout,
     /// Slot offsets in bytes, indexed `[bucket][layer * num_roles + role]`.
     offsets: Vec<Vec<usize>>,
     /// Bytes each bucket addresses, indexed by [`BucketIdx`].
@@ -175,6 +197,7 @@ impl CaptureArena {
             num_layers,
             role_table,
             bucket_ladder: bucket_ladder.to_vec(),
+            layout,
             offsets: Vec::new(),
             bucket_extents: Vec::new(),
         };
@@ -182,12 +205,42 @@ impl CaptureArena {
             let bucket = BucketIdx(bucket);
             let (table, extent) = match layout {
                 ArenaLayout::Greedy => arena.place_greedy(bucket),
-                ArenaLayout::NoReuse => arena.place_no_reuse(bucket),
+                ArenaLayout::NoReuse | ArenaLayout::Poison => arena.place_no_reuse(bucket),
             };
             arena.offsets.push(table);
             arena.bucket_extents.push(extent);
         }
         Ok(arena)
+    }
+
+    /// The fill schedule `layout` requires for `bucket`: under [`ArenaLayout::Poison`], two
+    /// fills per slot — one before its role's first use, one after its last use — sorted by
+    /// (before_op, offset). The other layouts require none.
+    ///
+    /// The schedule keeps the pattern standing across replays: each step re-poisons every slot
+    /// it consumed, so the caller fills the arena with [`POISON_BYTE`] once at allocation and
+    /// from then on only enqueues these fills.
+    pub fn poison_fills(&self, bucket: BucketIdx) -> Vec<PoisonFill> {
+        if self.layout != ArenaLayout::Poison {
+            return Vec::new();
+        }
+        let mut fills = Vec::with_capacity(2 * self.num_layers * self.num_roles());
+        for layer in 0..self.num_layers {
+            for role in 0..self.num_roles() {
+                let (live_from, live_until) = self.slot_lifetime(layer * self.num_roles() + role);
+                let offset = self.offset(bucket, LayerIdx(layer), TensorRole(role));
+                let len = self.slot_size(bucket, TensorRole(role));
+                for before_op in [live_from, live_until] {
+                    fills.push(PoisonFill {
+                        before_op,
+                        offset,
+                        len,
+                    });
+                }
+            }
+        }
+        fills.sort_unstable_by_key(|fill| (fill.before_op, fill.offset));
+        fills
     }
 
     /// The global lifetime of one slot: the declared frame-relative lifetime shifted by its
@@ -757,6 +810,126 @@ mod tests {
             }
         }
         assert_eq!(reversed.total_size(), sorted.total_size());
+    }
+
+    fn poison(
+        num_layers: usize,
+        ops_per_layer: usize,
+        roles: Vec<RoleDeclaration>,
+        ladder: &[usize],
+    ) -> CaptureArena {
+        CaptureArena::new(
+            num_layers,
+            RoleTable {
+                ops_per_layer,
+                roles,
+            },
+            ladder,
+            ArenaLayout::Poison,
+        )
+        .expect("test role tables declare valid lifetimes")
+    }
+
+    #[test]
+    fn poison_places_like_no_reuse() {
+        let roles = vec![declared(100, 0, 2), declared(300, 1, 3)];
+        let poisoned = poison(2, 4, roles.clone(), &[2, 8]);
+        let reference = CaptureArena::new(
+            2,
+            RoleTable {
+                ops_per_layer: 4,
+                roles,
+            },
+            &[2, 8],
+            ArenaLayout::NoReuse,
+        )
+        .expect("valid lifetimes");
+
+        for bucket in [BucketIdx(0), BucketIdx(1)] {
+            assert_eq!(
+                live_ranges(&poisoned, bucket),
+                live_ranges(&reference, bucket)
+            );
+        }
+    }
+
+    #[test]
+    fn poison_fills_bracket_every_lifetime() {
+        let roles = vec![declared(100, -1, 3), declared(300, 0, 2)];
+        let arena = poison(2, 4, roles, &[2]);
+        let fills = arena.poison_fills(BucketIdx(0));
+
+        // Two fills per (layer, role) slot: one at first use, one at last use.
+        assert_eq!(fills.len(), 2 * 2 * 2);
+        for ((live_from, live_until), (start, end)) in live_ranges(&arena, BucketIdx(0)) {
+            for boundary in [live_from, live_until] {
+                let fill = PoisonFill {
+                    before_op: boundary,
+                    offset: start,
+                    len: end - start,
+                };
+                assert!(fills.contains(&fill), "missing {fill:?} in {fills:?}");
+            }
+        }
+        for pair in fills.windows(2) {
+            assert!(
+                (pair[0].before_op, pair[0].offset) <= (pair[1].before_op, pair[1].offset),
+                "fills are not sorted for stable enqueue order"
+            );
+        }
+    }
+
+    #[test]
+    fn greedy_and_no_reuse_require_no_fills() {
+        let roles = vec![declared(100, 0, 2)];
+        assert!(greedy(1, 2, roles, &[2])
+            .poison_fills(BucketIdx(0))
+            .is_empty());
+        assert!(no_reuse(1, &[100], &[2])
+            .poison_fills(BucketIdx(0))
+            .is_empty());
+    }
+
+    #[test]
+    fn poison_keeps_the_pattern_outside_every_lifetime_across_replays() {
+        // Three roles on a 4-op order over 3 layers: a residual entering from the previous
+        // layer, a short-lived role, and one live through the frame tail. The simulation plays
+        // the schedule against a host buffer exactly as a captured step would: fills before the
+        // op they are scheduled at, producer writes at first use, then every byte is checked.
+        let roles = vec![declared(4, -1, 3), declared(4, 0, 1), declared(4, 1, 4)];
+        let arena = poison(3, 4, roles, &[2]);
+        let fills = arena.poison_fills(BucketIdx(0));
+        let slots = live_ranges(&arena, BucketIdx(0));
+
+        let first_op = slots.iter().map(|&((from, _), _)| from).min().unwrap();
+        let last_op = slots.iter().map(|&((_, until), _)| until).max().unwrap();
+        // The step starts from an arena-wide poison fill at allocation; every replay must then
+        // leave the buffer back in that state for the next one.
+        let mut bytes = vec![POISON_BYTE; arena.total_size()];
+        for replay in 0..2 {
+            for t in first_op..=last_op {
+                for fill in fills.iter().filter(|fill| fill.before_op == t) {
+                    bytes[fill.offset..fill.offset + fill.len].fill(POISON_BYTE);
+                }
+                for (slot, &((from, _), (start, end))) in slots.iter().enumerate() {
+                    if from == t {
+                        bytes[start..end].fill(u8::try_from(slot).unwrap() + 1);
+                    }
+                }
+                for (slot, &((from, until), (start, end))) in slots.iter().enumerate() {
+                    let expected = if from <= t && t < until {
+                        u8::try_from(slot).unwrap() + 1
+                    } else {
+                        POISON_BYTE
+                    };
+                    assert!(
+                        bytes[start..end].iter().all(|&b| b == expected),
+                        "slot {slot} live [{from}, {until}) holds the wrong bytes at op {t} \
+                         of replay {replay}"
+                    );
+                }
+            }
+        }
     }
 
     mod greedy_properties {
