@@ -13,6 +13,12 @@ _Avoid_: trace, record (as nouns)
 Launching a previously captured graph executable for one step.
 _Avoid_: playback, re-run
 
+**Allocation**:
+The first of the executor's three phases — Allocation, Capture, Replay — each named for the
+operation it permits. Allocation fixes every device address and binds every stream and
+communicator. Nothing is captured in it.
+_Avoid_: setup, init, startup
+
 **Bucket**:
 One captured batch size. A live batch is padded up to the nearest bucket.
 _Avoid_: shape, size class
@@ -22,6 +28,10 @@ The ordered list of buckets the engine captures. Always written qualified — "l
 ambiguous with the rung ladder.
 _Avoid_: capture sizes, batch-size list
 
+**Graph key**:
+The value that selects one captured graph for a padded batch.
+_Avoid_: signature, shape id, cache key
+
 **Rung**:
 A numbered project milestone, used in `rungN-MM` commit-message prefixes. Not a bucket.
 _Avoid_: ladder (unqualified), phase
@@ -29,6 +39,14 @@ _Avoid_: ladder (unqualified), phase
 **Arena**:
 The engine-owned device allocation from which every captured step's activations are addressed.
 _Avoid_: pool — a pool is a CUDA memory pool, which the arena deliberately is not
+
+**Role**:
+One tensor the step produces, declared with a per-token width and a lifetime.
+_Avoid_: tensor name, buffer kind
+
+**Lifetime**:
+The half-open range of a layer's op order in which a role's slot holds live data.
+_Avoid_: liveness, span
 
 **Slot**:
 The arena extent reserved for one tensor role in one layer.
@@ -42,9 +60,23 @@ _Avoid_: scratch, temporary
 One captured graph within a forward pass that is split around eager operations.
 _Avoid_: piece, partial graph
 
+**Break point**:
+The place in a forward pass where one segment ends and the next begins.
+_Avoid_: split, boundary, cut
+
 **Bridge buffer**:
 A fixed-address buffer through which an eager operation passes data between two segments.
 _Avoid_: intermediate buffer, staging buffer
+
+**Tier**:
+A residence class for a block's bytes. Device is the only tier built; host is the
+first planned addition. A tier is where bytes live, never a preemption mechanism.
+_Avoid_: swap — that names the deleted preemption path
+
+**Residence**:
+Which tier holds a block's bytes at a given moment. Residence is a property of the
+bytes; identity is the block hash and has no tier.
+_Avoid_: location, placement
 
 **Spike**:
 A time-boxed experiment that answers a design question with measurements on real hardware.
