@@ -78,6 +78,9 @@ pub enum RejectionReason {
 
 /// Admits `batch` to exactly one graph key, or rejects it for exactly one reason.
 ///
+/// Crate-internal: [`crate::dispatch::Dispatcher`] is the only public admission surface, so
+/// executors cannot re-derive dispatch truth outside this crate.
+///
 /// Checks run in a fixed order, so a batch failing several lands on the first: token count
 /// against the bucket ladder, request count against the captured maximum, uniform decode,
 /// then backend support level against the batch shape. Uniform decode comes before support so a
@@ -87,7 +90,7 @@ pub enum RejectionReason {
 ///
 /// Returns the [`RejectionReason`] naming the first failed check, carrying the numbers that
 /// caused it.
-pub fn admit(
+pub(crate) fn admit(
     batch: BatchShape,
     support_level: SupportLevel,
     captured_max_requests: usize,

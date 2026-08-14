@@ -12,7 +12,8 @@ mod dispatcher;
 mod key;
 mod lookup;
 
-pub use admission::{admit, BatchShape, RejectionReason, SupportLevel};
+pub(crate) use admission::admit;
+pub use admission::{BatchShape, RejectionReason, SupportLevel};
 pub use bucket_ladder::{BucketLadder, BucketLadderError, Platform};
 pub use dispatcher::{
     CaptureKind, DispatchConfig, DispatchDecision, Dispatcher, EagerFallbackCounters,
