@@ -1,15 +1,14 @@
 //! The capture arena: engine-owned addresses for every captured step's activations.
 //!
-//! One arena is shared by every bucket — buckets never replay concurrently, so the activation
-//! footprint is the largest bucket's, not the sum across the bucket ladder. A slot's address is a
-//! pure function of (bucket, layer, role): every bucket bumps from the same base, so address
-//! stability across replays is guaranteed by construction and needs no pinning, weak references,
-//! or write-back copies.
+//! One arena serves every bucket. Buckets never replay concurrently, so the arena is sized for
+//! the largest bucket, not for the sum across the bucket ladder. A slot's address is a pure
+//! function of (bucket, layer, role): every bucket bumps from the same base, so addresses stay
+//! stable across replays by construction, with no pinning, weak references, or write-back copies.
 //!
-//! Addresses are exposed only through [`CaptureArena::offset`] — never an open-coded formula at a
-//! call site — so the placement behind the lookup can change without touching any caller. The
-//! arena has no model knowledge: roles enter as caller-declared per-token widths and lifetimes,
-//! indexed positionally, and the bucket ladder as uninterpreted entries.
+//! Addresses are exposed only through [`CaptureArena::offset`], never as an open-coded formula at
+//! a call site, so how slots are placed can change without touching any caller. The arena has no
+//! model knowledge. Roles enter as caller-declared per-token widths and lifetimes, indexed
+//! positionally; the bucket ladder enters as uninterpreted entries.
 //!
 //! The arena holds only what is sized per bucket: activations and bridge buffers. Buffers sized
 //! once at the ladder maximum — per-step inputs, outputs, and kernel workspaces — are owned by
@@ -68,9 +67,10 @@ impl Dtype {
 /// Half-open range `[first_use, last_use)` of a layer's op order in which a role's slot holds
 /// live data.
 ///
-/// Indices are frame-relative and signed: an index below zero or beyond the op order names an op
-/// of an adjacent layer. That is how a residual stream entering a layer — written by the previous
-/// layer's last op — declares that its slot is already live at layer entry.
+/// Indices are signed and relative to the layer's own frame. An index below zero or beyond the op
+/// order names an op of a neighbouring layer. The residual stream is the motivating case: the
+/// previous layer's last op writes it, so it declares `first_use = -1` and is already live when
+/// its own layer starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lifetime {
     /// Op index of the first write into the slot.
@@ -108,11 +108,11 @@ pub enum ArenaLayout {
     /// One slot per layer per role, no sharing: the reference layout that reuse layouts are
     /// checked against.
     NoReuse,
-    /// No-reuse placement plus a fill schedule ([`CaptureArena::poison_fills`]) that writes
-    /// [`POISON_BYTE`] over every slot before its role's first use and after its last use, so a
-    /// read outside a role's lifetime yields deterministic garbage rather than plausible
-    /// numbers. Placement must not share bytes: reuse would put another role's live, plausible
-    /// data where stale reads land.
+    /// Places slots exactly like [`ArenaLayout::NoReuse`], and adds a fill schedule
+    /// ([`CaptureArena::poison_fills`]) that writes [`POISON_BYTE`] over every slot before its
+    /// role's first use and after its last use. A read outside a role's lifetime then yields
+    /// deterministic garbage instead of plausible numbers. Slots must not share bytes here:
+    /// reuse would put another role's live data exactly where stale reads land.
     Poison,
 }
 
@@ -127,7 +127,7 @@ impl ArenaLayout {
 
 impl Default for ArenaLayout {
     /// Greedy earliest-fit is the layout to build unless a run is checking against the
-    /// reference layout or poisoning lifetime declarations.
+    /// reference layout or hunting lifetime bugs with poison fills.
     fn default() -> Self {
         ArenaLayout::Greedy
     }
@@ -150,10 +150,11 @@ impl fmt::Display for ArenaLayout {
 pub const POISON_BYTE: u8 = 0xFF;
 
 /// One entry of the poison fill schedule: fill `len` bytes at `offset` with [`POISON_BYTE`],
-/// enqueued immediately before the op at global index `before_op`. Indices outside the step's
-/// op range are still part of the step: a negative index precedes the first op, and an index at
-/// or beyond the op count follows the final op — those trailing fills are the ones that restore
-/// the pattern for the next replay, so a consumer must not drop them.
+/// enqueued immediately before the op at global index `before_op`.
+///
+/// `before_op` may fall outside the step's op range, and such fills are still part of the step.
+/// A negative index precedes the first op. An index at or past the op count follows the final
+/// op; those trailing fills restore the pattern for the next replay, so do not drop them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoisonFill {
     pub before_op: isize,
@@ -187,8 +188,9 @@ struct PlacedSlot {
 
 /// Address layout for every captured step's activations. See the module docs for the invariants.
 ///
-/// The whole offset table is computed once at construction; [`CaptureArena::offset`] is a table
-/// lookup, so how slots are placed is a construction-time concern invisible at every call site.
+/// The whole offset table is computed once at construction, and [`CaptureArena::offset`] is a
+/// plain table lookup. How slots are placed is decided at construction and invisible at every
+/// call site.
 #[derive(Debug, Clone)]
 pub struct CaptureArena {
     num_layers: usize,
@@ -243,17 +245,16 @@ impl CaptureArena {
         Ok(arena)
     }
 
-    /// The fill schedule `layout` requires for `bucket`: under [`ArenaLayout::Poison`], two
-    /// fills per slot — one before its role's first use, one after its last use — sorted by
-    /// (before_op, offset). The other layouts require none.
+    /// The fill schedule `layout` requires for `bucket`. Under [`ArenaLayout::Poison`] there
+    /// are two fills per slot — one before its role's first use, one after its last use —
+    /// sorted by (before_op, offset). The other layouts require none.
     ///
-    /// The schedule keeps the pattern standing across replays: each step re-poisons every slot
+    /// The schedule keeps the pattern standing across replays. Each step re-poisons every slot
     /// it consumed, so the caller fills the arena with [`POISON_BYTE`] once at allocation and
-    /// from then on only enqueues these fills. The fill at first use looks redundant — the same
-    /// slot's last-use fill in the previous replay already re-poisoned it — but only within one
-    /// bucket: buckets share addresses under different slot geometry, so the first-use fill is
-    /// what restores this bucket's slot after a bucket switch, and it keeps every replay's
-    /// schedule correct in isolation.
+    /// then only enqueues these fills. The first-use fill is not made redundant by the previous
+    /// replay's last-use fill: that holds only within one bucket. Buckets share addresses under
+    /// different slot geometry, so after a bucket switch the first-use fill is what restores
+    /// this bucket's slot. It also keeps each replay's schedule correct on its own.
     pub fn poison_fills(&self, bucket: BucketIdx) -> Vec<PoisonFill> {
         if self.layout != ArenaLayout::Poison {
             return Vec::new();
@@ -427,7 +428,7 @@ pub trait WorkspaceRequirement {
 mod tests {
     use super::*;
 
-    /// Declares `width_bytes` with a minimal valid lifetime; no-reuse placement ignores
+    /// Declares `width_bytes` with a minimal valid lifetime. The no-reuse layout ignores
     /// lifetimes, so tests that only exercise addressing declare the simplest one.
     fn role(width_bytes: usize) -> RoleDeclaration {
         RoleDeclaration {
@@ -763,7 +764,7 @@ mod tests {
     #[test]
     fn greedy_reuse_stops_scaling_with_layer_count() {
         // One role live for a single op: every layer's slot is dead before the next layer's is
-        // live, so the whole ladder of layers shares one slot and the footprint is flat.
+        // live. So all the layers share one slot, and the footprint is flat at any depth.
         let shallow = greedy(4, 1, vec![declared(100, 0, 1)], &[2]);
         let deep = greedy(32, 1, vec![declared(100, 0, 1)], &[2]);
 
@@ -773,9 +774,9 @@ mod tests {
 
     #[test]
     fn greedy_layers_chain_through_a_residual_role() {
-        // A residual role live from the previous layer's last op (-1) through the whole next
-        // frame overlaps its neighbouring layers' instances, so consecutive layers must not
-        // share its slot — but layers two apart may, giving a ping-pong at constant footprint.
+        // A residual role enters at -1 and stays live through most of its frame, so it overlaps
+        // its neighbouring layers' instances. Consecutive layers must not share its slot.
+        // Layers two apart may, which gives a ping-pong at constant footprint.
         let roles = vec![declared(100, -1, 3), declared(100, 0, 1)];
         let arena = greedy(8, 3, roles, &[2]);
 
@@ -792,12 +793,12 @@ mod tests {
 
     #[test]
     fn bridge_role_spanning_a_break_point_is_never_overlapped_while_live() {
-        // One layer, op order 0..12, break point between ops 5 and 6: the bridge is written in
+        // One layer, op order 0..12, break point between ops 5 and 6. The bridge is written in
         // the first segment (op 3) and read in the second (through op 8), so its declared
-        // lifetime spans the break. The arena knows no break points — model knowledge stays
-        // with the caller — so that lifetime is the whole protection: every role live anywhere
-        // in [3, 9) must leave the bridge's bytes alone, and only a role live entirely outside
-        // it may reuse them.
+        // lifetime covers the break. The arena knows no break points — model knowledge stays
+        // with the caller — so that lifetime is the whole protection. Every role live anywhere
+        // in [3, 9) must leave the bridge's bytes alone. Only a role live entirely outside that
+        // range may reuse them.
         let bridge = declared(100, 3, 9);
         let declarations = vec![
             bridge,
@@ -943,8 +944,9 @@ mod tests {
     fn poison_keeps_the_pattern_outside_every_lifetime_across_replays() {
         // Three roles on a 4-op order over 3 layers: a residual entering from the previous
         // layer, a short-lived role, and one live through the frame tail. The simulation plays
-        // the schedule against a host buffer exactly as a captured step would: fills before the
-        // op they are scheduled at, producer writes at first use, then every byte is checked.
+        // the schedule against host memory exactly as a captured step would. Fills run before
+        // the op they are scheduled at, producers write at first use, and after every op each
+        // byte is checked.
         let roles = vec![declared(4, -1, 3), declared(4, 0, 1), declared(4, 1, 4)];
         let arena = poison(3, 4, roles, &[2]);
         let fills = arena.poison_fills(BucketIdx(0));
@@ -953,7 +955,7 @@ mod tests {
         let first_op = slots.iter().map(|&((from, _), _)| from).min().unwrap();
         let last_op = slots.iter().map(|&((_, until), _)| until).max().unwrap();
         // The step starts from an arena-wide poison fill at allocation; every replay must then
-        // leave the buffer back in that state for the next one.
+        // leave the bytes back in that state for the next one.
         let mut bytes = vec![POISON_BYTE; arena.total_size()];
         for replay in 0..2 {
             for t in first_op..=last_op {

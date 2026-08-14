@@ -68,10 +68,10 @@ impl Role {
         }
     }
 
-    /// Lifetime in the [`OPS_PER_LAYER`] op order, read off `run_step`'s enqueue order; keep the
-    /// two in step. `Hidden` enters at -1 because the previous layer's mlp residual add (op 12,
-    /// frame-relative -1) writes it; `Normed` is the hull of its two live intervals, written at
-    /// op 0 and again at op 7.
+    /// Lifetime in the [`OPS_PER_LAYER`] op order, read off `run_step`'s enqueue order — keep
+    /// the two in step. `Hidden` enters at -1 because the previous layer's mlp residual add
+    /// (op 12, frame-relative -1) writes it. `Normed` is written twice, at op 0 and again at
+    /// op 7, so its declaration covers both live intervals.
     pub fn lifetime(self) -> Lifetime {
         let frame_end = isize::try_from(OPS_PER_LAYER).expect("op order fits in isize");
         let (first_use, last_use) = match self {
@@ -110,9 +110,9 @@ fn role_table(dims: &ModelDims) -> RoleTable {
 /// Builds the arena for `buckets` (batch sizes; decode steps have one token per sequence), with
 /// the extra layer row for the final residual.
 ///
-/// The layout is explicitly no-reuse: these offsets are the ones the H100 stint verified
-/// bit-identical under capture and replay, so the reuse layout's device debut is a rig decision,
-/// not a side effect of building this arena.
+/// The layout is explicitly no-reuse. These offsets are the ones the H100 stint verified
+/// bit-identical under capture and replay; switching the harness to the reuse layout is a rig
+/// decision, not a side effect of building this arena.
 pub fn build_arena(dims: &ModelDims, buckets: &[usize]) -> CaptureArena {
     arena_with_layout(dims, buckets, ArenaLayout::NoReuse)
 }
@@ -222,13 +222,13 @@ mod tests {
     #[test]
     fn arena_sizes_by_layout_at_production_dimensions() {
         // Production dimensions: the full 32-layer 8B shape over the harness bucket ladder.
-        // No-reuse and poison place one slot per layer per role — 33 rows (32 layers plus the
-        // final-residual row) * 64 tokens * 147456 bytes per token = 297 MiB — which is
-        // closed-form, so pinned exactly. Greedy is asserted by its contract rather than its
-        // exact byte count, which would pin the earliest-fit tie-breaking: bounded below by the
-        // peak live set — Mid, Gate, Up and FfnAct at op 10 are 94208 bytes per token, or
-        // 6029312 bytes at bucket 64 — bounded above by fragmentation headroom under twice that
-        // peak, and flat in layer count.
+        //
+        // No-reuse and poison place one slot per layer per role, so their size is closed-form:
+        // 33 rows (32 layers plus the final-residual row) * 64 tokens * 147456 bytes per token
+        // = 297 MiB, pinned exactly. Greedy is asserted by its contract instead, because an
+        // exact byte count would pin the earliest-fit tie-breaking. The contract: at least the
+        // peak live set (Mid, Gate, Up and FfnAct at op 10 = 94208 bytes per token = 6029312
+        // bytes at bucket 64), under twice that peak, and flat in layer count.
         let dims = ModelDims::llama_8b_shaped(32);
         let sizes = arena_sizes_by_layout(&dims, &[1, 8, 32, 64]);
 
