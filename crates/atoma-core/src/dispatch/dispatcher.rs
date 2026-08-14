@@ -1,5 +1,7 @@
 //! The dispatcher: owns dispatch truth for every live batch.
 
+use std::num::NonZeroUsize;
+
 use tracing::debug;
 
 use crate::dispatch::{
@@ -21,7 +23,7 @@ pub struct DispatchConfig {
     /// The buckets the engine captured.
     pub bucket_ladder: BucketLadder,
     /// The largest request count any captured graph serves.
-    pub captured_max_requests: usize,
+    pub captured_max_requests: NonZeroUsize,
     /// The minimum support level across the active backends, settled at Allocation.
     pub support_level: SupportLevel,
     /// How the captured set was recorded.
@@ -95,7 +97,7 @@ impl EagerFallbackCounters {
 #[derive(Debug)]
 pub struct Dispatcher {
     lookup: PaddingLookup,
-    captured_max_requests: usize,
+    captured_max_requests: NonZeroUsize,
     support_level: SupportLevel,
     capture_kind: CaptureKind,
     fallbacks: EagerFallbackCounters,
@@ -161,7 +163,7 @@ mod tests {
     fn dispatcher(support_level: SupportLevel, capture_kind: CaptureKind) -> Dispatcher {
         Dispatcher::new(&DispatchConfig {
             bucket_ladder: BucketLadder::default_for(Platform::Hopper),
-            captured_max_requests: 512,
+            captured_max_requests: count(512),
             support_level,
             capture_kind,
         })
@@ -195,7 +197,7 @@ mod tests {
             dispatcher.dispatch(batch(600, 600, true)),
             DispatchDecision::Eager(RejectionReason::TokensAboveBucketLadderMaximum {
                 token_count: count(600),
-                bucket_ladder_maximum: 512,
+                bucket_ladder_maximum: Some(count(512)),
             })
         );
     }

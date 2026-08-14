@@ -14,7 +14,7 @@ pub struct PaddingLookup {
     /// `next_bucket[tokens]` is the smallest bucket holding `tokens`, for counts up to the
     /// bucket-ladder maximum.
     next_bucket: Box<[Option<NonZeroUsize>]>,
-    bucket_ladder_maximum: usize,
+    bucket_ladder_maximum: Option<NonZeroUsize>,
 }
 
 impl PaddingLookup {
@@ -22,7 +22,7 @@ impl PaddingLookup {
     #[must_use]
     pub fn new(bucket_ladder: &BucketLadder) -> Self {
         let bucket_ladder_maximum = bucket_ladder.maximum();
-        let next_bucket = (0..=bucket_ladder_maximum)
+        let next_bucket = (0..=bucket_ladder_maximum.map_or(0, NonZeroUsize::get))
             .map(|tokens| {
                 let smallest_holding = bucket_ladder
                     .buckets()
@@ -45,10 +45,10 @@ impl PaddingLookup {
         self.next_bucket.get(tokens.get()).copied().flatten()
     }
 
-    /// The largest bucket in the bucket ladder this lookup was built from; zero for an empty
+    /// The largest bucket in the bucket ladder this lookup was built from; `None` for an empty
     /// bucket ladder.
     #[must_use]
-    pub fn bucket_ladder_maximum(&self) -> usize {
+    pub fn bucket_ladder_maximum(&self) -> Option<NonZeroUsize> {
         self.bucket_ladder_maximum
     }
 }
@@ -139,7 +139,7 @@ mod tests {
             Some(64)
         );
         assert_eq!(lookup.bucket_for(count(65)), None);
-        assert_eq!(lookup.bucket_ladder_maximum(), 64);
+        assert_eq!(lookup.bucket_ladder_maximum(), NonZeroUsize::new(64));
     }
 
     #[test]
@@ -147,7 +147,7 @@ mod tests {
         let bucket_ladder = BucketLadder::new(Vec::new()).unwrap();
         let lookup = PaddingLookup::new(&bucket_ladder);
         assert_eq!(lookup.bucket_for(count(1)), None);
-        assert_eq!(lookup.bucket_ladder_maximum(), 0);
+        assert_eq!(lookup.bucket_ladder_maximum(), None);
     }
 
     proptest! {

@@ -1,5 +1,7 @@
 //! The bucket ladder: the ordered list of buckets the engine captures.
 
+use std::num::NonZeroUsize;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -67,10 +69,14 @@ impl BucketLadder {
         &self.buckets
     }
 
-    /// The largest bucket, or zero for an empty bucket ladder.
+    /// The largest bucket, or `None` for an empty bucket ladder.
     #[must_use]
-    pub fn maximum(&self) -> usize {
-        self.buckets.iter().copied().max().unwrap_or(0)
+    pub fn maximum(&self) -> Option<NonZeroUsize> {
+        self.buckets
+            .iter()
+            .copied()
+            .max()
+            .and_then(NonZeroUsize::new)
     }
 }
 
@@ -111,7 +117,7 @@ mod tests {
             320, 384, 448, 512,
         ];
         assert_eq!(bucket_ladder.buckets(), expected);
-        assert_eq!(bucket_ladder.maximum(), 512);
+        assert_eq!(bucket_ladder.maximum(), NonZeroUsize::new(512));
     }
 
     #[test]
@@ -121,14 +127,14 @@ mod tests {
         let (shared, extension) = bucket_ladder.buckets().split_at(hopper.buckets().len());
         assert_eq!(shared, hopper.buckets());
         assert_eq!(extension, [576, 640, 704, 768, 832, 896, 960, 1024]);
-        assert_eq!(bucket_ladder.maximum(), 1024);
+        assert_eq!(bucket_ladder.maximum(), NonZeroUsize::new(1024));
     }
 
     #[test]
     fn bucket_ladder_preserves_order_and_duplicates() {
         let bucket_ladder = BucketLadder::new(vec![64, 8, 8, 32]).unwrap();
         assert_eq!(bucket_ladder.buckets(), [64, 8, 8, 32]);
-        assert_eq!(bucket_ladder.maximum(), 64);
+        assert_eq!(bucket_ladder.maximum(), NonZeroUsize::new(64));
     }
 
     #[test]
@@ -140,10 +146,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_bucket_ladder_has_zero_maximum() {
+    fn empty_bucket_ladder_has_no_maximum() {
         let bucket_ladder = BucketLadder::new(Vec::new()).unwrap();
         assert!(bucket_ladder.buckets().is_empty());
-        assert_eq!(bucket_ladder.maximum(), 0);
+        assert_eq!(bucket_ladder.maximum(), None);
     }
 
     #[test]
