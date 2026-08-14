@@ -5,6 +5,13 @@ license     = "Apache-2.0"
 name        = "atoma-core"
 version     = { workspace = true }
 
+[dependencies]
+serde     = { workspace = true, features = [ "derive" ] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints.clippy]
 await_holding_lock      = "deny"
 dbg_macro               = "deny"
