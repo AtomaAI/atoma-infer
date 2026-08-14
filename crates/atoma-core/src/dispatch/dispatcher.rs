@@ -22,7 +22,7 @@ pub struct DispatchConfig {
     pub bucket_ladder: BucketLadder,
     /// The largest request count any captured graph serves.
     pub captured_max_requests: usize,
-    /// The minimum support level across the active backends, settled at startup.
+    /// The minimum support level across the active backends, settled at Allocation.
     pub support_level: SupportLevel,
     /// How the captured set was recorded.
     pub capture_kind: CaptureKind,
@@ -87,7 +87,7 @@ impl EagerFallbackCounters {
 
 /// Owns dispatch truth: which captured graph serves a live batch, or why none does.
 ///
-/// Built once at startup and never modified afterwards — no method changes the bucket ladder,
+/// Built once at Allocation and never modified afterwards — no method changes the bucket ladder,
 /// the captured set or the support level, so no code path recaptures at runtime.
 /// Dispatch priority is full-graph replay, then segmented replay, then eager: an admitted batch
 /// replays the whole pass when the captured set records whole passes, replays segments when it is

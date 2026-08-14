@@ -14,8 +14,6 @@ pub enum Platform {
 
 impl Platform {
     /// The largest bucket the default bucket ladder reaches on this platform.
-    ///
-    /// Contract defaults (#188): 512 by default, 1024 on data-center Blackwell.
     #[must_use]
     pub fn bucket_ladder_maximum(self) -> usize {
         match self {
