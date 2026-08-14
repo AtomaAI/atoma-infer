@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a5661f8bc045c94acc1786cd3741eecac027d7f9803baaa3cf2ddde16d89c891 # shrinks to num_layers = 1, ops_per_layer = 1, roles = [RoleDeclaration { width_bytes: 1, lifetime: Lifetime { first_use: 0, last_use: 1 } }, RoleDeclaration { width_bytes: 1, lifetime: Lifetime { first_use: 0, last_use: 1 } }], ladder = [1]
