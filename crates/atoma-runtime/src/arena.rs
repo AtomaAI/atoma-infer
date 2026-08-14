@@ -57,6 +57,9 @@ impl Dtype {
 }
 
 /// Address layout for every captured step's activations. See the module docs for the invariants.
+///
+/// The whole offset table is computed once at construction; [`CaptureArena::offset`] is a table
+/// lookup, so how slots are placed is a construction-time concern invisible at every call site.
 #[derive(Debug, Clone)]
 pub struct CaptureArena {
     num_layers: usize,
@@ -65,17 +68,38 @@ pub struct CaptureArena {
     /// Tokens per bucket, indexed by [`BucketIdx`]. Uninterpreted: never sorted, deduplicated,
     /// or assumed monotonic.
     bucket_ladder: Vec<usize>,
+    /// Slot offsets in bytes, indexed `[bucket][layer * num_roles + role]`.
+    offsets: Vec<Vec<usize>>,
+    /// Bytes each bucket addresses, indexed by [`BucketIdx`].
+    bucket_extents: Vec<usize>,
 }
 
 impl CaptureArena {
     /// Builds the arena layout from `num_layers` layers, caller-declared per-token role widths
     /// in bytes, and the bucket ladder in tokens per bucket.
     pub fn new(num_layers: usize, role_widths: &[usize], bucket_ladder: &[usize]) -> Self {
-        Self {
+        let mut arena = Self {
             num_layers,
             role_widths: role_widths.to_vec(),
             bucket_ladder: bucket_ladder.to_vec(),
+            offsets: Vec::new(),
+            bucket_extents: Vec::new(),
+        };
+        for bucket in 0..arena.bucket_ladder.len() {
+            let bucket = BucketIdx(bucket);
+            let per_layer = arena.layer_extent(bucket);
+            let mut table = Vec::with_capacity(num_layers * arena.role_widths.len());
+            for layer in 0..num_layers {
+                let mut within_layer = 0;
+                for role in 0..arena.role_widths.len() {
+                    table.push(layer * per_layer + within_layer);
+                    within_layer += arena.slot_size(bucket, TensorRole(role));
+                }
+            }
+            arena.offsets.push(table);
+            arena.bucket_extents.push(num_layers * per_layer);
         }
+        arena
     }
 
     /// Byte offset of the slot holding `role`'s activation for `layer` under `bucket`.
@@ -83,6 +107,12 @@ impl CaptureArena {
     /// One slot per layer, no liveness-based reuse: a wrong reuse decision cannot corrupt
     /// numbers silently inside a replay.
     pub fn offset(&self, bucket: BucketIdx, layer: LayerIdx, role: TensorRole) -> usize {
+        assert!(
+            bucket.0 < self.bucket_ladder.len(),
+            "bucket index {} out of range: the bucket ladder has {} buckets",
+            bucket.0,
+            self.bucket_ladder.len()
+        );
         assert!(
             layer.0 < self.num_layers,
             "layer index {} out of range: the arena was built for {} layers",
@@ -95,11 +125,7 @@ impl CaptureArena {
             role.0,
             self.role_widths.len()
         );
-        let per_layer: usize = self.layer_extent(bucket);
-        let within_layer: usize = (0..role.0)
-            .map(|r| self.slot_size(bucket, TensorRole(r)))
-            .sum();
-        layer.0 * per_layer + within_layer
+        self.offsets[bucket.0][layer.0 * self.role_widths.len() + role.0]
     }
 
     /// Size in bytes of the slot holding `role`'s activation under `bucket`.
@@ -116,16 +142,19 @@ impl CaptureArena {
 
     /// Total bytes `bucket` addresses: every layer's slots for every role.
     pub fn bucket_footprint(&self, bucket: BucketIdx) -> usize {
-        self.num_layers * self.layer_extent(bucket)
+        assert!(
+            bucket.0 < self.bucket_ladder.len(),
+            "bucket index {} out of range: the bucket ladder has {} buckets",
+            bucket.0,
+            self.bucket_ladder.len()
+        );
+        self.bucket_extents[bucket.0]
     }
 
     /// Bytes of device memory backing the arena: the largest bucket's footprint, since every
     /// bucket bumps from the same base and buckets never replay concurrently.
     pub fn total_size(&self) -> usize {
-        (0..self.bucket_ladder.len())
-            .map(|b| self.bucket_footprint(BucketIdx(b)))
-            .max()
-            .unwrap_or(0)
+        self.bucket_extents.iter().copied().max().unwrap_or(0)
     }
 
     fn layer_extent(&self, bucket: BucketIdx) -> usize {
