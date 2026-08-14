@@ -128,8 +128,10 @@ impl Default for ArenaLayout {
 pub const POISON_BYTE: u8 = 0xFF;
 
 /// One entry of the poison fill schedule: fill `len` bytes at `offset` with [`POISON_BYTE`],
-/// enqueued immediately before the op at global index `before_op`. A negative index precedes the
-/// step's first op.
+/// enqueued immediately before the op at global index `before_op`. Indices outside the step's
+/// op range are still part of the step: a negative index precedes the first op, and an index at
+/// or beyond the op count follows the final op — those trailing fills are the ones that restore
+/// the pattern for the next replay, so a consumer must not drop them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoisonFill {
     pub before_op: isize,
@@ -342,7 +344,8 @@ impl CaptureArena {
         (self.role_table.roles[role.0].width_bytes * tokens).next_multiple_of(SLOT_ALIGN)
     }
 
-    /// Total bytes `bucket` addresses: every layer's slots for every role.
+    /// Total bytes `bucket` addresses: the extent of its placed slots, with bytes shared
+    /// between lifetime-disjoint slots counted once.
     pub fn bucket_footprint(&self, bucket: BucketIdx) -> usize {
         assert!(
             bucket.0 < self.bucket_ladder.len(),
@@ -697,6 +700,11 @@ mod tests {
     }
 
     #[test]
+    fn greedy_is_the_default_layout() {
+        assert_eq!(ArenaLayout::default(), ArenaLayout::Greedy);
+    }
+
+    #[test]
     fn greedy_shares_an_offset_between_disjoint_lifetimes() {
         let arena = greedy(1, 4, vec![declared(100, 0, 2), declared(100, 2, 4)], &[2]);
 
@@ -941,9 +949,9 @@ mod tests {
             fn role_declarations()(
                 width_bytes in 1usize..4096,
                 first_use in -16isize..16,
-                span in 1isize..24,
+                live_ops in 1isize..24,
             ) -> RoleDeclaration {
-                declared(width_bytes, first_use, first_use + span)
+                declared(width_bytes, first_use, first_use + live_ops)
             }
         }
 
