@@ -64,14 +64,12 @@ mod tests {
     use crate::dispatch::test_support::count;
     use crate::dispatch::{BucketLadder, Platform};
 
-    /// Test-side oracle: linear scan for the smallest bucket holding `token_count`.
-    fn naive_next_bucket(bucket_ladder: &BucketLadder, token_count: usize) -> Option<usize> {
-        bucket_ladder
-            .buckets()
-            .iter()
-            .copied()
-            .filter(|&bucket| bucket >= token_count)
-            .min()
+    /// Test-side oracle, independent of the table's filter-and-min: sort a copy of the ladder
+    /// and take the first bucket that holds `token_count`.
+    fn sorted_scan_next_bucket(bucket_ladder: &BucketLadder, token_count: usize) -> Option<usize> {
+        let mut sorted = bucket_ladder.buckets().to_vec();
+        sorted.sort_unstable();
+        sorted.into_iter().find(|&bucket| bucket >= token_count)
     }
 
     #[test]
@@ -88,7 +86,7 @@ mod tests {
                 // One past a bucket pads to the next bucket up, or to nothing at the top.
                 assert_eq!(
                     lookup.bucket_for(count(bucket + 1)).map(NonZeroUsize::get),
-                    naive_next_bucket(&bucket_ladder, bucket + 1)
+                    sorted_scan_next_bucket(&bucket_ladder, bucket + 1)
                 );
                 // One short of a bucket never overshoots it.
                 if bucket > 1 {
@@ -152,7 +150,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn dense_table_agrees_with_naive_scan(
+        fn dense_table_agrees_with_sorted_scan(
             buckets in vec(1_usize..=256, 0..=24),
             token_count in 1_usize..=300,
         ) {
@@ -160,7 +158,7 @@ mod tests {
             let lookup = PaddingLookup::new(&bucket_ladder);
             prop_assert_eq!(
                 lookup.bucket_for(count(token_count)).map(NonZeroUsize::get),
-                naive_next_bucket(&bucket_ladder, token_count)
+                sorted_scan_next_bucket(&bucket_ladder, token_count)
             );
         }
     }
