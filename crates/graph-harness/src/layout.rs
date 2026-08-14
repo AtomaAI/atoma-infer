@@ -1,9 +1,16 @@
 //! Arena roles, static buffer sizes, and the device memory budget of the harness step.
 
-use atoma_runtime::arena::{CaptureArena, Dtype, TensorRole};
+use atoma_runtime::arena::{
+    ArenaLayout, CaptureArena, Dtype, Lifetime, RoleDeclaration, RoleTable, TensorRole,
+};
 use serde::Serialize;
 
 use crate::dims::{ModelDims, BF16_BYTES};
+
+/// Length of one layer's linear op order in `run_step`: rmsnorm1 (0), qkv gemm (1), rope (2),
+/// kv write (3), attention (4), o gemm (5), attention residual add (6), rmsnorm2 (7),
+/// gate gemm (8), up gemm (9), silu_mul (10), down gemm (11), mlp residual add (12).
+pub const OPS_PER_LAYER: usize = 13;
 
 /// One activation tensor the step produces per layer, addressed through the capture arena.
 ///
@@ -60,13 +67,70 @@ impl Role {
             Role::Gate | Role::Up | Role::FfnAct => Dtype::Bf16.width_bytes(dims.ffn),
         }
     }
+
+    /// Lifetime in the [`OPS_PER_LAYER`] op order, read off `run_step`'s enqueue order — keep
+    /// the two in step. `Hidden` enters at -1 because the previous layer's mlp residual add
+    /// (op 12, frame-relative -1) writes it. `Normed` is written twice, at op 0 and again at
+    /// op 7, so its declaration covers both live intervals.
+    pub fn lifetime(self) -> Lifetime {
+        let frame_end = isize::try_from(OPS_PER_LAYER).expect("op order fits in isize");
+        let (first_use, last_use) = match self {
+            Role::Hidden => (-1, 7),
+            Role::Normed => (0, 10),
+            Role::Qkv => (1, 5),
+            Role::AttnOut => (4, 6),
+            Role::OProj => (5, 7),
+            Role::Mid => (6, frame_end),
+            Role::Gate => (8, 11),
+            Role::Up => (9, 11),
+            Role::FfnAct => (10, 12),
+            Role::FfnDown => (11, frame_end),
+        };
+        Lifetime {
+            first_use,
+            last_use,
+        }
+    }
+}
+
+fn role_table(dims: &ModelDims) -> RoleTable {
+    let roles = Role::ALL
+        .iter()
+        .map(|r| RoleDeclaration {
+            width_bytes: r.width_bytes(dims),
+            lifetime: r.lifetime(),
+        })
+        .collect();
+    RoleTable {
+        ops_per_layer: OPS_PER_LAYER,
+        roles,
+    }
 }
 
 /// Builds the arena for `buckets` (batch sizes; decode steps have one token per sequence), with
 /// the extra layer row for the final residual.
+///
+/// The layout is explicitly no-reuse. These offsets are the ones the H100 stint verified
+/// bit-identical under capture and replay; switching the harness to the reuse layout is a rig
+/// decision, not a side effect of building this arena.
 pub fn build_arena(dims: &ModelDims, buckets: &[usize]) -> CaptureArena {
-    let widths: Vec<usize> = Role::ALL.iter().map(|r| r.width_bytes(dims)).collect();
-    CaptureArena::new(dims.num_layers + 1, &widths, buckets)
+    arena_with_layout(dims, buckets, ArenaLayout::NoReuse)
+}
+
+/// Total arena bytes under each selectable layout, comparing the reuse layout against the
+/// reference at any model dimensions with no device present.
+pub fn arena_sizes_by_layout(dims: &ModelDims, buckets: &[usize]) -> [(ArenaLayout, usize); 3] {
+    ArenaLayout::ALL.map(|layout| {
+        (
+            layout,
+            arena_with_layout(dims, buckets, layout).total_size(),
+        )
+    })
+}
+
+fn arena_with_layout(dims: &ModelDims, buckets: &[usize], layout: ArenaLayout) -> CaptureArena {
+    CaptureArena::new(dims.num_layers + 1, role_table(dims), buckets, layout)
+        .expect("harness role lifetimes are declared valid")
 }
 
 /// Byte sizes of one cell's per-graph buffers: the graph's static inputs, outputs, and
@@ -153,6 +217,43 @@ mod tests {
         // The final residual row exists: layer index num_layers is valid.
         let final_hidden = arena.offset(BucketIdx(0), LayerIdx(2), Role::Hidden.tensor_role());
         assert!(final_hidden > 0);
+    }
+
+    #[test]
+    fn arena_sizes_by_layout_at_production_dimensions() {
+        // Production dimensions: the full 32-layer 8B shape over the harness bucket ladder.
+        //
+        // No-reuse and poison place one slot per layer per role, so their size is closed-form:
+        // 33 rows (32 layers plus the final-residual row) * 64 tokens * 147456 bytes per token
+        // = 297 MiB, pinned exactly. Greedy is asserted by its contract instead, because an
+        // exact byte count would pin the earliest-fit tie-breaking. The contract: at least the
+        // peak live set (Mid, Gate, Up and FfnAct at op 10 = 94208 bytes per token = 6029312
+        // bytes at bucket 64), under twice that peak, and flat in layer count.
+        let dims = ModelDims::llama_8b_shaped(32);
+        let sizes = arena_sizes_by_layout(&dims, &[1, 8, 32, 64]);
+
+        let [greedy, no_reuse, poison] = sizes;
+        assert_eq!(no_reuse, (ArenaLayout::NoReuse, 33 * 64 * 147_456));
+        assert_eq!(poison, (ArenaLayout::Poison, 33 * 64 * 147_456));
+
+        let (layout, greedy_bytes) = greedy;
+        assert_eq!(layout, ArenaLayout::Greedy);
+        let peak_live_bytes = 64 * (8_192 + 3 * 28_672);
+        assert!(
+            greedy_bytes >= peak_live_bytes,
+            "greedy beat the peak live set: {greedy_bytes}"
+        );
+        assert!(
+            greedy_bytes < 2 * peak_live_bytes,
+            "greedy fragmentation exceeds one extra live set: {greedy_bytes}"
+        );
+
+        let shallow_dims = ModelDims::llama_8b_shaped(8);
+        let [shallow_greedy, _, _] = arena_sizes_by_layout(&shallow_dims, &[1, 8, 32, 64]);
+        assert_eq!(
+            greedy_bytes, shallow_greedy.1,
+            "greedy footprint scales with layer count"
+        );
     }
 
     #[test]

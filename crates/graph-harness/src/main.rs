@@ -8,7 +8,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use graph_harness::dims::ModelDims;
 use graph_harness::gpu::runner::{self, RunConfig};
-use graph_harness::layout::{build_arena, kv_cache_bytes_each, StaticSizes};
+use graph_harness::layout::{arena_sizes_by_layout, build_arena, kv_cache_bytes_each, StaticSizes};
 use graph_harness::matrix::capture_matrix;
 use graph_harness::splits;
 
@@ -112,6 +112,11 @@ fn plan(args: &CommonArgs) -> Result<()> {
         dims.num_layers
     );
     println!("arena: {:.1} MiB (largest bucket)", mib(arena.total_size()));
+    let by_layout: Vec<String> = arena_sizes_by_layout(&dims, &ladder)
+        .iter()
+        .map(|&(layout, bytes)| format!("{layout} {:.1} MiB", mib(bytes)))
+        .collect();
+    println!("arena by layout: {}", by_layout.join(", "));
     println!("\ncells (execution order):");
     let mut statics_total = 0;
     for cell in &cells {
