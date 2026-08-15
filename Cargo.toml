@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/atoma-api",
+    "crates/atoma-core",
     "crates/atoma-kernels",
     "crates/atoma-runtime",
     "crates/backends",
@@ -19,6 +20,7 @@ version = "0.1.0"
 anyhow = "1.0.89"
 atoma-backends = { path = "crates/backends" }
 atoma-bench = { path = "crates/bench" }
+atoma-core = { path = "crates/atoma-core" }
 atoma-kernels = { path = "crates/atoma-kernels" }
 atoma-runtime = { path = "crates/atoma-runtime" }
 axum = "0.8"

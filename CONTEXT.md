@@ -28,6 +28,10 @@ The ordered list of buckets the engine captures. Always written qualified — "l
 ambiguous with the rung ladder.
 _Avoid_: capture sizes, batch-size list
 
+**Live batch**:
+The batch the scheduler reports for the current step, before padding.
+_Avoid_: batch shape
+
 **Graph key**:
 The value that selects one captured graph for a padded batch.
 _Avoid_: signature, shape id, cache key
