@@ -1,6 +1,6 @@
 //! The graph key: the value that selects one captured graph for a padded batch.
 
-use std::num::NonZeroUsize;
+use crate::protocol::{RequestCount, TokenCount};
 
 /// Selects one captured graph for a padded batch.
 ///
@@ -10,16 +10,16 @@ use std::num::NonZeroUsize;
 /// and compare keys but never mint one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GraphKey {
-    padded_token_count: NonZeroUsize,
-    request_count: NonZeroUsize,
+    padded_token_count: TokenCount,
+    request_count: RequestCount,
     uniform_decode: bool,
 }
 
 impl GraphKey {
     /// The one pure function of the current padded batch.
     pub(crate) fn from_padded_batch(
-        padded_token_count: NonZeroUsize,
-        request_count: NonZeroUsize,
+        padded_token_count: TokenCount,
+        request_count: RequestCount,
         uniform_decode: bool,
     ) -> Self {
         Self {
@@ -31,13 +31,13 @@ impl GraphKey {
 
     /// The batch's token count after padding up to its bucket.
     #[must_use]
-    pub fn padded_token_count(self) -> NonZeroUsize {
+    pub fn padded_token_count(self) -> TokenCount {
         self.padded_token_count
     }
 
     /// The exact number of live requests in the batch, excluding padding.
     #[must_use]
-    pub fn request_count(self) -> NonZeroUsize {
+    pub fn request_count(self) -> RequestCount {
         self.request_count
     }
 

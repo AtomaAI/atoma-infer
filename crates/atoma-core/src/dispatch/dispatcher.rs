@@ -1,7 +1,5 @@
 //! The dispatcher: owns dispatch truth for every live batch.
 
-use std::num::NonZeroUsize;
-
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -9,6 +7,7 @@ use crate::dispatch::{
     admit, BucketLadder, EagerFallbackCounters, GraphKey, LiveBatch, PaddingLookup,
     RejectionReason, SupportLevel,
 };
+use crate::protocol::RequestCount;
 
 /// How the captured set was recorded: whole forward passes, or segments around eager regions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,7 +26,7 @@ pub struct DispatchConfig {
     /// The buckets the engine captured.
     pub bucket_ladder: BucketLadder,
     /// The largest request count any captured graph serves.
-    pub captured_max_requests: NonZeroUsize,
+    pub captured_max_requests: RequestCount,
     /// The minimum support level across the active backends, settled at Allocation.
     pub support_level: SupportLevel,
     /// How the captured set was recorded.
@@ -55,7 +54,7 @@ pub enum DispatchDecision {
 #[derive(Debug)]
 pub struct Dispatcher {
     lookup: PaddingLookup,
-    captured_max_requests: NonZeroUsize,
+    captured_max_requests: RequestCount,
     support_level: SupportLevel,
     capture_kind: CaptureKind,
     fallbacks: EagerFallbackCounters,
@@ -111,7 +110,7 @@ mod tests {
     use tracing::Level;
 
     use super::{CaptureKind, DispatchConfig, DispatchDecision, Dispatcher, EagerFallbackCounters};
-    use crate::dispatch::test_support::{batch, nonzero};
+    use crate::dispatch::test_support::{batch, requests, tokens};
     use crate::dispatch::{BucketLadder, Platform, RejectionReason, SupportLevel};
 
     /// Log output collected behind the process-global subscriber.
@@ -148,7 +147,7 @@ mod tests {
     fn dispatcher(support_level: SupportLevel, capture_kind: CaptureKind) -> Dispatcher {
         Dispatcher::new(&DispatchConfig {
             bucket_ladder: BucketLadder::default_for(Platform::Hopper),
-            captured_max_requests: nonzero(512),
+            captured_max_requests: requests(512),
             support_level,
             capture_kind,
         })
@@ -160,8 +159,8 @@ mod tests {
         let DispatchDecision::FullReplay(key) = dispatcher.dispatch(batch(5, 5, true)) else {
             panic!("a full captured set must replay fully");
         };
-        assert_eq!(key.padded_token_count(), nonzero(8));
-        assert_eq!(key.request_count(), nonzero(5));
+        assert_eq!(key.padded_token_count(), tokens(8));
+        assert_eq!(key.request_count(), requests(5));
         assert!(key.uniform_decode());
         assert_eq!(dispatcher.fallbacks(), EagerFallbackCounters::default());
     }
@@ -172,8 +171,8 @@ mod tests {
         let DispatchDecision::SegmentedReplay(key) = dispatcher.dispatch(batch(5, 5, true)) else {
             panic!("a segmented captured set must replay segments");
         };
-        assert_eq!(key.padded_token_count(), nonzero(8));
-        assert_eq!(key.request_count(), nonzero(5));
+        assert_eq!(key.padded_token_count(), tokens(8));
+        assert_eq!(key.request_count(), requests(5));
     }
 
     #[test]
@@ -182,8 +181,8 @@ mod tests {
         assert_eq!(
             dispatcher.dispatch(batch(600, 600, true)),
             DispatchDecision::Eager(RejectionReason::TokensAboveBucketLadderMaximum {
-                token_count: nonzero(600),
-                bucket_ladder_maximum: Some(nonzero(512)),
+                token_count: tokens(600),
+                bucket_ladder_maximum: Some(tokens(512)),
             })
         );
     }
@@ -237,7 +236,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.bucket_ladder.buckets(), [1, 2, 4, 8]);
-        assert_eq!(config.captured_max_requests, nonzero(16));
+        assert_eq!(config.captured_max_requests, requests(16));
         assert_eq!(config.support_level, SupportLevel::UniformSingleTokenDecode);
         assert_eq!(config.capture_kind, CaptureKind::Full);
         let json = serde_json::to_string(&config).unwrap();

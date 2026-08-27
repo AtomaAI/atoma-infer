@@ -153,6 +153,12 @@ impl From<NonZeroUsize> for TokenCount {
     }
 }
 
+impl fmt::Display for TokenCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// A count of requests, nonzero by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RequestCount(NonZeroUsize);
@@ -175,6 +181,12 @@ impl RequestCount {
 impl From<NonZeroUsize> for RequestCount {
     fn from(count: NonZeroUsize) -> Self {
         Self(count)
+    }
+}
+
+impl fmt::Display for RequestCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
