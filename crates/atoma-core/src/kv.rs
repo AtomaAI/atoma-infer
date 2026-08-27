@@ -6,12 +6,14 @@
 //! no device code, no threads, no channels.
 
 mod chain_hash;
+mod event;
 mod layer_group;
 mod padding;
 mod pool;
 mod prefix_index;
 
 pub use chain_hash::{ExtraKeys, HashAlgorithm};
+pub use event::{KvEvent, KvEventBatch, Tier};
 pub use layer_group::{BlockLayout, CacheKind, KvCacheSpec, KvSource, LayerGroup, LayerGroupError};
 pub use padding::{PaddingError, PaddingReservation};
 pub use pool::{BlockLease, BlockPool};

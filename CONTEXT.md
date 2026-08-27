@@ -97,6 +97,16 @@ The radix tree over chains of block hashes that answers longest-prefix match. It
 block hashes, never slot ids; which slot holds a hash's bytes is the pool's residence lookup.
 _Avoid_: radix cache, prefix tree
 
+**Tier**:
+Where cached KV bytes live — device or host memory. A tier is where bytes live, never a
+preemption mechanism.
+_Avoid_: swap, cache level
+
+**Residence**:
+Which tier and slot currently hold a block hash's bytes. Identity is the chain hash and never
+carries residence; residence is always a separate lookup.
+_Avoid_: placement (for cached KV bytes; arena slot placement is unrelated and stays legal)
+
 **Spike**:
 A time-boxed experiment that answers a design question with measurements on real hardware.
 _Avoid_: prototype, proof of concept
