@@ -1800,6 +1800,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_capacity_promised_by_can_allocate_is_always_deliverable() {
+        const BLOCK_SIZE: usize = 4;
+        const NUM_GPU_BLOCKS: usize = 4;
+        let mut block_manager = BlockSpaceManager::new(BLOCK_SIZE, 4, NUM_GPU_BLOCKS, None)
+            .expect("Failed to create a `BlockSpaceManager`");
+
+        // A finished sequence leaves two cached blocks; a live repeat of the same prompt pins
+        // their index nodes while leasing the other two blocks.
+        let (prompt, seq_group) = create_dummy_prompt(1, 2 * BLOCK_SIZE, Some(BLOCK_SIZE), 1);
+        block_manager
+            .allocate(&seq_group)
+            .expect("Failed to allocate");
+        let sequence_id = prompt.read().unwrap().sequence_id();
+        block_manager.free(sequence_id).expect("Failed to free");
+        let (_, repeat) = create_dummy_prompt(2, 2 * BLOCK_SIZE, Some(BLOCK_SIZE), 1);
+        block_manager.allocate(&repeat).expect("Failed to allocate");
+
+        // Every block is now leased or pinned-cached, yet the promised capacity must deliver.
+        let (_, third) = create_dummy_prompt(3, 2 * BLOCK_SIZE, Some(BLOCK_SIZE), 1);
+        assert_eq!(block_manager.can_allocate(&third), AllocationStatus::Ok);
+        block_manager
+            .allocate(&third)
+            .expect("promised capacity must be deliverable");
+        assert_eq!(block_manager.get_number_of_free_gpu_blocks(), 0);
+    }
+
+    #[test]
     fn test_sibling_sequences_do_not_self_hit() {
         const BLOCK_SIZE: usize = 4;
         let mut block_manager = BlockSpaceManager::new(BLOCK_SIZE, 4, 8, None)

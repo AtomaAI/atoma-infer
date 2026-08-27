@@ -164,6 +164,21 @@ impl BlockPool {
         Some(block)
     }
 
+    /// Evicts some cached block regardless of which hash it holds, returning the hash and the
+    /// freed slot; `None` when nothing is cached. For callers whose cached bytes have no
+    /// reader; a pin-aware caller evicts by hash instead.
+    pub fn evict_any(&mut self) -> Option<(BlockHash, BlockId)> {
+        let hash = self.blocks.iter().find_map(|meta| {
+            if meta.state == BlockState::Cached {
+                meta.hash
+            } else {
+                None
+            }
+        })?;
+        let block = self.evict(hash)?;
+        Some((hash, block))
+    }
+
     /// Which slot holds `hash`'s bytes right now, leased or cached. Identity never carries
     /// residence: consumers that only compare prefixes never need this lookup.
     #[must_use]
@@ -353,6 +368,29 @@ mod tests {
         pool.release(first);
         assert_eq!(pool.free_count(), 1, "the claiming copy stays cached");
         assert_eq!(pool.residence(hash), Some(first_block));
+    }
+
+    #[test]
+    fn evict_any_reclaims_only_cached_blocks() {
+        let mut pool = BlockPool::new(2);
+        let identified = pool.lease().unwrap();
+        let hash = hash_of(&[1, 2, 3, 4]);
+        assert!(pool.assign_hash(&identified, hash));
+        let anonymous = pool.lease().unwrap();
+
+        assert_eq!(
+            pool.evict_any(),
+            None,
+            "leased blocks are untouchable, hash or not"
+        );
+
+        let identified_block = identified.block();
+        pool.release(identified);
+        assert_eq!(pool.evict_any(), Some((hash, identified_block)));
+        assert_eq!(pool.residence(hash), None);
+        assert_eq!(pool.evict_any(), None, "nothing cached remains");
+
+        pool.release(anonymous);
     }
 
     #[test]

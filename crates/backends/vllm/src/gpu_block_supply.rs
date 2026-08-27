@@ -87,10 +87,18 @@ impl GpuBlockSupply {
             if let Some(lease) = self.pool.lease() {
                 break lease;
             }
-            let Some(hash) = self.index.evict_lru() else {
+            if let Some(hash) = self.index.evict_lru() {
+                self.pool.evict(hash);
+                continue;
+            }
+            // Every remaining cached block's node is pinned by a live measurement, but nothing
+            // reads cached bytes here, so reclaim one anyway: every cached block is
+            // deliverable capacity, and get_num_free_blocks never overpromises. The node stays
+            // behind as a slightly optimistic hit until its measurement retires.
+            let Some((hash, _)) = self.pool.evict_any() else {
                 return Err(BlockAllocatorError::OutOfMemory);
             };
-            self.pool.evict(hash);
+            self.index.remove_leaf(hash);
         };
         let leased = lease.block();
         self.leases.insert(leased, lease);
