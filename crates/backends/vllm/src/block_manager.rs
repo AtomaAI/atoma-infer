@@ -1311,12 +1311,23 @@ pub(crate) mod tests {
 
         assert!(block_manager.can_append_slots(&seq_group));
         let before_num_free_blocks = block_manager.get_number_of_free_gpu_blocks();
-        let cows = block_manager
+        let (source, target) = block_manager
             .append_slots(child_sequence.read().unwrap())
-            .expect("Failed to append slots to `child_sequence`");
-        // The shared prompt block is the pool's first lease (block 0) and the copy target is
-        // the next free one (block 1); the old allocator handed blocks out in reverse.
-        assert_eq!(cows, Some((0, 1)));
+            .expect("Failed to append slots to `child_sequence`")
+            .expect("a shared last block must be copied on write");
+        let parent_blocks = block_manager
+            .get_block_table_ids(&parent_sequence.read().unwrap().sequence_id())
+            .unwrap();
+        assert_eq!(
+            source,
+            *parent_blocks.last().unwrap(),
+            "the copy source is the block still shared with the parent"
+        );
+        assert_ne!(target, source, "the copy target is a fresh block");
+        let child_blocks = block_manager
+            .get_block_table_ids(&child_sequence.read().unwrap().sequence_id())
+            .unwrap();
+        assert_eq!(*child_blocks.last().unwrap(), target);
 
         let after_num_free_blocks = block_manager.get_number_of_free_gpu_blocks();
         assert_eq!(before_num_free_blocks, after_num_free_blocks + 1);

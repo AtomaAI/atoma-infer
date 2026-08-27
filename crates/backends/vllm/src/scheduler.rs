@@ -3626,8 +3626,7 @@ mod tests {
         assert_eq!(output.prefill_seq_groups.len(), 0);
 
         // Swap-in covers exactly the CPU blocks swap-out produced. The GPU slots need not be
-        // the same ones: the pool recycles least-recently-freed blocks first, unlike the old
-        // allocator's stack.
+        // the same ones: the pool recycles least-recently-freed blocks first.
         let swapped_out_cpu: HashSet<u32> = blocks_to_swap_out.values().copied().collect();
         let swapped_in_cpu: HashSet<u32> = output.blocks_to_swap_in.keys().copied().collect();
         assert_eq!(swapped_out_cpu, swapped_in_cpu);
