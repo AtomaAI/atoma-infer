@@ -1,5 +1,5 @@
 [package]
-description = "GPU-free engine core: graph key, bucket ladder, padding lookup and admission"
+description = "GPU-free engine core: protocol types, graph dispatch and the KV substrate"
 edition     = { workspace = true }
 license     = "Apache-2.0"
 name        = "atoma-core"
