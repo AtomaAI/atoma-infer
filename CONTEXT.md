@@ -82,6 +82,11 @@ The digest of one block-sized token run chained through its parent run's digest,
 mean equal prefixes. The tier-agnostic identity of cached KV.
 _Avoid_: content hash, prefix hash
 
+**Prefix index**:
+The radix tree over chains of block hashes that answers longest-prefix match. It answers in
+block hashes, never slot ids; which slot holds a hash's bytes is the pool's residence lookup.
+_Avoid_: radix cache, prefix tree
+
 **Spike**:
 A time-boxed experiment that answers a design question with measurements on real hardware.
 _Avoid_: prototype, proof of concept
