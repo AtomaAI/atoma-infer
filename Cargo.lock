@@ -221,6 +221,7 @@ name = "atoma-vllm-backend"
 version = "0.1.0"
 dependencies = [
  "atoma-bench",
+ "atoma-core",
  "candle-core",
  "candle-nn",
  "candle-transformers",

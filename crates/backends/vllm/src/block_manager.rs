@@ -7,14 +7,13 @@ use std::{
 use crate::{
     block::{BlockDevice, BlockError, BlockTable, SyncPhysicalTokenBlock},
     block_allocator::{BlockAllocator, BlockAllocatorError},
+    gpu_block_supply::{GpuBlockSupply, PrefixCacheStats},
     sequence::{Sequence, SequenceError, SequenceGroup, SequenceStatus},
     types::{ReadLock, WriteLock},
 };
 
-use candle_core::utils::cuda_is_available;
-
 use thiserror::Error;
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{error, info, instrument, trace};
 
 /// Represents the status of a potential block allocation for a sequence group.
 ///
@@ -43,8 +42,8 @@ pub struct BlockSpaceManager {
     pub(crate) num_gpu_blocks: usize,
     /// CPU allocator
     pub(crate) cpu_allocator: BlockAllocator,
-    /// GPU allocator
-    pub(crate) gpu_allocator: BlockAllocator,
+    /// GPU allocator, leasing from the atoma-core pool and measuring prefix reuse
+    pub(crate) gpu_allocator: GpuBlockSupply,
     /// Block sliding window
     pub(crate) block_sliding_window: Option<usize>,
 }
@@ -60,20 +59,8 @@ impl BlockSpaceManager {
     ) -> Result<Self, BlockSpaceManagerError> {
         let block_sliding_window = sliding_window.map(|sw| sw.div_ceil(block_size));
 
-        let (cpu_allocator, gpu_allocator): (BlockAllocator, BlockAllocator) =
-            if cuda_is_available() {
-                (
-                    BlockAllocator::new(block_size, BlockDevice::Cpu, num_cpu_blocks),
-                    BlockAllocator::new(block_size, BlockDevice::Gpu, num_gpu_blocks),
-                )
-            } else {
-                warn!("Unrecognized GPU");
-                // TODO: we maintain this for test purposes, but we should error
-                (
-                    BlockAllocator::new(block_size, BlockDevice::Cpu, num_cpu_blocks),
-                    BlockAllocator::new(block_size, BlockDevice::Gpu, num_gpu_blocks),
-                )
-            };
+        let cpu_allocator = BlockAllocator::new(block_size, BlockDevice::Cpu, num_cpu_blocks);
+        let gpu_allocator = GpuBlockSupply::new(block_size, num_gpu_blocks);
 
         Ok(Self {
             block_size,
@@ -227,6 +214,20 @@ impl BlockSpaceManager {
                 block_table.push(block);
             }
 
+            // Measure and register the prompt against the prefix index. Sliding windows
+            // overwrite block contents in place, so their blocks carry no stable identity.
+            if self.block_sliding_window.is_none() {
+                let token_ids = { sequence.read_lock()?.get_token_ids() };
+                let mut block_numbers = Vec::with_capacity(block_table.len());
+                for block in &block_table {
+                    block_numbers.push(block.read_lock()?.block_number());
+                }
+                for sequence_id in seq_group.get_sequences_ids(Some(SequenceStatus::Waiting)) {
+                    self.gpu_allocator
+                        .index_sequence(sequence_id, &token_ids, &block_numbers);
+                }
+            }
+
             // Assign the block table for each sequence.
             for seq_id in seq_group.get_sequences_ids(Some(SequenceStatus::Waiting)) {
                 self.block_tables.insert(seq_id, block_table.clone());
@@ -362,7 +363,7 @@ impl BlockSpaceManager {
             // At this point, the block is shared with other sequences, so we perform Copy on Write
             // (CoW) CoW: Allocate a new block and copy the tokens
             let new_block = self.gpu_allocator.allocate()?;
-            self.gpu_allocator.free(last_block.clone())?;
+            self.gpu_allocator.free(last_block)?;
             let (last_block_number, new_block_number) = {
                 (
                     last_block.read_lock()?.block_number(),
@@ -752,10 +753,11 @@ impl BlockSpaceManager {
                     };
                     new_block_table.push(cpu_block);
                     // Free the CPU block that was allocated into the GPU
-                    self.gpu_allocator.free(gpu_block.clone())?;
+                    self.gpu_allocator.free(gpu_block)?;
                 }
                 self.block_tables.insert(*sequence_id, new_block_table);
             }
+            self.gpu_allocator.discard_sequence(*sequence_id);
             // NOTE: we update the status of the `Sequence` right after the previous check, and not
             // on the scheduler logic
             let sequence = seq_group.get_sequence_from_id(*sequence_id).unwrap(); // DON'T PANIC: we already checked that `SequenceGroup` contains `Sequence` with
@@ -825,7 +827,7 @@ impl BlockSpaceManager {
             if block_device == BlockDevice::Cpu {
                 self.cpu_allocator.free(block)?;
             } else {
-                self.gpu_allocator.free(block)?;
+                self.gpu_allocator.free(&block)?;
             }
         }
 
@@ -886,6 +888,7 @@ impl BlockSpaceManager {
         self.free_block_table(&block_table)?;
 
         self.block_tables.remove(&sequence_id);
+        self.gpu_allocator.finish_sequence(sequence_id);
 
         Ok(())
     }
@@ -922,6 +925,7 @@ impl BlockSpaceManager {
             self.free_block_table(bt)?;
         }
         self.block_tables.clear();
+        self.gpu_allocator.clear();
         Ok(())
     }
 
@@ -973,6 +977,12 @@ impl BlockSpaceManager {
     /// `usize` - The number of free GPU blocks.
     pub fn get_number_of_free_gpu_blocks(&self) -> usize {
         self.gpu_allocator.get_num_free_blocks()
+    }
+
+    /// Prefix-cache traffic so far: prompt blocks queried at admission, and how many were
+    /// already indexed. The end-to-end hit rate is `hits / queries`.
+    pub fn prefix_cache_stats(&self) -> PrefixCacheStats {
+        self.gpu_allocator.prefix_cache_stats()
     }
 
     /// Returns the number of free CPU blocks available in the block manager.
@@ -1304,7 +1314,9 @@ pub(crate) mod tests {
         let cows = block_manager
             .append_slots(child_sequence.read().unwrap())
             .expect("Failed to append slots to `child_sequence`");
-        assert_eq!(cows, Some((3, 2)));
+        // The shared prompt block is the pool's first lease (block 0) and the copy target is
+        // the next free one (block 1); the old allocator handed blocks out in reverse.
+        assert_eq!(cows, Some((0, 1)));
 
         let after_num_free_blocks = block_manager.get_number_of_free_gpu_blocks();
         assert_eq!(before_num_free_blocks, after_num_free_blocks + 1);
@@ -1708,6 +1720,107 @@ pub(crate) mod tests {
         assert_eq!(
             block_manager.get_number_of_free_gpu_blocks(),
             NUM_GPU_BLOCKS
+        );
+    }
+
+    #[test]
+    fn test_prefix_cache_hits_count_repeated_prompts() {
+        const BLOCK_SIZE: usize = 4;
+        let mut block_manager = BlockSpaceManager::new(BLOCK_SIZE, 4, 8, None)
+            .expect("Failed to create a `BlockSpaceManager`");
+
+        // Two sequence groups with identical eight-token prompts: two full blocks each.
+        let (_, first) = create_dummy_prompt(1, 2 * BLOCK_SIZE, Some(BLOCK_SIZE), 1);
+        block_manager.allocate(&first).expect("Failed to allocate");
+        let stats = block_manager.prefix_cache_stats();
+        assert_eq!(stats.queries, 2, "two full prompt blocks queried");
+        assert_eq!(stats.hits, 0, "a cold index has nothing to offer");
+
+        let (_, second) = create_dummy_prompt(2, 2 * BLOCK_SIZE, Some(BLOCK_SIZE), 1);
+        block_manager.allocate(&second).expect("Failed to allocate");
+        let stats = block_manager.prefix_cache_stats();
+        assert_eq!(stats.queries, 4);
+        assert_eq!(stats.hits, 2, "the repeated prompt hits on both blocks");
+    }
+
+    #[test]
+    fn test_free_returns_capacity_with_cache_resident() {
+        const BLOCK_SIZE: usize = 4;
+        let mut block_manager = BlockSpaceManager::new(BLOCK_SIZE, 4, 4, None)
+            .expect("Failed to create a `BlockSpaceManager`");
+        let baseline = block_manager.get_number_of_free_gpu_blocks();
+
+        let (prompt, seq_group) = create_dummy_prompt(1, 2 * BLOCK_SIZE, Some(BLOCK_SIZE), 1);
+        block_manager
+            .allocate(&seq_group)
+            .expect("Failed to allocate");
+        assert_eq!(block_manager.get_number_of_free_gpu_blocks(), baseline - 2);
+
+        let sequence_id = prompt.read().unwrap().sequence_id();
+        block_manager.free(sequence_id).expect("Failed to free");
+        assert_eq!(
+            block_manager.get_number_of_free_gpu_blocks(),
+            baseline,
+            "released blocks stay resident as cache but count as obtainable"
+        );
+    }
+
+    #[test]
+    fn test_cached_blocks_are_recycled_under_pressure() {
+        const BLOCK_SIZE: usize = 4;
+        const NUM_GPU_BLOCKS: usize = 4;
+        let mut block_manager = BlockSpaceManager::new(BLOCK_SIZE, 4, NUM_GPU_BLOCKS, None)
+            .expect("Failed to create a `BlockSpaceManager`");
+
+        // Fill half the pool, then retire the sequence: its blocks stay cached.
+        let (prompt, seq_group) = create_dummy_prompt(1, 2 * BLOCK_SIZE, Some(BLOCK_SIZE), 1);
+        block_manager
+            .allocate(&seq_group)
+            .expect("Failed to allocate");
+        let sequence_id = prompt.read().unwrap().sequence_id();
+        block_manager.free(sequence_id).expect("Failed to free");
+
+        // A sequence needing the whole pool forces the cached blocks to be evicted.
+        let (_, hungry) = create_dummy_prompt(2, NUM_GPU_BLOCKS * BLOCK_SIZE, Some(BLOCK_SIZE), 1);
+        assert_eq!(block_manager.can_allocate(&hungry), AllocationStatus::Ok);
+        block_manager
+            .allocate(&hungry)
+            .expect("Failed to allocate over cached blocks");
+        assert_eq!(block_manager.get_number_of_free_gpu_blocks(), 0);
+    }
+
+    #[test]
+    fn test_swap_out_discards_the_sequences_index_entries() {
+        const BLOCK_SIZE: usize = 4;
+        let mut block_manager = BlockSpaceManager::new(BLOCK_SIZE, 4, 8, None)
+            .expect("Failed to create a `BlockSpaceManager`");
+
+        let (prompt, seq_group) = create_dummy_prompt(1, 2 * BLOCK_SIZE, Some(BLOCK_SIZE), 1);
+        block_manager
+            .allocate(&seq_group)
+            .expect("Failed to allocate");
+        {
+            let prompt = seq_group
+                .get_sequence_from_id(prompt.read().unwrap().sequence_id())
+                .unwrap();
+            prompt
+                .write()
+                .unwrap()
+                .set_sequence_status(SequenceStatus::Running);
+        }
+        let mut seq_group = seq_group.clone();
+        block_manager
+            .swap_out(&mut seq_group)
+            .expect("Failed to swap out");
+
+        // The device copies are gone, so an identical prompt finds nothing to hit.
+        let (_, repeat) = create_dummy_prompt(2, 2 * BLOCK_SIZE, Some(BLOCK_SIZE), 1);
+        block_manager.allocate(&repeat).expect("Failed to allocate");
+        let stats = block_manager.prefix_cache_stats();
+        assert_eq!(stats.queries, 4);
+        assert_eq!(
+            stats.hits, 0,
+            "swap-out removed the sequence's index entries"
         );
     }
 }
