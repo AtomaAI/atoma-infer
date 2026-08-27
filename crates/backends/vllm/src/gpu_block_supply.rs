@@ -245,3 +245,82 @@ impl Drop for GpuBlockSupply {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, RwLock};
+
+    use super::{GpuBlockSupply, PrefixCacheStats};
+    use crate::block::{BlockDevice, PhysicalTokenBlock};
+    use crate::block_allocator::BlockAllocatorError;
+
+    #[test]
+    fn a_second_free_of_the_same_block_is_a_double_free() {
+        let mut supply = GpuBlockSupply::new(4, 2);
+        let block = supply.allocate().unwrap();
+        supply.free(&block).unwrap();
+        assert!(matches!(
+            supply.free(&block),
+            Err(BlockAllocatorError::CannotDoubleFree(_))
+        ));
+    }
+
+    #[test]
+    fn a_block_the_supply_never_leased_is_refused() {
+        let mut supply = GpuBlockSupply::new(4, 2);
+        let mut foreign = PhysicalTokenBlock::new(99, 4, BlockDevice::Gpu);
+        foreign.increment_ref_count();
+        let foreign = Arc::new(RwLock::new(foreign));
+        assert!(matches!(
+            supply.free(&foreign),
+            Err(BlockAllocatorError::BlockNotFound(99))
+        ));
+    }
+
+    #[test]
+    fn an_exhausted_supply_reports_out_of_memory() {
+        let mut supply = GpuBlockSupply::new(4, 1);
+        let held = supply.allocate().unwrap();
+        assert!(matches!(
+            supply.allocate(),
+            Err(BlockAllocatorError::OutOfMemory)
+        ));
+        supply.free(&held).unwrap();
+    }
+
+    #[test]
+    fn retiring_an_unindexed_sequence_is_a_no_op() {
+        let mut supply = GpuBlockSupply::new(4, 1);
+        supply.finish_sequence(42);
+        assert_eq!(supply.prefix_cache_stats(), PrefixCacheStats::default());
+        assert_eq!(supply.get_num_free_blocks(), 1);
+    }
+
+    #[test]
+    fn clear_forgets_the_index_and_restores_free_capacity() {
+        let mut supply = GpuBlockSupply::new(4, 2);
+        let blocks: Vec<_> = (0..2).map(|_| supply.allocate().unwrap()).collect();
+        let numbers: Vec<u32> = blocks
+            .iter()
+            .map(|block| block.read().unwrap().block_number())
+            .collect();
+        supply.index_shared_prompt(&[1], &[1, 2, 3, 4, 5, 6, 7, 8], &numbers);
+        for block in &blocks {
+            supply.free(block).unwrap();
+        }
+        assert_eq!(supply.get_num_free_blocks(), 2);
+
+        supply.clear();
+        assert_eq!(supply.get_num_free_blocks(), 2);
+
+        // A prompt identical to the pre-reset one finds nothing to hit.
+        supply.index_shared_prompt(&[2], &[1, 2, 3, 4, 5, 6, 7, 8], &[]);
+        assert_eq!(
+            supply.prefix_cache_stats(),
+            PrefixCacheStats {
+                queries: 4,
+                hits: 0
+            }
+        );
+    }
+}
