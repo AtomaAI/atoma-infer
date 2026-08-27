@@ -7,6 +7,7 @@
 //! unleased cached block, so a leased block cannot be evicted by construction.
 
 use std::collections::HashMap;
+use std::thread;
 
 use crate::protocol::{BlockHash, BlockId};
 
@@ -56,7 +57,7 @@ impl BlockLease {
 impl Drop for BlockLease {
     fn drop(&mut self) {
         // Skipped mid-unwind so an unrelated test panic is not masked by a double panic.
-        if !std::thread::panicking() {
+        if !thread::panicking() {
             debug_assert!(
                 self.released,
                 "BlockLease for {:?} dropped without release; the block leaks until process exit",
