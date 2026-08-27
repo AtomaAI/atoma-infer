@@ -42,7 +42,8 @@ _Avoid_: ladder (unqualified), phase
 
 **Arena**:
 The engine-owned device allocation from which every captured step's activations are addressed.
-_Avoid_: pool — a pool is a CUDA memory pool, which the arena deliberately is not
+_Avoid_: pool — the arena is neither a CUDA memory pool nor the KV block pool; its slots are
+fixed, role-addressed extents, not interchangeable blocks
 
 **Role**:
 One tensor the step produces, declared with a per-token width and a lifetime.
