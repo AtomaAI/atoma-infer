@@ -10,9 +10,10 @@ use crate::protocol::TokenCount;
 /// bounds check and one load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaddingLookup {
-    /// `next_bucket[tokens]` is the smallest bucket holding `tokens`, for counts up to the
-    /// bucket-ladder maximum.
-    next_bucket: Box<[Option<TokenCount>]>,
+    /// `next_bucket[tokens - 1]` is the smallest bucket holding `tokens`. Every stored entry is
+    /// a real bucket; a count past the end exceeds every bucket, absent by the bounds check
+    /// alone.
+    next_bucket: Box<[TokenCount]>,
     bucket_ladder_maximum: Option<TokenCount>,
 }
 
@@ -21,19 +22,8 @@ impl PaddingLookup {
     #[must_use]
     pub fn new(bucket_ladder: &BucketLadder) -> Self {
         let bucket_ladder_maximum = bucket_ladder.maximum();
-        let next_bucket = (0..=bucket_ladder_maximum.map_or(0, TokenCount::get))
-            .map(|tokens| {
-                let smallest_holding = bucket_ladder
-                    .buckets()
-                    .iter()
-                    .copied()
-                    .filter(|&bucket| bucket >= tokens)
-                    .min();
-                smallest_holding.and_then(TokenCount::new)
-            })
-            .collect();
         Self {
-            next_bucket,
+            next_bucket: next_buckets(bucket_ladder, bucket_ladder_maximum),
             bucket_ladder_maximum,
         }
     }
@@ -41,7 +31,7 @@ impl PaddingLookup {
     /// The smallest bucket holding `tokens`, or `None` when `tokens` exceeds every bucket.
     #[must_use]
     pub fn bucket_for(&self, tokens: TokenCount) -> Option<TokenCount> {
-        self.next_bucket.get(tokens.get()).copied().flatten()
+        self.next_bucket.get(tokens.get() - 1).copied()
     }
 
     /// The largest bucket in the bucket ladder this lookup was built from; `None` for an empty
@@ -50,6 +40,27 @@ impl PaddingLookup {
     pub fn bucket_ladder_maximum(&self) -> Option<TokenCount> {
         self.bucket_ladder_maximum
     }
+}
+
+/// One entry per token count from one to the bucket-ladder maximum, each the smallest bucket
+/// holding that count. An empty bucket ladder builds an empty table.
+fn next_buckets(
+    bucket_ladder: &BucketLadder,
+    bucket_ladder_maximum: Option<TokenCount>,
+) -> Box<[TokenCount]> {
+    (1..=bucket_ladder_maximum.map_or(0, TokenCount::get))
+        .map(|tokens| {
+            let smallest_holding = bucket_ladder
+                .buckets()
+                .iter()
+                .copied()
+                .filter(|&bucket| bucket >= tokens)
+                .min()
+                .and_then(TokenCount::new);
+            // Every count in range is held by at least the maximum bucket itself.
+            smallest_holding.expect("the bucket-ladder maximum holds every count up to itself")
+        })
+        .collect()
 }
 
 #[cfg(test)]
