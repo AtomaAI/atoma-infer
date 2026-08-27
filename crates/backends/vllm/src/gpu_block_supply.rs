@@ -44,7 +44,7 @@ pub struct GpuBlockSupply {
     index: PrefixIndex,
     algorithm: HashAlgorithm,
     /// Tokens per block, as configured.
-    block_size: usize,
+    block_size: TokenCount,
     /// The lease behind each outstanding block.
     leases: HashMap<BlockId, BlockLease>,
     /// Each indexed sequence's inserted path, for unpinning at retirement.
@@ -54,8 +54,14 @@ pub struct GpuBlockSupply {
 
 impl GpuBlockSupply {
     /// Builds the supply over a pool of `num_blocks` preallocated blocks.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a zero block size or a block count beyond `u32` — both configuration errors
+    /// caught at construction rather than silently degrading later.
     #[must_use]
     pub fn new(block_size: usize, num_blocks: usize) -> Self {
+        let block_size = TokenCount::new(block_size).expect("the block size must be nonzero");
         // A u32 block count bounds pools at four billion blocks; at a kilobyte or more per
         // block, real configurations sit orders of magnitude below that.
         let num_blocks = u32::try_from(num_blocks).expect("block count fits u32");
@@ -88,7 +94,8 @@ impl GpuBlockSupply {
         };
         let leased = lease.block();
         self.leases.insert(leased, lease);
-        let mut block = PhysicalTokenBlock::new(leased.get(), self.block_size, BlockDevice::Gpu);
+        let mut block =
+            PhysicalTokenBlock::new(leased.get(), self.block_size.get(), BlockDevice::Gpu);
         block.increment_ref_count();
         Ok(Arc::new(RwLock::new(block)))
     }
@@ -140,12 +147,9 @@ impl GpuBlockSupply {
     /// block that holds its bytes. Indexing is skipped under a sliding window, where block
     /// contents are overwritten in place.
     pub fn index_sequence(&mut self, sequence_id: u64, token_ids: &[u32], block_numbers: &[u32]) {
-        let Some(block_size) = TokenCount::new(self.block_size) else {
-            return;
-        };
         let chain = self
             .algorithm
-            .chain(block_size, token_ids, ExtraKeys::none());
+            .chain(self.block_size, token_ids, ExtraKeys::none());
         let matched = self.index.lookup(&chain);
         self.stats.queries += chain.len() as u64;
         self.stats.hits += matched as u64;
