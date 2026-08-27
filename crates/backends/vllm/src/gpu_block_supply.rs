@@ -142,11 +142,20 @@ impl GpuBlockSupply {
         self.pool.block_count()
     }
 
-    /// Measures and registers one admitted sequence: chain-hashes its prompt, counts the
-    /// longest-prefix match as hits, pins the path, and claims each full block's hash for the
-    /// block that holds its bytes. Indexing is skipped under a sliding window, where block
-    /// contents are overwritten in place.
-    pub fn index_sequence(&mut self, sequence_id: u64, token_ids: &[u32], block_numbers: &[u32]) {
+    /// Measures and registers one admitted prompt shared by `sequence_ids`: chain-hashes it,
+    /// counts the longest-prefix match as hits exactly once for the group — siblings never hit
+    /// on the chain their own admission just inserted — pins the path once per sequence, and
+    /// claims each full block's hash for the block that holds its bytes. Indexing is skipped
+    /// under a sliding window, where block contents are overwritten in place.
+    pub fn index_shared_prompt(
+        &mut self,
+        sequence_ids: &[u64],
+        token_ids: &[u32],
+        block_numbers: &[u32],
+    ) {
+        if sequence_ids.is_empty() {
+            return;
+        }
         let chain = self
             .algorithm
             .chain(self.block_size, token_ids, ExtraKeys::none());
@@ -156,21 +165,23 @@ impl GpuBlockSupply {
         counter!(PREFIX_CACHE_QUERIES_METRIC).increment(chain.len() as u64);
         counter!(PREFIX_CACHE_HITS_METRIC).increment(matched as u64);
         debug!(
-            sequence_id,
+            ?sequence_ids,
             queried = chain.len(),
             matched,
             "prefix cache lookup"
         );
-        self.index.insert(&chain);
         for (hash, block_number) in chain.iter().zip(block_numbers) {
             if let Some(lease) = self.leases.get(&BlockId::new(*block_number)) {
                 // A duplicate claim is refused and the first copy keeps the hash; this
-                // sequence's copy then frees outright on release instead of caching.
+                // group's copy then frees outright on release instead of caching.
                 self.pool.assign_hash(lease, *hash);
             }
         }
-        if let Some(previous) = self.chains.insert(sequence_id, chain) {
-            self.index.unpin(&previous);
+        for &sequence_id in sequence_ids {
+            self.index.insert(&chain);
+            if let Some(previous) = self.chains.insert(sequence_id, chain.clone()) {
+                self.index.unpin(&previous);
+            }
         }
     }
 

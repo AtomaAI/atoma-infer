@@ -222,10 +222,9 @@ impl BlockSpaceManager {
                 for block in &block_table {
                     block_numbers.push(block.read_lock()?.block_number());
                 }
-                for sequence_id in seq_group.get_sequences_ids(Some(SequenceStatus::Waiting)) {
-                    self.gpu_allocator
-                        .index_sequence(sequence_id, &token_ids, &block_numbers);
-                }
+                let sequence_ids = seq_group.get_sequences_ids(Some(SequenceStatus::Waiting));
+                self.gpu_allocator
+                    .index_shared_prompt(&sequence_ids, &token_ids, &block_numbers);
             }
 
             // Assign the block table for each sequence.
@@ -1798,6 +1797,34 @@ pub(crate) mod tests {
             .allocate(&hungry)
             .expect("Failed to allocate over cached blocks");
         assert_eq!(block_manager.get_number_of_free_gpu_blocks(), 0);
+    }
+
+    #[test]
+    fn test_sibling_sequences_do_not_self_hit() {
+        const BLOCK_SIZE: usize = 4;
+        let mut block_manager = BlockSpaceManager::new(BLOCK_SIZE, 4, 8, None)
+            .expect("Failed to create a `BlockSpaceManager`");
+
+        // A group of two sequences sharing one two-block prompt, as beam search builds.
+        let prompt = Sequence::new(1, "prompt".into(), (1..=8).collect(), BLOCK_SIZE, false)
+            .expect("Failed to build prompt sequence");
+        let child = prompt.fork(2);
+        let seq_group = SequenceGroup::new(
+            1.to_string(),
+            vec![prompt, child],
+            Instant::now(),
+            Default::default(),
+            Default::default(),
+            LogitsProcessor::new(0, None, None),
+        )
+        .expect("Failed to construct a new `SequenceGroup`");
+        block_manager
+            .allocate(&seq_group)
+            .expect("Failed to allocate");
+
+        let stats = block_manager.prefix_cache_stats();
+        assert_eq!(stats.queries, 2, "one shared prompt is measured once");
+        assert_eq!(stats.hits, 0, "siblings do not hit on their own admission");
     }
 
     #[test]
