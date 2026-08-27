@@ -82,6 +82,11 @@ The digest of one block-sized token run chained through its parent run's digest,
 mean equal prefixes. The tier-agnostic identity of cached KV.
 _Avoid_: content hash, prefix hash
 
+**Layer group**:
+A set of layers with a common cache kind and geometry. A model's cache is declared group by
+group, and a group can share another group's cache instead of writing its own.
+_Avoid_: cache group, attention group
+
 **Prefix index**:
 The radix tree over chains of block hashes that answers longest-prefix match. It answers in
 block hashes, never slot ids; which slot holds a hash's bytes is the pool's residence lookup.

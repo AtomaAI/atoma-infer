@@ -6,10 +6,12 @@
 //! no device code, no threads, no channels.
 
 mod chain_hash;
+mod layer_group;
 mod pool;
 mod prefix_index;
 
 pub use chain_hash::{ExtraKeys, HashAlgorithm};
+pub use layer_group::{BlockLayout, CacheKind, KvCacheSpec, KvSource, LayerGroup, LayerGroupError};
 pub use pool::{BlockLease, BlockPool};
 pub use prefix_index::PrefixIndex;
 
