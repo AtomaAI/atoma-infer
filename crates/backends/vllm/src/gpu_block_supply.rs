@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use atoma_core::kv::{BlockLease, BlockPool, ExtraKeys, HashAlgorithm, PrefixIndex};
-use atoma_core::protocol::{BlockHash, TokenCount};
+use atoma_core::protocol::{BlockHash, BlockId, TokenCount};
 use metrics::counter;
 use tracing::debug;
 
@@ -45,8 +45,8 @@ pub struct GpuBlockSupply {
     algorithm: HashAlgorithm,
     /// Tokens per block, as configured.
     block_size: usize,
-    /// The lease behind each outstanding block, by block number.
-    leases: HashMap<u32, BlockLease>,
+    /// The lease behind each outstanding block.
+    leases: HashMap<BlockId, BlockLease>,
     /// Each indexed sequence's inserted path, for unpinning at retirement.
     chains: HashMap<u64, Vec<BlockHash>>,
     stats: PrefixCacheStats,
@@ -86,9 +86,9 @@ impl GpuBlockSupply {
             };
             self.pool.evict(hash);
         };
-        let block_number = lease.block().get();
-        self.leases.insert(block_number, lease);
-        let mut block = PhysicalTokenBlock::new(block_number, self.block_size, BlockDevice::Gpu);
+        let leased = lease.block();
+        self.leases.insert(leased, lease);
+        let mut block = PhysicalTokenBlock::new(leased.get(), self.block_size, BlockDevice::Gpu);
         block.increment_ref_count();
         Ok(Arc::new(RwLock::new(block)))
     }
@@ -115,7 +115,7 @@ impl GpuBlockSupply {
             block.ref_count()
         };
         if remaining == 0 {
-            let Some(lease) = self.leases.remove(&block_number) else {
+            let Some(lease) = self.leases.remove(&BlockId::new(block_number)) else {
                 return Err(BlockAllocatorError::BlockNotFound(block_number));
             };
             self.pool.release(lease);
@@ -159,7 +159,7 @@ impl GpuBlockSupply {
         );
         self.index.insert(&chain);
         for (hash, block_number) in chain.iter().zip(block_numbers) {
-            if let Some(lease) = self.leases.get(block_number) {
+            if let Some(lease) = self.leases.get(&BlockId::new(*block_number)) {
                 // A duplicate claim is refused and the first copy keeps the hash; this
                 // sequence's copy then frees outright on release instead of caching.
                 self.pool.assign_hash(lease, *hash);
