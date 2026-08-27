@@ -72,6 +72,11 @@ _Avoid_: split, boundary, cut
 A fixed-address buffer through which an eager operation passes data between two segments.
 _Avoid_: intermediate buffer, staging buffer
 
+**Lease**:
+The value that holds one pool block for exactly one owner. While it exists the block cannot be
+evicted or handed out again; surrendering it is the block's only way back to the pool.
+_Avoid_: ref count, handle
+
 **Chain hash**:
 The digest of one block-sized token run chained through its parent run's digest, so equal hashes
 mean equal prefixes. The tier-agnostic identity of cached KV.

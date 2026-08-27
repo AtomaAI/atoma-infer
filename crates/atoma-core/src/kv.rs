@@ -6,5 +6,7 @@
 //! no device code, no threads, no channels.
 
 mod chain_hash;
+mod pool;
 
 pub use chain_hash::{ExtraKeys, HashAlgorithm};
+pub use pool::{BlockLease, BlockPool};
