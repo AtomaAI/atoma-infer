@@ -82,6 +82,11 @@ The digest of one block-sized token run chained through its parent run's digest,
 mean equal prefixes. The tier-agnostic identity of cached KV.
 _Avoid_: content hash, prefix hash
 
+**Dummy**:
+A padding request filling one bucket slot. Each dummy owns its own KV block, leased from the
+pool at startup for the process lifetime.
+_Avoid_: filler, fake request
+
 **Layer group**:
 A set of layers with a common cache kind and geometry. A model's cache is declared group by
 group, and a group can share another group's cache instead of writing its own.
