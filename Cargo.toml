@@ -59,6 +59,7 @@ reqwest = "0.12.15" # hf-hub already pulls the 0.12 line; keep one copy
 serde = "1.0.204"
 serde_json = "1.0.120"
 serial_test = "4.0.1"
+sha2 = "0.11.0"
 sys-info = "0.9.1"
 thiserror = "2"
 tokenizers = "0.22.0"

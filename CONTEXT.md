@@ -72,6 +72,11 @@ _Avoid_: split, boundary, cut
 A fixed-address buffer through which an eager operation passes data between two segments.
 _Avoid_: intermediate buffer, staging buffer
 
+**Chain hash**:
+The digest of one block-sized token run chained through its parent run's digest, so equal hashes
+mean equal prefixes. The tier-agnostic identity of cached KV.
+_Avoid_: content hash, prefix hash
+
 **Spike**:
 A time-boxed experiment that answers a design question with measurements on real hardware.
 _Avoid_: prototype, proof of concept

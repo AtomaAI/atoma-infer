@@ -5,4 +5,5 @@
 //! and every test runs without a GPU.
 
 pub mod dispatch;
+pub mod kv;
 pub mod protocol;
