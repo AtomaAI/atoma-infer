@@ -252,23 +252,29 @@ fn a_prompt_that_cannot_fit_the_model_finishes_at_intake() {
     let max_model_length = 8 * BLOCK_SIZE;
 
     let (sender, receiver) = egress();
-    let error = scheduler
-        .intake(new_request(max_model_length, 16, sender))
-        .unwrap_err();
+    assert!(
+        scheduler
+            .intake(new_request(max_model_length, 16, sender))
+            .is_none(),
+        "a prompt that leaves no room to generate never waits"
+    );
+    let RequestEvent::Finished { reason, usage, .. } = receiver.recv().unwrap() else {
+        panic!("intake finishes a prompt it can never serve");
+    };
     assert_eq!(
-        error,
+        reason,
         FinishReason::PromptExceedsMaxModelLength {
             prompt_tokens: max_model_length,
             max_model_length,
         }
     );
-    assert!(matches!(
-        receiver.recv().unwrap(),
-        RequestEvent::Finished {
-            reason: FinishReason::PromptExceedsMaxModelLength { .. },
-            ..
+    assert_eq!(
+        usage,
+        Usage {
+            prompt_tokens: max_model_length,
+            generated_tokens: 0
         }
-    ));
+    );
     assert!(receiver.recv().is_err(), "nothing follows the finish");
     assert_eq!(
         scheduler.request_count(),
@@ -277,10 +283,7 @@ fn a_prompt_that_cannot_fit_the_model_finishes_at_intake() {
     );
 
     let (sender, receiver) = egress();
-    assert_eq!(
-        scheduler.intake(new_request(0, 16, sender)).unwrap_err(),
-        FinishReason::EmptyPrompt
-    );
+    assert!(scheduler.intake(new_request(0, 16, sender)).is_none());
     assert!(matches!(
         receiver.recv().unwrap(),
         RequestEvent::Finished {

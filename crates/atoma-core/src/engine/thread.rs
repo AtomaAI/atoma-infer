@@ -300,8 +300,7 @@ impl Engine {
             let Some(request) = self.ingress.try_recv() else {
                 return;
             };
-            // A rejected request was already told why at intake.
-            let _ = self.scheduler.intake(request);
+            self.scheduler.intake(request);
         }
     }
 
@@ -361,15 +360,13 @@ impl Engine {
         }
     }
 
-    /// Finishes every live request for `reason`, including those still in ingress.
+    /// Finishes every live request for `reason`, including those still in ingress: those are
+    /// taken in only so they can be told, and a prompt refused at intake hears its own reason
+    /// instead.
     fn fail_all(&mut self, reason: FinishReason) {
         self.in_flight = None;
-        self.scheduler.finish_all(reason);
         while let Some(request) = self.ingress.try_recv() {
-            // Taken in only to be told; a refused prompt is told its own reason instead.
-            if let Ok(slot) = self.scheduler.intake(request) {
-                debug_assert!(self.scheduler.request(slot).is_some());
-            }
+            self.scheduler.intake(request);
         }
         self.scheduler.finish_all(reason);
         if let Some(reply) = self.draining.take() {

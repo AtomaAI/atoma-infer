@@ -353,11 +353,11 @@ impl Scheduler {
 
     /// Takes `new` in as a Waiting request, or finishes it on the spot when it can never run.
     ///
-    /// # Errors
-    ///
-    /// Returns the [`FinishReason`] already sent to the client when the prompt is empty or leaves
-    /// no room to generate under the maximum model length.
-    pub fn intake(&mut self, new: NewRequest) -> Result<RequestSlot, FinishReason> {
+    /// Returns the slot it waits in, or `None` when it was finished on the spot: an empty prompt,
+    /// or one leaving no room to generate under the maximum model length. A request finished here
+    /// has already been told why and never took a slot, so a caller with nothing else to do with
+    /// the slot can ignore the answer.
+    pub fn intake(&mut self, new: NewRequest) -> Option<RequestSlot> {
         let id = RequestId::new(self.next_request_id);
         self.next_request_id += 1;
         let prompt_tokens = new.prompt.len();
@@ -382,7 +382,7 @@ impl Scheduler {
                 },
             });
             debug!(request = id.get(), ?reason, "request finished at intake");
-            return Err(reason);
+            return None;
         }
         let mut request = Request::new(id, new, self.step);
         for sequence in request.sequences_mut() {
@@ -390,7 +390,7 @@ impl Scheduler {
         }
         let slot = self.requests.insert(request);
         self.waiting.push_back(slot);
-        Ok(slot)
+        Some(slot)
     }
 
     /// One scheduling pass: requests whose client hung up retire in every queue, running requests
