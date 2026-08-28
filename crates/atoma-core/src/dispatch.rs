@@ -21,13 +21,8 @@ pub use lookup::PaddingLookup;
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::num::NonZeroUsize;
-
     use crate::dispatch::LiveBatch;
-
-    pub(crate) fn nonzero(value: usize) -> NonZeroUsize {
-        NonZeroUsize::new(value).expect("test counts are nonzero")
-    }
+    use crate::test_support::{requests, tokens};
 
     pub(crate) fn batch(
         token_count: usize,
@@ -35,8 +30,8 @@ pub(crate) mod test_support {
         uniform_decode: bool,
     ) -> LiveBatch {
         LiveBatch {
-            token_count: nonzero(token_count),
-            request_count: nonzero(request_count),
+            token_count: tokens(token_count),
+            request_count: requests(request_count),
             uniform_decode,
         }
     }

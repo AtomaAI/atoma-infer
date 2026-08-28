@@ -9,6 +9,7 @@ pub mod block_manager;
 pub mod config;
 pub mod egress;
 pub mod error;
+pub mod gpu_block_supply;
 pub mod llm_engine;
 pub mod llm_service;
 #[cfg(feature = "cuda")]

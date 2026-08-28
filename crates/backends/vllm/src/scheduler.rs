@@ -2287,6 +2287,7 @@ mod tests {
         policy::FcfsPolicy,
         sequence::{tests::create_dummy_prompt, LogProb},
     };
+    use std::collections::HashSet;
     use std::time::Duration;
 
     fn get_sequence_groups(scheduler_outputs: &SchedulerOutputs) -> Vec<SequenceGroup> {
@@ -3624,12 +3625,12 @@ mod tests {
         assert_eq!(output.decode_seq_groups.len(), 1);
         assert_eq!(output.prefill_seq_groups.len(), 0);
 
-        // swap in is the reverse of swap out
-        let mut blocks_to_swap_in_rev = HashMap::new();
-        for (swap_in, swap_out) in output.blocks_to_swap_in {
-            blocks_to_swap_in_rev.insert(swap_out, swap_in);
-        }
-        assert_eq!(blocks_to_swap_out, blocks_to_swap_in_rev)
+        // Swap-in covers exactly the CPU blocks swap-out produced. The GPU slots need not be
+        // the same ones: the pool recycles least-recently-freed blocks first.
+        let swapped_out_cpu: HashSet<u32> = blocks_to_swap_out.values().copied().collect();
+        let swapped_in_cpu: HashSet<u32> = output.blocks_to_swap_in.keys().copied().collect();
+        assert_eq!(swapped_out_cpu, swapped_in_cpu);
+        assert_eq!(blocks_to_swap_out.len(), output.blocks_to_swap_in.len());
     }
 
     #[test]

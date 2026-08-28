@@ -1,9 +1,9 @@
 //! The bucket ladder: the ordered list of buckets the engine captures.
 
-use std::num::NonZeroUsize;
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::types::TokenCount;
 
 /// The GPU platform a default bucket ladder is sized for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,12 +71,8 @@ impl BucketLadder {
 
     /// The largest bucket, or `None` for an empty bucket ladder.
     #[must_use]
-    pub fn maximum(&self) -> Option<NonZeroUsize> {
-        self.buckets
-            .iter()
-            .copied()
-            .max()
-            .and_then(NonZeroUsize::new)
+    pub fn maximum(&self) -> Option<TokenCount> {
+        self.buckets.iter().copied().max().and_then(TokenCount::new)
     }
 }
 
@@ -107,9 +103,8 @@ pub enum BucketLadderError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-
     use super::{BucketLadder, BucketLadderError, Platform};
+    use crate::types::TokenCount;
 
     #[test]
     fn default_hopper_bucket_ladder_is_the_contract_list() {
@@ -119,7 +114,7 @@ mod tests {
             320, 384, 448, 512,
         ];
         assert_eq!(bucket_ladder.buckets(), expected);
-        assert_eq!(bucket_ladder.maximum(), NonZeroUsize::new(512));
+        assert_eq!(bucket_ladder.maximum(), TokenCount::new(512));
     }
 
     #[test]
@@ -129,14 +124,14 @@ mod tests {
         let (shared, extension) = bucket_ladder.buckets().split_at(hopper.buckets().len());
         assert_eq!(shared, hopper.buckets());
         assert_eq!(extension, [576, 640, 704, 768, 832, 896, 960, 1024]);
-        assert_eq!(bucket_ladder.maximum(), NonZeroUsize::new(1024));
+        assert_eq!(bucket_ladder.maximum(), TokenCount::new(1024));
     }
 
     #[test]
     fn bucket_ladder_preserves_order_and_duplicates() {
         let bucket_ladder = BucketLadder::new(vec![64, 8, 8, 32]).unwrap();
         assert_eq!(bucket_ladder.buckets(), [64, 8, 8, 32]);
-        assert_eq!(bucket_ladder.maximum(), NonZeroUsize::new(64));
+        assert_eq!(bucket_ladder.maximum(), TokenCount::new(64));
     }
 
     #[test]

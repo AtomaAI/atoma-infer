@@ -5,6 +5,7 @@ name    = "atoma-vllm-backend"
 version = { workspace = true }
 
 [dependencies]
+atoma-core          = { workspace = true }
 candle-core         = { workspace = true }
 candle-nn           = { workspace = true }
 candle-transformers = { workspace = true }

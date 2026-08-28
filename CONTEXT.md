@@ -42,7 +42,8 @@ _Avoid_: ladder (unqualified), phase
 
 **Arena**:
 The engine-owned device allocation from which every captured step's activations are addressed.
-_Avoid_: pool — a pool is a CUDA memory pool, which the arena deliberately is not
+_Avoid_: pool — the arena is neither a CUDA memory pool nor the KV block pool; its slots are
+fixed, role-addressed extents, not interchangeable blocks
 
 **Role**:
 One tensor the step produces, declared with a per-token width and a lifetime.
@@ -71,6 +72,41 @@ _Avoid_: split, boundary, cut
 **Bridge buffer**:
 A fixed-address buffer through which an eager operation passes data between two segments.
 _Avoid_: intermediate buffer, staging buffer
+
+**Lease**:
+The value that holds one pool block for exactly one owner. While it exists the block cannot be
+evicted or handed out again; surrendering it is the block's only way back to the pool.
+_Avoid_: ref count, handle
+
+**Chain hash**:
+The digest of one block-sized token run chained through its parent run's digest, so equal hashes
+mean equal prefixes. The tier-agnostic identity of cached KV.
+_Avoid_: content hash, prefix hash
+
+**Dummy**:
+A padding request filling one bucket slot. Each dummy owns its own KV block, leased from the
+pool at startup for the process lifetime.
+_Avoid_: filler, fake request
+
+**Layer group**:
+A set of layers with a common cache kind and geometry. A model's cache is declared group by
+group, and a group can share another group's cache instead of writing its own.
+_Avoid_: cache group, attention group
+
+**Prefix index**:
+The radix tree over chains of block hashes that answers longest-prefix match. It answers in
+block hashes, never slot ids; which slot holds a hash's bytes is the pool's residence lookup.
+_Avoid_: radix cache, prefix tree
+
+**Tier**:
+Where cached KV bytes live — device or host memory. A tier is where bytes live, never a
+preemption mechanism.
+_Avoid_: swap, cache level
+
+**Residence**:
+Which tier and slot currently hold a block hash's bytes. Identity is the chain hash and never
+carries residence; residence is always a separate lookup.
+_Avoid_: placement (for cached KV bytes; arena slot placement is unrelated and stays legal)
 
 **Spike**:
 A time-boxed experiment that answers a design question with measurements on real hardware.
