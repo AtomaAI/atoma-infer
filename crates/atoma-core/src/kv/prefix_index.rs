@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::mem;
 
-use crate::protocol::BlockHash;
+use crate::types::BlockHash;
 
 /// One slab slot: an occupied node, or a vacancy threading the free list.
 #[derive(Debug)]
@@ -208,7 +208,7 @@ mod tests {
 
     use super::PrefixIndex;
     use crate::kv::{ExtraKeys, HashAlgorithm};
-    use crate::protocol::{BlockHash, TokenCount};
+    use crate::types::{BlockHash, TokenCount};
 
     /// Chains `tokens` with block size 2 so short test sequences span several runs.
     fn chain(tokens: &[u32]) -> Vec<BlockHash> {

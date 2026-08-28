@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::dispatch::{GraphKey, PaddingLookup};
-use crate::protocol::{RequestCount, TokenCount};
+use crate::types::{RequestCount, TokenCount};
 
 /// What the scheduler reports about the live batch it wants served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

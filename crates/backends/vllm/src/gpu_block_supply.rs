@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use atoma_core::kv::{BlockLease, BlockPool, ExtraKeys, HashAlgorithm, PrefixIndex};
-use atoma_core::protocol::{BlockHash, BlockId, TokenCount};
+use atoma_core::types::{BlockHash, BlockId, TokenCount};
 use metrics::counter;
 use tracing::debug;
 

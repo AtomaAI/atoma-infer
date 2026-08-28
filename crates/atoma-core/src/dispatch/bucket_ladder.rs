@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::protocol::TokenCount;
+use crate::types::TokenCount;
 
 /// The GPU platform a default bucket ladder is sized for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +104,7 @@ pub enum BucketLadderError {
 #[cfg(test)]
 mod tests {
     use super::{BucketLadder, BucketLadderError, Platform};
-    use crate::protocol::TokenCount;
+    use crate::types::TokenCount;
 
     #[test]
     fn default_hopper_bucket_ladder_is_the_contract_list() {

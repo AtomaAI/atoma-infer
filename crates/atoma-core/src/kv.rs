@@ -22,7 +22,7 @@ pub use prefix_index::PrefixIndex;
 #[cfg(test)]
 mod tests {
     use crate::kv::{BlockPool, ExtraKeys, HashAlgorithm, PrefixIndex};
-    use crate::protocol::{BlockHash, TokenCount};
+    use crate::types::{BlockHash, TokenCount};
 
     /// One admission-to-eviction cycle across the pool and the index together, as the engine
     /// will drive them: hashes looked up and inserted at admission, blocks leased per run,

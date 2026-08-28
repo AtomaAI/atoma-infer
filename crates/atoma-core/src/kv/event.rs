@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::kv::HashAlgorithm;
-use crate::protocol::BlockHash;
+use crate::types::BlockHash;
 
 /// Where cached bytes reside. A tier is where bytes live, never a preemption mechanism.
 ///
@@ -58,7 +58,7 @@ mod tests {
 
     use super::{KvEvent, KvEventBatch, Tier};
     use crate::kv::{ExtraKeys, HashAlgorithm};
-    use crate::protocol::BlockHash;
+    use crate::types::BlockHash;
 
     fn hash_of(tokens: &[u32]) -> BlockHash {
         HashAlgorithm::Sha256V1.hash_run(None, tokens, ExtraKeys::none())

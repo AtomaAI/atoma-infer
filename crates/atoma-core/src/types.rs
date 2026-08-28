@@ -1,4 +1,4 @@
-//! The protocol vocabulary the engine is written against.
+//! The id and count types the engine is written against.
 //!
 //! Every identity and count that crosses a module or wire boundary is a newtype here, so a block
 //! id cannot be passed where a request slot is meant and a raw integer cannot impersonate either.

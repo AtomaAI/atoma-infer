@@ -7,7 +7,7 @@ use crate::dispatch::{
     admit, BucketLadder, EagerFallbackCounters, GraphKey, LiveBatch, PaddingLookup,
     RejectionReason, SupportLevel,
 };
-use crate::protocol::RequestCount;
+use crate::types::RequestCount;
 
 /// How the captured set was recorded: whole forward passes, or segments around eager regions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

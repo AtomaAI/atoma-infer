@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::protocol::{BlockHash, TokenCount};
+use crate::types::{BlockHash, TokenCount};
 
 /// Domain string opening every `sha256_v1` digest, separating this encoding from any other use
 /// of SHA-256 over similar bytes. Part of the frozen encoding: changing it orphans every
@@ -137,7 +137,7 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::{ExtraKeys, HashAlgorithm};
-    use crate::protocol::{BlockHash, TokenCount};
+    use crate::types::{BlockHash, TokenCount};
 
     /// Golden digests computed by an independent Python hashlib implementation of the documented
     /// encoding. They pin both the encoding and cross-restart reproducibility: a digest that

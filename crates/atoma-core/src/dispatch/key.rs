@@ -1,6 +1,6 @@
 //! The graph key: the value that selects one captured graph for a padded batch.
 
-use crate::protocol::{RequestCount, TokenCount};
+use crate::types::{RequestCount, TokenCount};
 
 /// Selects one captured graph for a padded batch.
 ///

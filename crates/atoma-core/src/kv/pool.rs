@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::thread;
 
-use crate::protocol::{BlockHash, BlockId};
+use crate::types::{BlockHash, BlockId};
 
 /// The links' null: where a pointer-based list would hold a null pointer, the index-based free
 /// list holds `NIL` — in a block's `prev`/`next` for a missing neighbor, and in `free_head`/
@@ -254,7 +254,7 @@ mod tests {
 
     use super::{BlockLease, BlockPool};
     use crate::kv::{ExtraKeys, HashAlgorithm};
-    use crate::protocol::BlockHash;
+    use crate::types::BlockHash;
 
     fn hash_of(tokens: &[u32]) -> BlockHash {
         HashAlgorithm::Sha256V1.hash_run(None, tokens, ExtraKeys::none())

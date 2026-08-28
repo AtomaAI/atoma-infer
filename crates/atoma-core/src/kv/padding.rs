@@ -10,7 +10,7 @@
 use thiserror::Error;
 
 use crate::kv::{BlockLease, BlockPool, KvCacheSpec};
-use crate::protocol::{BlockId, RequestCount};
+use crate::types::{BlockId, RequestCount};
 
 /// The padding dummies' blocks, held as leases for the process lifetime.
 ///
@@ -90,7 +90,7 @@ mod tests {
 
     use super::{PaddingError, PaddingReservation};
     use crate::kv::{BlockLayout, BlockPool, CacheKind, KvCacheSpec, KvSource, LayerGroup};
-    use crate::protocol::{LayerGroupId, RequestCount, TokenCount};
+    use crate::types::{LayerGroupId, RequestCount, TokenCount};
 
     fn max_batch(requests: usize) -> RequestCount {
         RequestCount::new(requests).expect("test batches are nonzero")

@@ -1,7 +1,7 @@
 //! Dense lookup from token count to the next captured bucket.
 
 use crate::dispatch::BucketLadder;
-use crate::protocol::TokenCount;
+use crate::types::TokenCount;
 
 /// Maps every token count in range to the next captured bucket — the smallest bucket that holds
 /// at least that many tokens.
@@ -71,7 +71,7 @@ mod tests {
     use super::PaddingLookup;
     use crate::dispatch::test_support::tokens;
     use crate::dispatch::{BucketLadder, Platform};
-    use crate::protocol::TokenCount;
+    use crate::types::TokenCount;
 
     /// Test-side oracle, independent of the table's filter-and-min: sort a copy of the ladder
     /// and take the first bucket that holds `token_count`.

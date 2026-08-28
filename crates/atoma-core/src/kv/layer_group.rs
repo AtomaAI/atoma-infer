@@ -10,7 +10,7 @@ use std::num::NonZeroUsize;
 
 use thiserror::Error;
 
-use crate::protocol::{LayerGroupId, TokenCount};
+use crate::types::{LayerGroupId, TokenCount};
 
 /// What kind of cache a layer group writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,7 +162,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use super::{BlockLayout, CacheKind, KvCacheSpec, KvSource, LayerGroup, LayerGroupError};
-    use crate::protocol::{LayerGroupId, TokenCount};
+    use crate::types::{LayerGroupId, TokenCount};
 
     fn nonzero(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("test values are nonzero")
