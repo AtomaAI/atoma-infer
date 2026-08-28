@@ -1,9 +1,12 @@
 //! The token-budget scheduler.
 //!
 //! One scheduling pass spends a per-step token budget: running requests first, then admission
-//! from the preempted stack and the waiting queue over a bounded window. A running request the
-//! pool cannot grow preempts the most recently admitted one, which releases its KV and later
-//! recomputes from the start; nothing is ever swapped out to be brought back. It answers in indices
+//! from the preempted stack and the waiting queue over a bounded window. Admission consults the
+//! prefix index, so a request starts past every block already cached; blocks that fill are
+//! hashed and indexed at once. A running request the pool cannot grow evicts unpinned cache
+//! first and only then preempts the most recently admitted request, which releases its KV and
+//! later recomputes from whatever the index still holds; nothing is ever swapped out to be
+//! brought back. It answers in indices
 //! and counts — which sequences run, how many tokens each computes, which entries sample — never in
 //! copied request state. The scheduler owns the request slab and the block pool outright; nothing
 //! here is shared or locked.
@@ -19,11 +22,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::debug;
 
-use crate::kv::BlockPool;
+use crate::kv::{BlockPool, HashAlgorithm, PrefixIndex};
 use crate::request::{
     FinishReason, Finished, NewRequest, Request, RequestEvent, RequestPhase, RequestSlab, Usage,
 };
-use crate::scheduler::kv::{ensure_blocks, release_blocks, PoolExhausted};
+use crate::scheduler::kv::{Kv, PoolExhausted};
 use crate::types::{RequestCount, RequestId, RequestSlot, SequenceIndex, StepId, TokenCount};
 
 pub use budget::TokenBudget;
@@ -47,6 +50,8 @@ pub struct SchedulerConfig {
     /// The model's end-of-sequence token ids; sampling one finishes a request that does not
     /// ignore it.
     pub eos_token_ids: Vec<u32>,
+    /// The chain-hash algorithm block identity is minted under.
+    pub hash_algorithm: HashAlgorithm,
 }
 
 /// One row of a [`Scheduled`]: a sequence, what it computes this step, and whether it samples.
@@ -122,6 +127,7 @@ pub struct Scheduler {
     config: SchedulerConfig,
     requests: RequestSlab,
     pool: BlockPool,
+    index: PrefixIndex,
     /// Admission order, which is batch order. The last admitted is the preemption victim.
     running: Vec<RequestSlot>,
     /// Arrival order. Admission examines a bounded window from the front.
@@ -150,6 +156,7 @@ impl Scheduler {
             requests: RequestSlab::with_capacity(config.max_requests.get()),
             config,
             pool,
+            index: PrefixIndex::new(),
             running: Vec::with_capacity(budget.max_requests().get()),
             waiting: VecDeque::new(),
             preempted: Vec::new(),
@@ -167,6 +174,23 @@ impl Scheduler {
     #[must_use]
     pub fn pool(&self) -> &BlockPool {
         &self.pool
+    }
+
+    #[must_use]
+    pub fn index(&self) -> &PrefixIndex {
+        &self.index
+    }
+
+    /// The KV substrate and the request slab, borrowed apart so a sequence and the pool can
+    /// change together.
+    fn kv_and_requests(&mut self) -> (Kv<'_>, &mut RequestSlab) {
+        let kv = Kv {
+            pool: &mut self.pool,
+            index: &mut self.index,
+            algorithm: self.config.hash_algorithm,
+            block_size: self.config.block_size,
+        };
+        (kv, &mut self.requests)
     }
 
     /// The step the last pass scheduled.
@@ -241,7 +265,11 @@ impl Scheduler {
             debug!(request = id.get(), ?reason, "request finished at intake");
             return Err(reason);
         }
-        let slot = self.requests.insert(Request::new(id, new, self.step));
+        let mut request = Request::new(id, new, self.step);
+        for sequence in request.sequences_mut() {
+            sequence.extend_chain(self.config.hash_algorithm, self.config.block_size);
+        }
+        let slot = self.requests.insert(request);
         self.waiting.push_back(slot);
         Ok(slot)
     }
@@ -276,19 +304,23 @@ impl Scheduler {
         let mut sampled = sampled.iter().copied();
         let mut finished = Vec::new();
         for entry in &scheduled.entries {
-            let request = self
-                .requests
+            let (mut kv, requests) = self.kv_and_requests();
+            let request = requests
                 .get_mut(entry.slot)
                 .expect("a scheduled slot stays live until its result is applied");
             let sequence = &mut request.sequences_mut()[entry.sequence.get() as usize];
             sequence.advance(entry.query_len.get());
-            if !entry.samples {
+            let token = entry.samples.then(|| {
+                let token = sampled
+                    .next()
+                    .expect("one sampled token per sampling entry");
+                sequence.push_token(token);
+                token
+            });
+            kv.cache_filled_blocks(sequence);
+            let Some(token) = token else {
                 continue;
-            }
-            let token = sampled
-                .next()
-                .expect("one sampled token per sampling entry");
-            sequence.push_token(token);
+            };
             request.egress().send(RequestEvent::Token {
                 request: request.id(),
                 sequence: entry.sequence,
@@ -353,8 +385,9 @@ impl Scheduler {
                 unreachable!("only live requests retire")
             }
         };
+        let (mut kv, _) = self.kv_and_requests();
         for sequence in request.sequences_mut() {
-            release_blocks(&mut self.pool, sequence);
+            kv.release(sequence);
         }
         request.set_phase(RequestPhase::Finished(finished));
         request.egress().send(RequestEvent::Finished {
@@ -399,12 +432,12 @@ impl Scheduler {
                 let context_len = sequence.computed();
                 let total = sequence.total();
                 let sequence_len = context_len + query_len.get();
-                while ensure_blocks(
-                    &mut self.pool,
-                    self.config.block_size,
-                    &mut self.requests.get_mut(slot).expect("live").sequences_mut()[index],
-                    sequence_len,
-                ) == Err(PoolExhausted)
+                while {
+                    let (mut kv, requests) = self.kv_and_requests();
+                    let sequence =
+                        &mut requests.get_mut(slot).expect("live").sequences_mut()[index];
+                    kv.ensure_blocks(sequence, sequence_len)
+                } == Err(PoolExhausted)
                 {
                     let victim = *self.running.last().expect("this request is running");
                     self.preempt(victim);
@@ -443,25 +476,42 @@ impl Scheduler {
             Some(slot),
             "the preemption victim is the most recently admitted request"
         );
-        let request = self.requests.get_mut(slot).expect("running slots are live");
+        let Scheduler {
+            config,
+            requests,
+            pool,
+            index,
+            running: _,
+            waiting: _,
+            preempted,
+            budget: _,
+            step,
+            next_request_id: _,
+        } = self;
+        let mut kv = Kv {
+            pool,
+            index,
+            algorithm: config.hash_algorithm,
+            block_size: config.block_size,
+        };
+        let request = requests.get_mut(slot).expect("running slots are live");
         let RequestPhase::Running(running) = request.phase() else {
             unreachable!("the running queue holds only Running requests")
         };
-        request.set_phase(RequestPhase::Preempted(running.preempt(self.step)));
+        request.set_phase(RequestPhase::Preempted(running.preempt(*step)));
         for sequence in request.sequences_mut() {
-            release_blocks(&mut self.pool, sequence);
+            kv.release(sequence);
             sequence.reset_for_recompute();
         }
-        self.preempted.push(slot);
+        preempted.push(slot);
         debug!(request = request.id().get(), "request preempted");
     }
 
     /// Admission: examines up to the window of candidates — the preempted stack top first, last
-    /// in first out, then the front of the waiting queue first come first served — and stops at
-    /// the first request the budget or the pool cannot serve. Admission never preempts.
+    /// in first out, then the front of the waiting queue first come first served — claims each
+    /// one's cached prefix, and stops at the first request the budget or the pool cannot serve.
+    /// Admission never preempts.
     fn admit(&mut self, entries: &mut Vec<Entry>) {
-        let block_size = self.config.block_size;
-        let step = self.step;
         for _ in 0..self.config.window.get() {
             let (slot, from) = match self.preempted.last() {
                 Some(&slot) => (slot, Candidate::Preempted),
@@ -470,43 +520,65 @@ impl Scheduler {
                     None => return,
                 },
             };
-            let request = self.requests.get_mut(slot).expect("candidates are live");
-            if request.is_cancelled() {
+            if self.requests.get(slot).is_some_and(Request::is_cancelled) {
                 self.retire(slot, FinishReason::Cancelled);
                 continue;
             }
+            let Scheduler {
+                config,
+                requests,
+                pool,
+                index,
+                running,
+                waiting,
+                preempted,
+                budget,
+                step,
+                next_request_id: _,
+            } = self;
+            let mut kv = Kv {
+                pool,
+                index,
+                algorithm: config.hash_algorithm,
+                block_size: config.block_size,
+            };
+            let request = requests.get_mut(slot).expect("candidates are live");
             let sequence = &mut request.sequences_mut()[0];
             let total = sequence.total();
-            let Some(query_len) = self.budget.offer(sequence.remaining()) else {
+            kv.claim_prefix(sequence);
+            let context_len = sequence.computed();
+            let Some(query_len) = budget.offer(sequence.remaining()) else {
+                kv.release(sequence);
+                sequence.reset_for_recompute();
                 return;
             };
-            if ensure_blocks(&mut self.pool, block_size, sequence, query_len.get())
-                == Err(PoolExhausted)
-            {
+            if kv.ensure_blocks(sequence, context_len + query_len.get()) == Err(PoolExhausted) {
+                kv.release(sequence);
+                sequence.reset_for_recompute();
                 return;
             }
-            let running = match (from, request.phase()) {
-                (Candidate::Preempted, RequestPhase::Preempted(preempted)) => {
-                    self.preempted.pop();
-                    preempted.admit(step)
+            let admitted = match (from, request.phase()) {
+                (Candidate::Preempted, RequestPhase::Preempted(phase)) => {
+                    preempted.pop();
+                    phase.admit(*step)
                 }
-                (Candidate::Waiting, RequestPhase::Waiting(waiting)) => {
-                    self.waiting.pop_front();
-                    waiting.admit(step)
+                (Candidate::Waiting, RequestPhase::Waiting(phase)) => {
+                    waiting.pop_front();
+                    phase.admit(*step)
                 }
                 (Candidate::Preempted | Candidate::Waiting, _) => {
                     unreachable!("each admission queue holds only its own phase")
                 }
             };
-            request.set_phase(RequestPhase::Running(running));
-            self.running.push(slot);
-            self.budget.spend(query_len);
+            request.set_phase(RequestPhase::Running(admitted));
+            running.push(slot);
+            budget.spend(query_len);
             entries.push(Entry {
                 slot,
                 sequence: SequenceIndex::new(0),
-                context_len: 0,
+                context_len,
                 query_len,
-                samples: query_len.get() == total,
+                samples: context_len + query_len.get() == total,
             });
         }
     }
@@ -522,9 +594,10 @@ enum Candidate {
 impl Drop for Scheduler {
     /// Returns every block to the pool so no lease outlives the scheduler unreleased.
     fn drop(&mut self) {
-        for (_, request) in self.requests.iter_mut() {
+        let (mut kv, requests) = self.kv_and_requests();
+        for (_, request) in requests.iter_mut() {
             for sequence in request.sequences_mut() {
-                release_blocks(&mut self.pool, sequence);
+                kv.release(sequence);
             }
         }
     }

@@ -8,7 +8,9 @@
 //!   `finished_sequence_groups_return_their_blocks`,
 //!   `sequential_requests_do_not_exhaust_the_block_pool`,
 //!   `abort_removes_the_sequence_group_from_every_queue` and `scheduler_abort_sequence_group`
-//!   (abort is the client dropping its egress receiver).
+//!   (abort is the client dropping its egress receiver). Where the old tests counted free blocks
+//!   after a finish, these count `available` blocks: a finished request's full blocks stay resident
+//!   as evictable cache, which the old block manager had no notion of.
 //! - Rewritten, divergence documented on the test: `prefill_prioritized` (decode-first, mixed
 //!   batches), `prefill_schedule_token_budget` (a prompt over the remaining budget is chunked, not
 //!   refused), `scheduler_schedule_preempt_abort` and `decode_schedule_preempted` (preemption is
@@ -20,7 +22,7 @@
 
 use std::collections::VecDeque;
 
-use crate::kv::BlockPool;
+use crate::kv::{BlockPool, HashAlgorithm};
 use crate::request::{
     egress, EgressReceiver, FinishReason, NewRequest, RequestEvent, RequestPhase, SamplingParams,
     StopCriteria, Usage,
@@ -53,6 +55,7 @@ fn config(blocks: u32, token_budget: usize, max_batch: usize) -> SchedulerConfig
         window: requests(WINDOW),
         max_requests: requests(MAX_REQUESTS),
         eos_token_ids: vec![EOS],
+        hash_algorithm: HashAlgorithm::Sha256V1,
     }
 }
 
@@ -63,17 +66,34 @@ struct Clients {
 }
 
 impl Clients {
-    /// Submits a `prompt_len`-token prompt allowed `max_new_tokens` generated tokens.
+    /// Submits a `prompt_len`-token prompt allowed `max_new_tokens` generated tokens. Each
+    /// submission gets its own token range, so requests never share a prefix unless a test
+    /// submits an explicit prompt through [`Clients::submit_prompt`].
     fn submit(
         &mut self,
         scheduler: &mut Scheduler,
         prompt_len: usize,
         max_new_tokens: usize,
     ) -> RequestSlot {
+        let base = u32::try_from(1000 * self.receivers.len()).unwrap();
+        let prompt = (base + 1..=base + u32::try_from(prompt_len).unwrap()).collect();
+        self.submit_prompt(scheduler, prompt, max_new_tokens)
+    }
+
+    /// Submits `prompt` exactly, for tests about shared prefixes.
+    fn submit_prompt(
+        &mut self,
+        scheduler: &mut Scheduler,
+        prompt: Vec<u32>,
+        max_new_tokens: usize,
+    ) -> RequestSlot {
         let (sender, receiver) = egress();
         self.receivers.push(receiver);
         scheduler
-            .intake(new_request(prompt_len, max_new_tokens, sender))
+            .intake(NewRequest {
+                prompt,
+                ..new_request(1, max_new_tokens, sender)
+            })
             .expect("the prompt fits the model")
     }
 }
@@ -117,6 +137,11 @@ fn finish_reason(receiver: &EgressReceiver) -> Option<FinishReason> {
         RequestEvent::Finished { reason, .. } => Some(reason),
         RequestEvent::Token { .. } => None,
     })
+}
+
+/// A prompt of exactly `blocks` full blocks, the same for every caller.
+fn shared_prompt(blocks: usize) -> Vec<u32> {
+    (1..=u32::try_from(blocks * BLOCK_SIZE).unwrap()).collect()
 }
 
 fn slots(scheduled: &Scheduled) -> Vec<RequestSlot> {
@@ -183,7 +208,7 @@ fn prompts_are_scheduled_together_then_decode_one_token_each() {
     for slot in submitted {
         let sequence = &scheduler.request(slot).unwrap().sequences()[0];
         assert_eq!(sequence.computed(), BLOCK_SIZE + 1);
-        assert_eq!(sequence.tokens(), &[1, 2, 3, 4, 1, 1]);
+        assert_eq!(&sequence.tokens()[BLOCK_SIZE..], &[1, 1]);
         assert!(sequence.is_decoding());
     }
 }
@@ -439,14 +464,14 @@ fn applying_fewer_tokens_than_sampling_entries_is_a_protocol_violation() {
 fn finished_requests_return_their_blocks() {
     let mut scheduler = scheduler(8, 100, 4);
     let mut clients = Clients::default();
-    let baseline = scheduler.pool().free_count();
+    let baseline = scheduler.pool().available();
     let submitted: Vec<_> = (0..4)
         .map(|_| clients.submit(&mut scheduler, BLOCK_SIZE, 1))
         .collect();
 
     let scheduled = scheduler.schedule();
     assert_eq!(
-        scheduler.pool().free_count(),
+        scheduler.pool().available(),
         baseline - 4,
         "one block per prompt"
     );
@@ -462,9 +487,9 @@ fn finished_requests_return_their_blocks() {
         "finished requests free their slots"
     );
     assert_eq!(
-        scheduler.pool().free_count(),
+        scheduler.pool().available(),
         baseline,
-        "every block came back"
+        "every block came back, free or as cache"
     );
     for (slot, receiver) in submitted.iter().zip(&clients.receivers) {
         assert!(scheduler.request(*slot).is_none());
@@ -491,13 +516,13 @@ fn finished_requests_return_their_blocks() {
 fn sequential_requests_do_not_exhaust_the_block_pool() {
     let mut scheduler = scheduler(4, 100, 1);
     let mut clients = Clients::default();
-    let baseline = scheduler.pool().free_count();
+    let baseline = scheduler.pool().available();
     for i in 0..32 {
         let slot = clients.submit(&mut scheduler, BLOCK_SIZE, 1);
         let scheduled = step(&mut scheduler);
         assert_eq!(slots(&scheduled), [slot], "request {i} was never scheduled");
         assert_eq!(
-            scheduler.pool().free_count(),
+            scheduler.pool().available(),
             baseline,
             "request {i} leaked blocks"
         );
@@ -527,7 +552,7 @@ fn a_dropped_receiver_retires_only_that_request_from_waiting() {
 fn a_dropped_receiver_retires_only_that_request_from_running() {
     let mut scheduler = scheduler(8, 100, 4);
     let mut clients = Clients::default();
-    let baseline = scheduler.pool().free_count();
+    let baseline = scheduler.pool().available();
     let cancelled = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
     let survivor = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
     assert_eq!(slots(&step(&mut scheduler)), [cancelled, survivor]);
@@ -536,7 +561,7 @@ fn a_dropped_receiver_retires_only_that_request_from_running() {
     let scheduled = step(&mut scheduler);
     assert_eq!(slots(&scheduled), [survivor]);
     assert_eq!(scheduler.running(), [survivor]);
-    assert_eq!(scheduler.pool().free_count(), baseline - 2);
+    assert_eq!(scheduler.pool().available(), baseline - 2);
     assert!(matches!(
         events(&clients.receivers[0]).last(),
         Some(RequestEvent::Token { token: 1, .. })
@@ -557,7 +582,7 @@ fn every_client_hanging_up_empties_the_scheduler() {
     let scheduled = step(&mut scheduler);
     assert!(scheduled.is_empty());
     assert_eq!(scheduler.request_count(), 0);
-    assert_eq!(scheduler.pool().free_count(), 8);
+    assert_eq!(scheduler.pool().available(), 8);
 }
 
 #[test]
@@ -605,7 +630,7 @@ fn reaching_the_max_model_length_finishes_a_request() {
         finish_reason(&clients.receivers[0]),
         Some(FinishReason::MaxModelLength)
     );
-    assert_eq!(scheduler.pool().free_count(), 2);
+    assert_eq!(scheduler.pool().available(), 2);
 }
 
 /// Rewrite of `test_scheduler_schedule_preempt_abort`. Divergence: the old scheduler preempted
@@ -675,7 +700,7 @@ fn preemption_takes_victims_from_the_tail_only_as_the_pool_needs_them() {
         .map(|_| clients.submit(&mut scheduler, 4 * BLOCK_SIZE, 16))
         .collect();
     assert_eq!(slots(&step(&mut scheduler)), submitted);
-    assert_eq!(scheduler.pool().free_count(), 0);
+    assert_eq!(scheduler.pool().available(), 0);
 
     let decode = step(&mut scheduler);
     assert_eq!(slots(&decode), submitted[..2]);
@@ -687,9 +712,9 @@ fn preemption_takes_victims_from_the_tail_only_as_the_pool_needs_them() {
     assert_eq!(decode.token_count(), 2);
     assert!(decode.is_uniform_decode());
     assert_eq!(
-        scheduler.pool().free_count(),
+        scheduler.pool().available(),
         2,
-        "two of the freed blocks were taken"
+        "two of the victim's four blocks were evicted and taken; two stay cached"
     );
     assert_eq!(scheduler.running(), &submitted[..2]);
     assert_eq!(scheduler.preempted(), [submitted[2]]);
@@ -754,4 +779,157 @@ fn a_dropped_receiver_retires_only_that_request_from_the_preempted_stack() {
         "the other preempted request is untouched"
     );
     assert_eq!(scheduler.request_count(), 2);
+}
+
+#[test]
+fn a_request_with_a_cached_prefix_starts_past_it() {
+    let mut scheduler = scheduler(16, 100, 64);
+    let mut clients = Clients::default();
+    let shared = shared_prompt(3);
+    let first = clients.submit_prompt(&mut scheduler, shared.clone(), 1);
+    let scheduled = scheduler.schedule();
+    let first_blocks = scheduler.request(first).unwrap().sequences()[0]
+        .block_table()
+        .to_vec();
+    scheduler.apply(&scheduled, &[1]);
+    assert!(scheduler.request(first).is_none());
+    assert_eq!(scheduler.index().len(), 3, "three full blocks were hashed");
+
+    let second = clients.submit_prompt(&mut scheduler, shared, 1);
+    let scheduled = scheduler.schedule();
+    let entry = scheduled.entries[0];
+    assert_eq!(entry.slot, second);
+    assert_eq!(entry.context_len, 2 * BLOCK_SIZE, "two blocks are hits");
+    assert_eq!(
+        entry.query_len,
+        tokens(BLOCK_SIZE),
+        "the last block is computed"
+    );
+    assert!(entry.samples);
+    let table = scheduler.request(second).unwrap().sequences()[0].block_table();
+    assert_eq!(table[..2], first_blocks[..2], "hits read the cached blocks");
+    assert_ne!(table[2], first_blocks[2], "the computed block is its own");
+    scheduler.apply(&scheduled, &[1]);
+}
+
+/// A prompt of exactly two full blocks hits only the first: the block holding the last prompt
+/// token is always computed, so there is a logit to sample the first token from.
+#[test]
+fn the_block_holding_the_last_prompt_token_is_never_a_hit() {
+    let mut scheduler = scheduler(16, 100, 64);
+    let mut clients = Clients::default();
+    let shared = shared_prompt(2);
+    clients.submit_prompt(&mut scheduler, shared.clone(), 1);
+    step(&mut scheduler);
+    assert_eq!(scheduler.index().len(), 2);
+
+    let second = clients.submit_prompt(&mut scheduler, shared, 1);
+    let scheduled = step(&mut scheduler);
+    let entry = scheduled.entries[0];
+    assert_eq!(entry.slot, second);
+    assert_eq!(entry.context_len, BLOCK_SIZE);
+    assert_eq!(entry.query_len, tokens(BLOCK_SIZE));
+}
+
+/// The preempted request's computed count resets to zero, and what the index still holds of
+/// its prefix is rediscovered when it re-enters Running.
+#[test]
+fn a_preempted_request_rediscovers_its_cached_prefix_on_re_entry() {
+    let mut scheduler = scheduler(12, 1000, 64);
+    let mut clients = Clients::default();
+    let submitted: Vec<_> = (0..3)
+        .map(|_| clients.submit(&mut scheduler, 4 * BLOCK_SIZE, 2))
+        .collect();
+    step(&mut scheduler);
+
+    // The two survivors each take one of the victim's four cached blocks, then finish.
+    let decode = step(&mut scheduler);
+    assert_eq!(decode.preempted, [submitted[2]]);
+    assert!(
+        scheduler.running().is_empty(),
+        "two tokens was all they asked for"
+    );
+    assert_eq!(
+        scheduler.request(submitted[2]).unwrap().sequences()[0].computed(),
+        0
+    );
+
+    let readmit = step(&mut scheduler);
+    let entry = readmit.entries[0];
+    assert_eq!(entry.slot, submitted[2]);
+    assert_eq!(
+        entry.context_len,
+        2 * BLOCK_SIZE,
+        "two of its blocks survived"
+    );
+    assert_eq!(
+        entry.query_len,
+        tokens(2 * BLOCK_SIZE + 1),
+        "the rest of the prompt and its sampled token recompute"
+    );
+    assert!(entry.samples);
+}
+
+#[test]
+fn cache_is_evicted_before_anyone_is_preempted() {
+    let mut scheduler = scheduler(4, 100, 64);
+    let mut clients = Clients::default();
+    clients.submit(&mut scheduler, BLOCK_SIZE, 1);
+    step(&mut scheduler);
+    assert_eq!(scheduler.index().len(), 1);
+    assert_eq!(scheduler.pool().free_count(), 3);
+
+    let b = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    let c = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    step(&mut scheduler);
+    let decode = step(&mut scheduler);
+    assert_eq!(slots(&decode), [b, c]);
+    assert!(decode.preempted.is_empty(), "the cached block went first");
+    assert_eq!(scheduler.pool().free_count(), 0);
+}
+
+#[test]
+fn finished_requests_leave_their_full_blocks_as_evictable_cache() {
+    let mut scheduler = scheduler(8, 100, 64);
+    let mut clients = Clients::default();
+    let baseline = scheduler.pool().free_count();
+    clients.submit(&mut scheduler, 2 * BLOCK_SIZE, 1);
+    step(&mut scheduler);
+
+    assert_eq!(scheduler.request_count(), 0);
+    assert_eq!(scheduler.pool().available(), baseline);
+    assert_eq!(
+        scheduler.pool().free_count(),
+        baseline - 2,
+        "two full blocks stay"
+    );
+    assert_eq!(scheduler.index().len(), 2);
+}
+
+/// Two requests computing the same prefix at once both compute it; only the first claim is
+/// cached, the other block frees on finish, and a third request hits the one copy.
+#[test]
+fn identical_prompts_admitted_together_share_one_cached_copy() {
+    let mut scheduler = scheduler(8, 100, 64);
+    let mut clients = Clients::default();
+    let baseline = scheduler.pool().available();
+    let shared = shared_prompt(2);
+    clients.submit_prompt(&mut scheduler, shared.clone(), 1);
+    clients.submit_prompt(&mut scheduler, shared.clone(), 1);
+    let scheduled = step(&mut scheduler);
+    assert_eq!(scheduled.entries.len(), 2);
+    assert!(scheduled.entries.iter().all(|entry| entry.context_len == 0));
+
+    assert_eq!(scheduler.index().len(), 2, "one node per block, not two");
+    assert_eq!(scheduler.pool().available(), baseline);
+    assert_eq!(
+        scheduler.pool().free_count(),
+        baseline - 2,
+        "one cached copy"
+    );
+
+    let third = clients.submit_prompt(&mut scheduler, shared, 1);
+    let scheduled = step(&mut scheduler);
+    assert_eq!(scheduled.entries[0].slot, third);
+    assert_eq!(scheduled.entries[0].context_len, BLOCK_SIZE);
 }
