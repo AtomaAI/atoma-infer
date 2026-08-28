@@ -1119,6 +1119,37 @@ fn a_closed_admission_still_re_admits_preempted_requests() {
     );
 }
 
+/// The cancel sweep runs before admission does, so a client that hangs up in Waiting or in the
+/// preempted stack is retired even while a drain admits nothing new.
+#[test]
+fn cancelled_requests_retire_while_admission_is_closed() {
+    let mut scheduler = scheduler(2, 64, 2);
+    let mut clients = Clients::default();
+    let running = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    let preempted = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    step(&mut scheduler);
+    assert_eq!(step(&mut scheduler).preempted, [preempted]);
+    let waiting = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    scheduler.close_admission();
+
+    clients.receivers.remove(2);
+    clients.receivers.remove(1);
+    step(&mut scheduler);
+
+    assert!(
+        scheduler.request(preempted).is_none(),
+        "cancelled in the stack"
+    );
+    assert!(
+        scheduler.request(waiting).is_none(),
+        "cancelled in the queue"
+    );
+    assert!(scheduler.preempted().is_empty());
+    assert!(scheduler.waiting().is_empty());
+    assert_eq!(scheduler.running(), [running], "the live one runs on");
+    assert_eq!(scheduler.request_count(), 1);
+}
+
 #[test]
 fn finishing_everything_tells_every_client_and_keeps_the_dummies() {
     let mut scheduler = scheduler(8, 100, 64);

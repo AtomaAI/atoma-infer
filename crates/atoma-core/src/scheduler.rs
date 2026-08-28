@@ -371,14 +371,14 @@ impl Scheduler {
         Ok(slot)
     }
 
-    /// One scheduling pass: requests whose client hung up retire, running requests spend the
-    /// budget first — preempting the most recently admitted when the pool cannot grow them —
-    /// then admission offers the remainder to the preempted stack and the waiting queue over the
-    /// configured window.
+    /// One scheduling pass: requests whose client hung up retire in every queue, running requests
+    /// spend the budget first — preempting the most recently admitted when the pool cannot grow
+    /// them — then admission offers the remainder to the preempted stack and the waiting queue
+    /// over the configured window.
     pub fn schedule(&mut self) -> Scheduled {
         self.step = StepId::new(self.step.get() + 1);
         self.budget.reset();
-        self.retire_cancelled_running();
+        self.retire_cancelled();
         let mut entries = Vec::with_capacity(self.budget.max_requests().get());
         let preempted = self.schedule_running(&mut entries);
         self.admit(&mut entries);
@@ -495,10 +495,17 @@ impl Scheduler {
         debug!(request = request.id().get(), reason = ?finished.reason(), "request finished");
     }
 
-    /// Retires every running request whose client hung up, before any budget is spent on it.
-    fn retire_cancelled_running(&mut self) {
+    /// Retires every request whose client hung up, before any budget is spent on it: the whole
+    /// running batch and preempted stack, and the waiting requests admission would examine. It
+    /// runs at the head of every pass, so a drain that admits nothing still lets cancels through.
+    fn retire_cancelled(&mut self) {
         let mut cancelled = Vec::new();
-        for &slot in &self.running {
+        let examined = self
+            .running
+            .iter()
+            .chain(&self.preempted)
+            .chain(self.waiting.iter().take(self.config.window.get()));
+        for &slot in examined {
             if self.requests.get(slot).is_some_and(Request::is_cancelled) {
                 cancelled.push(slot);
             }
@@ -616,10 +623,6 @@ impl Scheduler {
             let Some((slot, from)) = self.next_candidate() else {
                 return;
             };
-            if self.requests.get(slot).is_some_and(Request::is_cancelled) {
-                self.retire(slot, FinishReason::Cancelled);
-                continue;
-            }
             let Scheduler {
                 config,
                 requests,
@@ -686,7 +689,8 @@ impl Scheduler {
 impl Scheduler {
     /// The next admission candidate: the preempted stack top, or — while admission is open —
     /// the waiting request the policy picks from the window. A closed admission still offers the
-    /// preempted stack, since those are running requests on their way to finishing.
+    /// preempted stack, since those are running requests on their way to finishing. Cancelled
+    /// candidates are gone already: the pass sweeps them before it spends anything.
     fn next_candidate(&mut self) -> Option<(RequestSlot, Candidate)> {
         if let Some(&slot) = self.preempted.last() {
             return Some((slot, Candidate::Preempted));
@@ -694,7 +698,6 @@ impl Scheduler {
         if !self.admission_open {
             return None;
         }
-        self.retire_cancelled_in_window();
         let position = match self.config.admission {
             AdmissionPolicy::Fcfs => 0,
             AdmissionPolicy::LongestPrefixMatch => self.longest_prefix_position()?,
@@ -702,19 +705,6 @@ impl Scheduler {
         self.waiting
             .get(position)
             .map(|&slot| (slot, Candidate::Waiting { position }))
-    }
-
-    /// Retires every cancelled request within the window, so none sits there unexamined.
-    fn retire_cancelled_in_window(&mut self) {
-        let mut cancelled = Vec::new();
-        for &slot in self.waiting.iter().take(self.config.window.get()) {
-            if self.requests.get(slot).is_some_and(Request::is_cancelled) {
-                cancelled.push(slot);
-            }
-        }
-        for slot in cancelled {
-            self.retire(slot, FinishReason::Cancelled);
-        }
     }
 
     /// The position in the waiting queue, within the window, of the request with the most
