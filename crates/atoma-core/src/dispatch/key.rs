@@ -1,16 +1,14 @@
 //! The graph key: the value that selects one captured graph for a padded batch.
 
-use serde::{Deserialize, Serialize};
-
 use crate::types::{RequestCount, TokenCount};
 
 /// Selects one captured graph for a padded batch.
 ///
 /// A key is built by exactly one pure function of the padded batch — the crate-internal
 /// constructor the dispatch decision owns. There is no default value and no public field, so adding
-/// a field later fails to compile at the construction site, and code outside this crate can carry,
-/// compare and transport keys but never derive one from a batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// a field later fails to compile at the construction site, and code outside this crate can carry
+/// and compare keys but never mint one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GraphKey {
     padded_token_count: TokenCount,
     request_count: RequestCount,

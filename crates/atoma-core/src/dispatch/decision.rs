@@ -33,8 +33,7 @@ pub enum SupportLevel {
 }
 
 /// Why a batch fell back to eager execution, carrying the numbers that caused it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum EagerReason {
     /// No bucket holds this many tokens.
     #[error(

@@ -2,17 +2,15 @@
 //!
 //! A step command carries everything the executor acts on for one step, built on the engine
 //! thread from host-native request state with zero device reads; a step result carries each
-//! sampling entry's token back. Both are plain serializable values — no reference counting, no
-//! trait objects, no wall-clock types — so the seam survives being moved to a socket.
-
-use serde::{Deserialize, Serialize};
+//! sampling entry's token back. Both are plain values: no reference counting, no trait objects
+//! and no wall-clock types cross the seam.
 
 use crate::dispatch::DispatchDecision;
 use crate::request::SamplingParams;
 use crate::types::{BlockId, RequestId, RequestSlot, SequenceIndex, StepId, TokenCount};
 
 /// One entry of a step command: a sequence, the tokens it computes and where its KV lives.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommandEntry {
     pub request: RequestId,
     pub slot: RequestSlot,
@@ -48,7 +46,7 @@ impl CommandEntry {
 }
 
 /// Everything the executor acts on for one step.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StepCommand {
     pub step: StepId,
     /// The live entries in batch order, then the padding dummies inserted to reach the bucket.
@@ -81,7 +79,7 @@ impl StepCommand {
 }
 
 /// What the executor returns for one step: one token per sampling entry, in entry order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepResult {
     pub step: StepId,
     pub sampled: Vec<u32>,
@@ -89,7 +87,7 @@ pub struct StepResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandEntry, StepCommand, StepResult};
+    use super::{CommandEntry, StepCommand};
     use crate::dispatch::{DispatchDecision, EagerReason};
     use crate::request::SamplingParams;
     use crate::test_support::{requests, tokens};
@@ -145,24 +143,5 @@ mod tests {
             None,
             "an empty command has no live batch"
         );
-    }
-
-    #[test]
-    fn commands_and_results_round_trip_through_serde() {
-        let command = StepCommand {
-            step: StepId::new(4),
-            entries: vec![entry(0, vec![1, 2], true)],
-            padding_count: 0,
-            dispatch: eager(),
-        };
-        let json = serde_json::to_string(&command).unwrap();
-        assert_eq!(serde_json::from_str::<StepCommand>(&json).unwrap(), command);
-
-        let result = StepResult {
-            step: StepId::new(4),
-            sampled: vec![42],
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        assert_eq!(serde_json::from_str::<StepResult>(&json).unwrap(), result);
     }
 }
