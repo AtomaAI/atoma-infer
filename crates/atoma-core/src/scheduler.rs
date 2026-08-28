@@ -546,62 +546,86 @@ impl Scheduler {
         let mut position = 0;
         while position < self.running.len() {
             let slot = self.running[position];
-            let request = self.requests.get_mut(slot).expect("running slots are live");
-            let sequence_count = request.sequences().len();
-            let mut displaced_self = false;
-            for index in 0..sequence_count {
-                let sequence =
-                    &mut self.requests.get_mut(slot).expect("live").sequences_mut()[index];
-                let Some(query_len) = self.budget.offer(sequence.remaining()) else {
-                    return preempted;
-                };
-                let context_len = sequence.computed();
-                let total = sequence.total();
-                let sequence_len = context_len + query_len.get();
-                while {
-                    let mut parts = self.parts();
-                    let sequence =
-                        &mut parts.requests.get_mut(slot).expect("live").sequences_mut()[index];
-                    parts.kv.ensure_blocks(sequence, sequence_len)
-                } == Err(PoolExhausted)
-                {
-                    let victim = *self.running.last().expect("this request is running");
-                    self.preempt(victim);
-                    preempted.push(victim);
-                    if victim == slot {
-                        displaced_self = true;
-                        break;
-                    }
-                }
-                if displaced_self {
-                    break;
-                }
-                self.budget.spend(query_len);
-                entries.push(Entry {
-                    slot,
-                    sequence: SequenceIndex::new(
-                        u16::try_from(index).expect("sequence indices fit u16"),
-                    ),
-                    context_len,
-                    query_len,
-                    samples: sequence_len == total,
-                });
-            }
-            if !displaced_self {
-                position += 1;
+            match self.budget_running(slot, entries, &mut preempted) {
+                // The queue shrank under this position, so the next request is at it already.
+                Budgeted::DisplacedItself => {}
+                Budgeted::Scheduled => position += 1,
+                Budgeted::BudgetSpent => return preempted,
             }
         }
         preempted
     }
 
-    /// Preemption: the request at `slot`, the most recently admitted, releases its KV and will
-    /// recompute from the start when it re-enters Running.
-    fn preempt(&mut self, slot: RequestSlot) {
-        assert_eq!(
-            self.running.pop(),
-            Some(slot),
-            "the preemption victim is the most recently admitted request"
-        );
+    /// Gives every sequence of the running request at `slot` an entry, growing its blocks and
+    /// spending the budget for each.
+    fn budget_running(
+        &mut self,
+        slot: RequestSlot,
+        entries: &mut Vec<Entry>,
+        preempted: &mut Vec<RequestSlot>,
+    ) -> Budgeted {
+        let sequence_count = self
+            .requests
+            .get(slot)
+            .expect("running slots are live")
+            .sequences()
+            .len();
+        for index in 0..sequence_count {
+            let sequence = &self.requests.get(slot).expect("live").sequences()[index];
+            let Some(query_len) = self.budget.offer(sequence.remaining()) else {
+                return Budgeted::BudgetSpent;
+            };
+            let context_len = sequence.computed();
+            let total = sequence.total();
+            let sequence_len = context_len + query_len.get();
+            if self.grow(slot, index, sequence_len, preempted) == Grown::DisplacedItself {
+                return Budgeted::DisplacedItself;
+            }
+            self.budget.spend(query_len);
+            entries.push(Entry {
+                slot,
+                sequence: SequenceIndex::new(
+                    u16::try_from(index).expect("sequence indices fit u16"),
+                ),
+                context_len,
+                query_len,
+                samples: sequence_len == total,
+            });
+        }
+        Budgeted::Scheduled
+    }
+
+    /// Grows sequence `index` of `slot` to cover `sequence_len` tokens, preempting the most
+    /// recently admitted request as often as it takes and recording each victim in `preempted`.
+    /// The victim is this request itself when it is the newest one running.
+    fn grow(
+        &mut self,
+        slot: RequestSlot,
+        index: usize,
+        sequence_len: usize,
+        preempted: &mut Vec<RequestSlot>,
+    ) -> Grown {
+        loop {
+            let mut parts = self.parts();
+            let sequence = &mut parts.requests.get_mut(slot).expect("live").sequences_mut()[index];
+            if parts.kv.ensure_blocks(sequence, sequence_len) != Err(PoolExhausted) {
+                return Grown::Fits;
+            }
+            let victim = self.preempt_newest();
+            preempted.push(victim);
+            if victim == slot {
+                return Grown::DisplacedItself;
+            }
+        }
+    }
+
+    /// Preemption: the most recently admitted running request releases its KV and computes from
+    /// its first token again when it re-enters Running. Returns the request displaced.
+    fn preempt_newest(&mut self) -> RequestSlot {
+        let slot = self
+            .running
+            .pop()
+            .expect("preemption has a running request to displace");
         let mut parts = self.parts();
         let request = parts
             .requests
@@ -617,6 +641,7 @@ impl Scheduler {
         }
         parts.preempted.push(slot);
         debug!(request = request.id().get(), "request preempted");
+        slot
     }
 
     /// Admission: examines up to the window of candidates — the preempted stack top first, last
@@ -737,6 +762,27 @@ struct Parts<'a> {
     budget: &'a mut TokenBudget,
     /// The step being scheduled; the phase a transition produces is stamped with it.
     step: StepId,
+}
+
+/// How a running request's turn at the budget ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Budgeted {
+    /// Every sequence has an entry this step.
+    Scheduled,
+    /// The pool could not grow the request and it was the newest running one, so it displaced
+    /// itself and is no longer in the running queue.
+    DisplacedItself,
+    /// The budget has nothing left for another entry; the pass is over.
+    BudgetSpent,
+}
+
+/// How growing a sequence's blocks ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grown {
+    /// The sequence holds blocks for every token the step computes.
+    Fits,
+    /// The request needing the room was the newest running one, so it was its own victim.
+    DisplacedItself,
 }
 
 /// Which admission queue a candidate came from.
