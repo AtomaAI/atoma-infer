@@ -40,7 +40,8 @@ pub use budget::TokenBudget;
 pub struct SchedulerConfig {
     /// Query tokens one step may compute, summed over entries.
     pub token_budget: TokenCount,
-    /// Entries one step may hold: the largest bucket.
+    /// Entries one step may hold: the largest bucket graphs were captured for, which the
+    /// dispatch config knows as `captured_max_requests`. It bounds one step.
     pub max_batch: RequestCount,
     /// The longest sequence the model serves.
     pub max_model_len: TokenCount,
@@ -50,7 +51,9 @@ pub struct SchedulerConfig {
     pub window: RequestCount,
     /// How admission orders the window.
     pub admission: AdmissionPolicy,
-    /// Requests the slab holds before intake is refused.
+    /// Requests the slab holds at once — running, waiting and preempted together — before
+    /// ingress is refused. Where `max_batch` bounds one step, this bounds the whole population
+    /// a step is drawn from.
     pub max_requests: RequestCount,
     /// The model's end-of-sequence token ids; sampling one finishes a request that does not
     /// ignore it.
@@ -266,16 +269,17 @@ impl Scheduler {
         self.requests.get(slot)
     }
 
-    /// Live requests, in every phase; padding dummies are not counted.
+    /// Live requests, in every phase; padding dummies are not counted. Not the batch's request
+    /// count, which is a [`Scheduled`]'s own.
     #[must_use]
-    pub fn request_count(&self) -> usize {
+    pub fn live_request_count(&self) -> usize {
         self.requests.len() - self.padding.len()
     }
 
     /// Whether the slab can take another request.
     #[must_use]
     pub fn has_room(&self) -> bool {
-        self.request_count() < self.config.max_requests.get()
+        self.live_request_count() < self.config.max_requests.get()
     }
 
     /// Builds a scheduler over `pool` with the padding dummies of `reservation` in its slab:
@@ -321,9 +325,9 @@ impl Scheduler {
         self.admission_open
     }
 
-    /// Finishes every live request for `reason` — waiting, running and preempted alike —
+    /// Retires every live request for `reason` — waiting, running and preempted alike —
     /// returning its KV and telling its client. The padding dummies stay.
-    pub fn finish_all(&mut self, reason: FinishReason) {
+    pub fn retire_all(&mut self, reason: FinishReason) {
         let live: Vec<RequestSlot> = self
             .requests
             .iter()

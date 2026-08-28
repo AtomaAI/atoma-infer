@@ -170,7 +170,7 @@ fn intake_queues_requests_in_arrival_order() {
     let mut submitted = Vec::new();
     for i in 0..4 {
         submitted.push(clients.submit(&mut scheduler, BLOCK_SIZE, 16));
-        assert_eq!(scheduler.request_count(), i + 1);
+        assert_eq!(scheduler.live_request_count(), i + 1);
     }
     assert_eq!(scheduler.waiting(), &VecDeque::from(submitted.clone()));
     assert!(scheduler.running().is_empty());
@@ -277,7 +277,7 @@ fn a_prompt_that_cannot_fit_the_model_finishes_at_intake() {
     );
     assert!(receiver.recv().is_err(), "nothing follows the finish");
     assert_eq!(
-        scheduler.request_count(),
+        scheduler.live_request_count(),
         0,
         "a rejected request takes no slot"
     );
@@ -295,7 +295,7 @@ fn a_prompt_that_cannot_fit_the_model_finishes_at_intake() {
     let mut clients = Clients::default();
     clients.submit(&mut scheduler, max_model_length - 1, 16);
     assert_eq!(
-        scheduler.request_count(),
+        scheduler.live_request_count(),
         1,
         "one short of the maximum fits"
     );
@@ -499,7 +499,7 @@ fn finished_requests_return_their_blocks() {
         "one token was all each asked for"
     );
     assert_eq!(
-        scheduler.request_count(),
+        scheduler.live_request_count(),
         0,
         "finished requests free their slots"
     );
@@ -560,7 +560,7 @@ fn a_dropped_receiver_retires_only_that_request_from_waiting() {
     let scheduled = step(&mut scheduler);
     assert_eq!(slots(&scheduled), [survivor]);
     assert!(scheduler.request(cancelled).is_none());
-    assert_eq!(scheduler.request_count(), 1);
+    assert_eq!(scheduler.live_request_count(), 1);
 }
 
 /// The same for the running queue: the cancelled request's blocks return and the survivor keeps
@@ -594,11 +594,11 @@ fn every_client_hanging_up_empties_the_scheduler() {
         clients.submit(&mut scheduler, BLOCK_SIZE, 16);
     }
     step(&mut scheduler);
-    assert_eq!(scheduler.request_count(), 4);
+    assert_eq!(scheduler.live_request_count(), 4);
     clients.receivers.clear();
     let scheduled = step(&mut scheduler);
     assert!(scheduled.is_empty());
-    assert_eq!(scheduler.request_count(), 0);
+    assert_eq!(scheduler.live_request_count(), 0);
     assert_eq!(scheduler.pool().available(), 8);
 }
 
@@ -798,7 +798,7 @@ fn a_dropped_receiver_retires_only_that_request_from_the_preempted_stack() {
         [c],
         "the other preempted request is untouched"
     );
-    assert_eq!(scheduler.request_count(), 2);
+    assert_eq!(scheduler.live_request_count(), 2);
 }
 
 #[test]
@@ -916,7 +916,7 @@ fn finished_requests_leave_their_full_blocks_as_evictable_cache() {
     clients.submit(&mut scheduler, 2 * BLOCK_SIZE, 1);
     step(&mut scheduler);
 
-    assert_eq!(scheduler.request_count(), 0);
+    assert_eq!(scheduler.live_request_count(), 0);
     assert_eq!(scheduler.pool().available(), baseline);
     assert_eq!(
         scheduler.pool().free_count(),
@@ -1153,19 +1153,19 @@ fn cancelled_requests_retire_while_admission_is_closed() {
     assert!(scheduler.preempted().is_empty());
     assert!(scheduler.waiting().is_empty());
     assert_eq!(scheduler.running(), [running], "the live one runs on");
-    assert_eq!(scheduler.request_count(), 1);
+    assert_eq!(scheduler.live_request_count(), 1);
 }
 
 #[test]
-fn finishing_everything_tells_every_client_and_keeps_the_dummies() {
+fn retiring_everything_tells_every_client_and_keeps_the_dummies() {
     let mut scheduler = scheduler(8, 100, 64);
     let mut clients = Clients::default();
     clients.submit(&mut scheduler, BLOCK_SIZE, 16);
     step(&mut scheduler);
     clients.submit(&mut scheduler, BLOCK_SIZE, 16);
 
-    scheduler.finish_all(FinishReason::Shutdown);
-    assert_eq!(scheduler.request_count(), 0);
+    scheduler.retire_all(FinishReason::Shutdown);
+    assert_eq!(scheduler.live_request_count(), 0);
     assert!(scheduler.running().is_empty() && scheduler.waiting().is_empty());
     assert_eq!(scheduler.pool().available(), 8);
     for receiver in &clients.receivers {

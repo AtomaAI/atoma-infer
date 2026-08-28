@@ -268,7 +268,7 @@ impl Engine {
     pub fn state(&self) -> EngineState {
         EngineState {
             step: self.scheduler.step(),
-            live_requests: self.scheduler.request_count(),
+            live_requests: self.scheduler.live_request_count(),
             waiting: self.scheduler.waiting().len(),
             running: self.scheduler.running().len(),
             preempted: self.scheduler.preempted().len(),
@@ -378,7 +378,7 @@ impl Engine {
         while let Some(request) = self.ingress.try_recv() {
             self.scheduler.intake(request);
         }
-        self.scheduler.finish_all(reason);
+        self.scheduler.retire_all(reason);
         if let Some(reply) = self.draining.take() {
             send_reply(&reply, self.state());
         }

@@ -309,7 +309,7 @@ mod tests {
         let (mut scheduler, _) = scheduler(100);
         assert_eq!(scheduler.padding().len(), MAX_BATCH - 1);
         assert_eq!(
-            scheduler.request_count(),
+            scheduler.live_request_count(),
             0,
             "dummies are not live requests"
         );
