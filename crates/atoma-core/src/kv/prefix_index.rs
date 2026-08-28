@@ -115,9 +115,11 @@ impl PrefixIndex {
     pub fn insert_child(&mut self, parent: Option<BlockHash>, hash: BlockHash) {
         self.clock += 1;
         let clock = self.clock;
-        let parent_slot = parent.map(|parent| match self.node_by_hash.get(&parent) {
-            Some(&slot) => slot,
-            None => panic!("insert_child under a parent never inserted: {parent:?}"),
+        let parent_slot = parent.map(|parent| {
+            *self
+                .node_by_hash
+                .get(&parent)
+                .unwrap_or_else(|| panic!("insert_child under a parent never inserted: {parent:?}"))
         });
         let slot = match self.node_by_hash.get(&hash) {
             Some(&slot) => {

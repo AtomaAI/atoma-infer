@@ -16,6 +16,7 @@ use crate::request::{
     Usage,
 };
 use crate::scheduler::{AdmissionPolicy, SchedulerConfig};
+use crate::step::StepResult;
 use crate::test_support::{requests, tokens};
 use crate::types::RequestId;
 
@@ -330,7 +331,7 @@ fn a_result_that_does_not_match_the_step_in_flight_is_fatal() {
     engine.pass();
     let command = executor.served.first().cloned();
     assert!(command.is_none(), "not served through the mock");
-    executor.push_raw(crate::step::StepResult {
+    executor.push_raw(StepResult {
         step: engine.scheduler().step(),
         sampled: vec![1, 2],
     });

@@ -24,8 +24,8 @@ use std::collections::VecDeque;
 
 use crate::kv::{BlockPool, HashAlgorithm};
 use crate::request::{
-    egress, EgressReceiver, FinishReason, NewRequest, RequestEvent, RequestPhase, SamplingParams,
-    StopCriteria, Usage,
+    egress, EgressReceiver, EgressSender, FinishReason, NewRequest, RequestEvent, RequestPhase,
+    SamplingParams, StopCriteria, Usage,
 };
 use crate::scheduler::{AdmissionPolicy, Scheduled, Scheduler, SchedulerConfig, SchedulerError};
 use crate::test_support::{requests, tokens};
@@ -112,11 +112,7 @@ impl Clients {
     }
 }
 
-fn new_request(
-    prompt_len: usize,
-    max_new_tokens: usize,
-    egress: crate::request::EgressSender,
-) -> NewRequest {
+fn new_request(prompt_len: usize, max_new_tokens: usize, egress: EgressSender) -> NewRequest {
     NewRequest {
         prompt: (1..=u32::try_from(prompt_len).unwrap()).collect(),
         sampling: SamplingParams::default(),

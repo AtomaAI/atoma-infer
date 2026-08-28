@@ -1,7 +1,9 @@
 //! The heartbeat: the pass counter and timestamp the engine thread publishes every pass.
 //!
 //! Liveness is read from the thread that could wedge, not from the API in front of it. Two
-//! atomics, written with relaxed stores on the engine thread and read anywhere; no lock.
+//! atomics, written on the engine thread and read anywhere, with no lock: the timestamp is
+//! published before the pass counter that releases it, so a reader that sees a pass sees the
+//! time it completed.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

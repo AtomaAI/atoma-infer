@@ -71,7 +71,7 @@ impl StepCommand {
         TokenCount::new(self.entries.iter().map(CommandEntry::query_len).sum())
     }
 
-    /// Entries that sample, in order.
+    /// How many entries sample a token this step.
     #[must_use]
     pub fn sampling_count(&self) -> usize {
         self.entries.iter().filter(|entry| entry.samples()).count()
