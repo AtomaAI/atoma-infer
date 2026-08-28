@@ -1061,3 +1061,45 @@ fn a_cancelled_request_inside_the_window_retires_even_when_never_the_best_match(
     assert!(scheduler.request(cancelled).is_none());
     assert!(scheduler.waiting().is_empty());
 }
+
+#[test]
+fn closing_admission_lets_running_requests_finish_and_admits_nothing_more() {
+    let mut scheduler = scheduler(8, 100, 64);
+    let mut clients = Clients::default();
+    let running = clients.submit(&mut scheduler, BLOCK_SIZE, 2);
+    assert_eq!(slots(&step(&mut scheduler)), [running]);
+    let waiting = clients.submit(&mut scheduler, BLOCK_SIZE, 2);
+
+    assert!(scheduler.is_admission_open());
+    scheduler.close_admission();
+    assert!(!scheduler.is_admission_open());
+    let scheduled = step(&mut scheduler);
+    assert_eq!(
+        slots(&scheduled),
+        [running],
+        "the running request decodes on"
+    );
+    assert_eq!(scheduler.waiting(), &VecDeque::from([waiting]));
+    assert!(
+        scheduler.running().is_empty(),
+        "and finishes on its second token"
+    );
+    assert!(step(&mut scheduler).is_empty(), "nothing is admitted after");
+}
+
+#[test]
+fn finishing_everything_tells_every_client_and_keeps_the_dummies() {
+    let mut scheduler = scheduler(8, 100, 64);
+    let mut clients = Clients::default();
+    clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    step(&mut scheduler);
+    clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+
+    scheduler.finish_all(FinishReason::Shutdown);
+    assert_eq!(scheduler.request_count(), 0);
+    assert!(scheduler.running().is_empty() && scheduler.waiting().is_empty());
+    assert_eq!(scheduler.pool().available(), 8);
+    for receiver in &clients.receivers {
+        assert_eq!(finish_reason(receiver), Some(FinishReason::Shutdown));
+    }
+}

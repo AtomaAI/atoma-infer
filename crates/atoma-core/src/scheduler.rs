@@ -169,6 +169,8 @@ pub struct Scheduler {
     padding: Vec<RequestSlot>,
     /// The leases behind the dummies' blocks, held until the scheduler is dropped.
     padding_reservation: Option<PaddingReservation>,
+    /// Whether admission may move requests into Running; a drain closes it for good.
+    admission_open: bool,
     budget: TokenBudget,
     step: StepId,
     next_request_id: u64,
@@ -197,6 +199,7 @@ impl Scheduler {
             preempted: Vec::new(),
             padding: Vec::new(),
             padding_reservation: None,
+            admission_open: true,
             budget,
             step: StepId::new(0),
             next_request_id: 0,
@@ -282,6 +285,30 @@ impl Scheduler {
     #[must_use]
     pub fn padding(&self) -> &[RequestSlot] {
         &self.padding
+    }
+
+    /// Stops admission for good: running requests finish, nothing else enters Running.
+    pub fn close_admission(&mut self) {
+        self.admission_open = false;
+    }
+
+    #[must_use]
+    pub fn is_admission_open(&self) -> bool {
+        self.admission_open
+    }
+
+    /// Finishes every live request for `reason` — waiting, running and preempted alike —
+    /// returning its KV and telling its client. The padding dummies stay.
+    pub fn finish_all(&mut self, reason: FinishReason) {
+        let live: Vec<RequestSlot> = self
+            .requests
+            .iter()
+            .filter(|(_, request)| !request.is_padding())
+            .map(|(slot, _)| slot)
+            .collect();
+        for slot in live {
+            self.retire(slot, reason);
+        }
     }
 
     #[must_use]
@@ -554,6 +581,7 @@ impl Scheduler {
             preempted,
             padding: _,
             padding_reservation: _,
+            admission_open: _,
             budget: _,
             step,
             next_request_id: _,
@@ -582,6 +610,9 @@ impl Scheduler {
     /// one's cached prefix, and stops at the first request the budget or the pool cannot serve.
     /// Admission never preempts.
     fn admit(&mut self, entries: &mut Vec<Entry>) {
+        if !self.admission_open {
+            return;
+        }
         for _ in 0..self.config.window.get() {
             let Some((slot, from)) = self.next_candidate() else {
                 return;
@@ -600,6 +631,7 @@ impl Scheduler {
                 preempted,
                 padding: _,
                 padding_reservation: _,
+                admission_open: _,
                 budget,
                 step,
                 next_request_id: _,

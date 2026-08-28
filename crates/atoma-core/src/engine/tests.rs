@@ -1,0 +1,321 @@
+//! Engine tests: every one drives the engine's pass in lockstep with a mock executor on the far
+//! side of the rings. No thread, no device.
+
+use crate::dispatch::{BucketLadder, CaptureKind, DispatchConfig, SupportLevel};
+use crate::engine::mock::MockExecutor;
+use crate::engine::{
+    Control, Engine, EngineConfig, EngineError, EngineHandle, IngressRefused, Pass,
+};
+use crate::kv::HashAlgorithm;
+use crate::request::{
+    egress, EgressReceiver, FinishReason, NewRequest, RequestEvent, SamplingParams, StopCriteria,
+};
+use crate::scheduler::{AdmissionPolicy, SchedulerConfig};
+use crate::test_support::{requests, tokens};
+
+const BLOCK_SIZE: usize = 4;
+const MAX_BATCH: usize = 4;
+const BLOCKS: usize = 16;
+const EOS: u32 = 99;
+
+fn config(max_requests: usize, ingress_capacity: usize) -> EngineConfig {
+    EngineConfig {
+        scheduler: SchedulerConfig {
+            token_budget: tokens(64),
+            max_batch: requests(MAX_BATCH),
+            max_model_len: tokens(32),
+            block_size: tokens(BLOCK_SIZE),
+            window: requests(8),
+            admission: AdmissionPolicy::Fcfs,
+            max_requests: requests(max_requests),
+            eos_token_ids: vec![EOS],
+            hash_algorithm: HashAlgorithm::Sha256V1,
+        },
+        dispatch: DispatchConfig {
+            bucket_ladder: BucketLadder::new(vec![1, 2, 4]).unwrap(),
+            captured_max_requests: requests(MAX_BATCH),
+            support_level: SupportLevel::Always,
+            capture_kind: CaptureKind::Full,
+        },
+        block_count: u32::try_from(BLOCKS).unwrap(),
+        ingress_capacity: requests(ingress_capacity),
+        idle_deadline_millis: 1,
+    }
+}
+
+fn engine(max_requests: usize, ingress_capacity: usize) -> (Engine, EngineHandle, MockExecutor) {
+    let (engine, handle, rings) = Engine::new(&config(max_requests, ingress_capacity)).unwrap();
+    (engine, handle, MockExecutor::constant(rings, 1))
+}
+
+fn new_request(prompt_len: usize, max_new_tokens: usize) -> (NewRequest, EgressReceiver) {
+    let (sender, receiver) = egress();
+    let request = NewRequest {
+        prompt: (1..=u32::try_from(prompt_len).unwrap()).collect(),
+        sampling: SamplingParams::default(),
+        stop: StopCriteria {
+            max_new_tokens: tokens(max_new_tokens),
+            ignore_eos: false,
+        },
+        egress: sender,
+    };
+    (request, receiver)
+}
+
+fn submit(handle: &EngineHandle, prompt_len: usize, max_new_tokens: usize) -> EgressReceiver {
+    let (request, receiver) = new_request(prompt_len, max_new_tokens);
+    handle.ingress.try_send(request).unwrap();
+    receiver
+}
+
+fn events(receiver: &EgressReceiver) -> Vec<RequestEvent> {
+    receiver.try_iter().collect()
+}
+
+fn finish_reason(receiver: &EgressReceiver) -> Option<FinishReason> {
+    events(receiver).into_iter().find_map(|event| match event {
+        RequestEvent::Finished { reason, .. } => Some(reason),
+        RequestEvent::Token { .. } => None,
+    })
+}
+
+/// One engine pass followed by the executor serving whatever it issued.
+fn turn(engine: &mut Engine, executor: &mut MockExecutor) -> Pass {
+    let pass = engine.pass();
+    executor.serve_one();
+    pass
+}
+
+#[test]
+fn a_request_flows_from_ingress_through_the_executor_to_its_finish() {
+    let (mut engine, handle, mut executor) = engine(8, 8);
+    let client = submit(&handle, 5, 2);
+
+    assert_eq!(engine.pass(), Pass::Continue);
+    assert_eq!(engine.state().running, 1, "taken in and admitted");
+    assert!(engine.state().step_in_flight);
+    assert!(executor.serve_one(), "the prefill command was issued");
+    assert_eq!(executor.served[0].entries[0].input_tokens, [1, 2, 3, 4, 5]);
+
+    assert_eq!(engine.pass(), Pass::Continue);
+    assert!(matches!(
+        events(&client).as_slice(),
+        [RequestEvent::Token { token: 1, .. }]
+    ));
+    assert!(executor.serve_one(), "the decode command was issued");
+    assert_eq!(executor.served[1].entries[0].context_len, 5);
+    assert_eq!(executor.served[1].entries[0].input_tokens, [1]);
+
+    assert_eq!(engine.pass(), Pass::Continue);
+    assert_eq!(finish_reason(&client), Some(FinishReason::MaxNewTokens));
+    assert!(!executor.serve_one(), "nothing left to run");
+    assert_eq!(engine.state().live_requests, 0);
+    assert_eq!(engine.passes(), 3);
+}
+
+/// Control is drained before ingress: a state query sent behind a burst of requests is
+/// answered before any of the burst is taken in.
+#[test]
+fn control_is_drained_before_ingress() {
+    let (mut engine, handle, _executor) = engine(8, 8);
+    let clients: Vec<_> = (0..4).map(|_| submit(&handle, 2, 1)).collect();
+    let (reply, answer) = flume::bounded(1);
+    handle.control.try_send(Control::State { reply }).unwrap();
+
+    engine.pass();
+    let state = answer.recv().unwrap();
+    assert_eq!(
+        state.live_requests, 0,
+        "answered before the burst was taken in"
+    );
+    assert_eq!(
+        engine.state().live_requests,
+        clients.len(),
+        "and then the burst was"
+    );
+}
+
+#[test]
+fn ingress_is_drained_only_while_the_slab_has_room_and_then_refuses() {
+    let (mut engine, handle, mut executor) = engine(2, 2);
+    let mut clients: Vec<_> = (0..2).map(|_| submit(&handle, 2, 1)).collect();
+    engine.pass();
+    assert_eq!(engine.state().live_requests, 2, "two slots, two taken in");
+
+    // The slab is full and the step is still out; ingress fills up behind it and refuses.
+    clients.extend((0..2).map(|_| submit(&handle, 2, 1)));
+    let (fifth, _fifth_client) = new_request(2, 1);
+    let IngressRefused::Overload(fifth) = handle.ingress.try_send(fifth).unwrap_err() else {
+        panic!("a full ingress behind a full slab is overload");
+    };
+    engine.pass();
+    assert_eq!(engine.state().live_requests, 2, "no room, nothing drained");
+    assert!(
+        matches!(
+            handle.ingress.try_send(fifth),
+            Err(IngressRefused::Overload(_))
+        ),
+        "still overloaded"
+    );
+
+    // The two in the slab finish on their first token; the same pass takes the next two in.
+    executor.serve_one();
+    engine.pass();
+    assert_eq!(engine.state().live_requests, 2, "the next two came in");
+    assert!(clients[..2]
+        .iter()
+        .all(|client| finish_reason(client) == Some(FinishReason::MaxNewTokens)));
+    turn(&mut engine, &mut executor);
+    turn(&mut engine, &mut executor);
+    assert!(clients[2..]
+        .iter()
+        .all(|client| finish_reason(client) == Some(FinishReason::MaxNewTokens)));
+}
+
+#[test]
+fn a_disconnected_client_retires_its_request_and_the_rest_of_the_batch_still_goes_out() {
+    let (mut engine, handle, mut executor) = engine(8, 8);
+    let mut clients: Vec<_> = (0..3).map(|_| submit(&handle, 2, 16)).collect();
+    turn(&mut engine, &mut executor);
+    turn(&mut engine, &mut executor);
+    assert_eq!(executor.served[1].live_entries().len(), 3, "three decodes");
+
+    drop(clients.remove(1));
+    turn(&mut engine, &mut executor);
+    let batch = executor.served.last().unwrap();
+    assert_eq!(
+        batch.live_entries().len(),
+        2,
+        "one retired, two still go out"
+    );
+    assert_eq!(engine.state().live_requests, 2);
+}
+
+#[test]
+fn a_drain_stops_admission_and_reports_once_nothing_is_in_flight() {
+    let (mut engine, handle, mut executor) = engine(8, 8);
+    let running = submit(&handle, 2, 2);
+    turn(&mut engine, &mut executor);
+    let waiting = submit(&handle, 2, 2);
+    let (reply, drained) = flume::bounded(1);
+    handle.control.try_send(Control::Drain { reply }).unwrap();
+
+    turn(&mut engine, &mut executor);
+    assert!(drained.try_recv().is_err(), "a step is still in flight");
+    assert_eq!(engine.state().running, 1);
+    assert_eq!(engine.state().waiting, 1, "nothing new is admitted");
+    assert!(engine.state().draining);
+
+    turn(&mut engine, &mut executor);
+    let state = drained.recv().unwrap();
+    assert_eq!(state.running, 0);
+    assert!(!state.step_in_flight);
+    assert_eq!(state.waiting, 1);
+    assert_eq!(finish_reason(&running), Some(FinishReason::MaxNewTokens));
+    assert_eq!(
+        finish_reason(&waiting),
+        None,
+        "still waiting, never admitted"
+    );
+    assert_eq!(turn(&mut engine, &mut executor), Pass::Continue);
+    assert_eq!(engine.state().waiting, 1);
+}
+
+#[test]
+fn shutdown_finishes_every_live_request_and_exits() {
+    let (mut engine, handle, mut executor) = engine(2, 8);
+    let running = submit(&handle, 2, 16);
+    turn(&mut engine, &mut executor);
+    let waiting = submit(&handle, 2, 16);
+    engine.pass();
+    let in_ingress = submit(&handle, 2, 16);
+    handle.control.try_send(Control::Shutdown).unwrap();
+
+    assert_eq!(engine.pass(), Pass::Exit);
+    for client in [&running, &waiting, &in_ingress] {
+        assert_eq!(finish_reason(client), Some(FinishReason::Shutdown));
+    }
+    assert_eq!(engine.state().live_requests, 0);
+    assert_eq!(engine.state().available_blocks, BLOCKS - (MAX_BATCH - 1));
+    drop(engine);
+    assert!(executor.engine_gone());
+}
+
+#[test]
+fn a_gone_executor_fails_every_pending_request_and_exits() {
+    let (mut engine, handle, executor) = engine(8, 8);
+    let running = submit(&handle, 2, 16);
+    engine.pass();
+    let waiting = submit(&handle, 2, 16);
+    drop(executor);
+
+    assert_eq!(engine.pass(), Pass::Exit);
+    assert_eq!(finish_reason(&running), Some(FinishReason::ExecutorLost));
+    assert_eq!(finish_reason(&waiting), Some(FinishReason::ExecutorLost));
+    assert!(handle.ingress.is_engine_gone() || engine.state().live_requests == 0);
+}
+
+#[test]
+fn a_result_that_does_not_match_the_step_in_flight_is_fatal() {
+    let (mut engine, handle, mut executor) = engine(8, 8);
+    let client = submit(&handle, 2, 16);
+    engine.pass();
+    let command = executor.served.first().cloned();
+    assert!(command.is_none(), "not served through the mock");
+    executor.push_raw(crate::step::StepResult {
+        step: engine.scheduler().step(),
+        sampled: vec![1, 2],
+    });
+
+    assert_eq!(engine.pass(), Pass::Exit);
+    assert_eq!(finish_reason(&client), Some(FinishReason::ExecutorLost));
+}
+
+#[test]
+fn the_heartbeat_advances_every_pass() {
+    let (mut engine, handle, _executor) = engine(8, 8);
+    assert_eq!(handle.heartbeat.read().pass, 0);
+    engine.pass();
+    engine.pass();
+    assert_eq!(handle.heartbeat.read().pass, 2);
+}
+
+#[test]
+fn the_engine_pads_a_replayed_decode_with_the_dummies_it_reserved() {
+    let (mut engine, handle, mut executor) = engine(8, 8);
+    assert_eq!(
+        engine.state().free_blocks,
+        BLOCKS - (MAX_BATCH - 1),
+        "the dummies' blocks are held from the start"
+    );
+    let _clients: Vec<_> = (0..3).map(|_| submit(&handle, 2, 16)).collect();
+    turn(&mut engine, &mut executor);
+    turn(&mut engine, &mut executor);
+    let decode = executor.served.last().unwrap();
+    assert_eq!(
+        decode.padding_count, 1,
+        "three decodes pad to the bucket of four"
+    );
+    assert_eq!(decode.entries.len(), 4);
+}
+
+#[test]
+fn a_bucket_ladder_the_reservation_cannot_pad_to_is_refused() {
+    let mut unpaddable = config(8, 8);
+    unpaddable.dispatch.bucket_ladder = BucketLadder::new(vec![8]).unwrap();
+    assert_eq!(
+        Engine::new(&unpaddable).unwrap_err(),
+        EngineError::PaddingCannotCoverBucket {
+            max_batch: requests(MAX_BATCH),
+            bucket: tokens(8),
+            reserved: MAX_BATCH - 1,
+        }
+    );
+
+    let mut too_small = config(8, 8);
+    too_small.block_count = 2;
+    assert!(matches!(
+        Engine::new(&too_small).unwrap_err(),
+        EngineError::Padding(_)
+    ));
+}
