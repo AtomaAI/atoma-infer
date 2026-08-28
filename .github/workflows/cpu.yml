@@ -70,6 +70,9 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
+      - name: Gate step-path latency
+        run: cargo bench -p atoma-core --bench step_path --locked
+
       - name: Check dependency policy
         run: cargo deny --locked check
 
