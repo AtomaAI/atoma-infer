@@ -12,6 +12,7 @@ use crate::{
     types::{ReadLock, WriteLock},
 };
 
+use atoma_core::types::BlockId;
 use thiserror::Error;
 use tracing::{error, info, instrument, trace};
 
@@ -217,14 +218,14 @@ impl BlockSpaceManager {
             // Measure and register the prompt against the prefix index. Sliding windows
             // overwrite block contents in place, so their blocks carry no stable identity.
             if self.block_sliding_window.is_none() {
-                let token_ids = { sequence.read_lock()?.get_token_ids() };
-                let mut block_numbers = Vec::with_capacity(block_table.len());
+                let token_ids = sequence.read_lock()?.get_token_ids();
+                let mut block_ids = Vec::with_capacity(block_table.len());
                 for block in &block_table {
-                    block_numbers.push(block.read_lock()?.block_number());
+                    block_ids.push(BlockId::new(block.read_lock()?.block_number()));
                 }
                 let sequence_ids = seq_group.get_sequences_ids(Some(SequenceStatus::Waiting));
                 self.gpu_allocator
-                    .index_shared_prompt(&sequence_ids, &token_ids, &block_numbers);
+                    .index_shared_prompt(&sequence_ids, &token_ids, &block_ids);
             }
 
             // Assign the block table for each sequence.

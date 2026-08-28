@@ -159,7 +159,7 @@ impl GpuBlockSupply {
         &mut self,
         sequence_ids: &[u64],
         token_ids: &[u32],
-        block_numbers: &[u32],
+        block_ids: &[BlockId],
     ) {
         if sequence_ids.is_empty() {
             return;
@@ -178,8 +178,8 @@ impl GpuBlockSupply {
             matched,
             "prefix cache lookup"
         );
-        for (hash, block_number) in chain.iter().zip(block_numbers) {
-            if let Some(lease) = self.leases.get(&BlockId::new(*block_number)) {
+        for (hash, block_id) in chain.iter().zip(block_ids) {
+            if let Some(lease) = self.leases.get(block_id) {
                 // A duplicate claim is refused and the first copy keeps the hash; this
                 // group's copy then frees outright on release instead of caching.
                 self.pool.assign_hash(lease, *hash);
@@ -250,6 +250,8 @@ impl Drop for GpuBlockSupply {
 mod tests {
     use std::sync::{Arc, RwLock};
 
+    use atoma_core::types::BlockId;
+
     use super::{GpuBlockSupply, PrefixCacheStats};
     use crate::block::{BlockDevice, PhysicalTokenBlock};
     use crate::block_allocator::BlockAllocatorError;
@@ -300,11 +302,11 @@ mod tests {
     fn clear_forgets_the_index_and_restores_free_capacity() {
         let mut supply = GpuBlockSupply::new(4, 2);
         let blocks: Vec<_> = (0..2).map(|_| supply.allocate().unwrap()).collect();
-        let numbers: Vec<u32> = blocks
+        let block_ids: Vec<BlockId> = blocks
             .iter()
-            .map(|block| block.read().unwrap().block_number())
+            .map(|block| BlockId::new(block.read().unwrap().block_number()))
             .collect();
-        supply.index_shared_prompt(&[1], &[1, 2, 3, 4, 5, 6, 7, 8], &numbers);
+        supply.index_shared_prompt(&[1], &[1, 2, 3, 4, 5, 6, 7, 8], &block_ids);
         for block in &blocks {
             supply.free(block).unwrap();
         }
