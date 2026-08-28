@@ -9,6 +9,7 @@ version     = { workspace = true }
 flume     = { workspace = true }
 serde     = { workspace = true, features = [ "derive" ] }
 sha2      = { workspace = true }
+slab      = { workspace = true }
 thiserror = { workspace = true }
 tracing   = { workspace = true }
 
