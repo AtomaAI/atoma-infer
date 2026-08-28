@@ -224,8 +224,9 @@ impl Request {
         self.phase
     }
 
-    /// Moves the request into `phase`. Only a value a legal transition produced can be passed.
-    pub fn set_phase(&mut self, phase: RequestPhase) {
+    /// Moves the request into `phase`. Only a value a legal transition produced can be passed,
+    /// and only the scheduler that owns the request can pass one.
+    pub(crate) fn set_phase(&mut self, phase: RequestPhase) {
         self.phase = phase;
     }
 

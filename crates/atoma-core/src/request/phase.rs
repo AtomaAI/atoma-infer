@@ -28,6 +28,17 @@
 //!     Running { admitted_at }
 //! }
 //! ```
+//!
+//! Nor can a phase be installed on a request from outside: minting a [`Waiting`] and moving a
+//! request back into it are both the crate's, so a finished request cannot be sent round again.
+//!
+//! ```compile_fail
+//! use atoma_core::request::{Request, RequestPhase, Waiting};
+//! use atoma_core::types::StepId;
+//! fn requeue(request: &mut Request, at: StepId) {
+//!     request.set_phase(RequestPhase::Waiting(Waiting::new(at)));
+//! }
+//! ```
 
 use crate::request::FinishReason;
 use crate::types::StepId;
@@ -65,9 +76,10 @@ pub struct Waiting {
 }
 
 impl Waiting {
-    /// A request taken in during step `arrived_at`.
+    /// A request taken in during step `arrived_at`. Intake is the only way in, so this is the
+    /// crate's to mint.
     #[must_use]
-    pub fn new(arrived_at: StepId) -> Self {
+    pub(crate) fn new(arrived_at: StepId) -> Self {
         Self { arrived_at }
     }
 
