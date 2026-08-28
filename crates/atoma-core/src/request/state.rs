@@ -1,7 +1,8 @@
 //! Request and sequence state as the engine thread holds it: host-native, one owner, no locks.
 
+use crate::kv::BlockLease;
 use crate::request::{EgressSender, RequestPhase, SamplingParams, StopCriteria, Usage, Waiting};
-use crate::types::{RequestId, StepId};
+use crate::types::{BlockId, RequestId, StepId};
 
 /// A request as its client submits it: one prompt, one set of sampling parameters, one egress
 /// sink. Everything the engine needs to give it a slot.
@@ -13,7 +14,7 @@ pub struct NewRequest {
     pub egress: EgressSender,
 }
 
-/// One token stream inside a request, with its own computed count.
+/// One token stream inside a request, with its own computed count and block table.
 ///
 /// Prompt and generated tokens share one buffer, so a chunk of computation is always a
 /// contiguous slice of it — including the recompute after a preemption, which spans both.
@@ -23,6 +24,11 @@ pub struct Sequence {
     prompt_len: usize,
     /// Tokens whose KV is resident. Resets to zero on preemption.
     computed: usize,
+    /// The ordered block ids the sequence's KV occupies. Host-native: a step command is built
+    /// from it with no device read.
+    pub(crate) block_table: Vec<BlockId>,
+    /// The leases behind the blocks this sequence obtained fresh from the pool.
+    pub(crate) leases: Vec<BlockLease>,
 }
 
 impl Sequence {
@@ -32,7 +38,15 @@ impl Sequence {
             tokens: prompt,
             prompt_len,
             computed: 0,
+            block_table: Vec::new(),
+            leases: Vec::new(),
         }
+    }
+
+    /// The ordered block ids the sequence's KV occupies.
+    #[must_use]
+    pub fn block_table(&self) -> &[BlockId] {
+        &self.block_table
     }
 
     /// Prompt tokens plus every token generated so far.

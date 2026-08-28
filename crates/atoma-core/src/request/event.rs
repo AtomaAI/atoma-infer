@@ -37,6 +37,8 @@ pub enum FinishReason {
         prompt_tokens: usize,
         max_model_length: usize,
     },
+    /// The prompt has no tokens, so there is nothing to compute a first token from.
+    EmptyPrompt,
     /// The client dropped its egress receiver.
     Cancelled,
     /// The engine shut down with the request live.

@@ -69,6 +69,13 @@ impl RequestSlab {
             .iter()
             .map(|(key, request)| (slot_of(key), request))
     }
+
+    /// Every live request with its slot, in slot order, mutably.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (RequestSlot, &mut Request)> {
+        self.requests
+            .iter_mut()
+            .map(|(key, request)| (slot_of(key), request))
+    }
 }
 
 fn slot_of(key: usize) -> RequestSlot {
