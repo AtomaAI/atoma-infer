@@ -159,7 +159,7 @@ impl Engine {
     /// batch above itself.
     pub fn new(config: &EngineConfig) -> Result<(Self, EngineHandle, ExecutorRings), EngineError> {
         let max_batch = config.scheduler.max_batch;
-        let reserved = max_batch.get() - 1;
+        let reserved = PaddingReservation::dummies_for(max_batch);
         let lookup = PaddingLookup::new(&config.dispatch.bucket_ladder);
         let max_batch_bucket =
             TokenCount::new(max_batch.get()).and_then(|tokens| lookup.bucket_for(tokens));
