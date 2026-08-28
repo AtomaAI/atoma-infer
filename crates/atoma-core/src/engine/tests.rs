@@ -25,7 +25,7 @@ const BLOCKS: usize = 16;
 const EOS: u32 = 99;
 
 /// Long enough that a test finishing in time proves a wake, not the deadline.
-const LONG_DEADLINE_MILLIS: u64 = 10_000;
+const LONG_DEADLINE: Duration = Duration::from_secs(10);
 const WAIT: Duration = Duration::from_secs(5);
 
 fn config(max_requests: usize, ingress_capacity: usize) -> EngineConfig {
@@ -49,7 +49,7 @@ fn config(max_requests: usize, ingress_capacity: usize) -> EngineConfig {
         },
         block_count: u32::try_from(BLOCKS).unwrap(),
         ingress_capacity: requests(ingress_capacity),
-        idle_deadline_millis: 1,
+        idle_deadline: Duration::from_millis(1),
     }
 }
 
@@ -340,6 +340,16 @@ fn a_result_that_does_not_match_the_step_in_flight_is_fatal() {
 }
 
 #[test]
+fn the_idle_deadline_is_a_duration_written_in_milliseconds() {
+    let config = config(8, 8);
+    let json = serde_json::to_string(&config).unwrap();
+    assert!(json.contains(r#""idle_deadline_millis":1"#), "{json}");
+    let back: EngineConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.idle_deadline, Duration::from_millis(1));
+    assert_eq!(back, config);
+}
+
+#[test]
 fn the_heartbeat_advances_every_pass() {
     let (mut engine, handle, _executor) = engine(8, 8);
     assert_eq!(handle.heartbeat.read().pass, 0);
@@ -389,9 +399,9 @@ fn a_bucket_ladder_the_reservation_cannot_pad_to_is_refused() {
 }
 
 /// Spawns the engine with a long idle deadline and the mock executor on its own thread.
-fn spawn_with_executor(idle_deadline_millis: u64) -> (EngineHandle, EngineThread) {
+fn spawn_with_executor(idle_deadline: Duration) -> (EngineHandle, EngineThread) {
     let mut config = config(8, 8);
-    config.idle_deadline_millis = idle_deadline_millis;
+    config.idle_deadline = idle_deadline;
     let (handle, rings, engine) = Engine::spawn(&config).unwrap();
     let executor = MockExecutor::constant(rings, 1);
     thread::spawn(move || executor.run_until_engine_gone());
@@ -402,7 +412,7 @@ fn spawn_with_executor(idle_deadline_millis: u64) -> (EngineHandle, EngineThread
 /// to issue the step, and the executor's result wakes it to apply it, long before the deadline.
 #[test]
 fn the_thread_wakes_on_ingress_and_on_the_executor() {
-    let (handle, engine) = spawn_with_executor(LONG_DEADLINE_MILLIS);
+    let (handle, engine) = spawn_with_executor(LONG_DEADLINE);
     let started = Instant::now();
     let client = submit(&handle, 3, 2);
 
@@ -421,7 +431,7 @@ fn the_thread_wakes_on_ingress_and_on_the_executor() {
             ..
         }
     ));
-    assert!(started.elapsed() < Duration::from_millis(LONG_DEADLINE_MILLIS));
+    assert!(started.elapsed() < LONG_DEADLINE);
 
     handle.control.try_send(Control::Shutdown).unwrap();
     engine.join();
@@ -431,7 +441,7 @@ fn the_thread_wakes_on_ingress_and_on_the_executor() {
 /// wedge it: the heartbeat keeps advancing with no wake at all.
 #[test]
 fn the_thread_never_wedges_on_an_empty_schedule() {
-    let (handle, engine) = spawn_with_executor(1);
+    let (handle, engine) = spawn_with_executor(Duration::from_millis(1));
     let deadline = Instant::now() + WAIT;
     while handle.heartbeat.read().pass < 5 {
         assert!(Instant::now() < deadline, "the heartbeat stopped");
@@ -447,7 +457,7 @@ fn the_thread_never_wedges_on_an_empty_schedule() {
 
 #[test]
 fn a_drain_is_answered_from_the_thread_and_shutdown_returns_it() {
-    let (handle, engine) = spawn_with_executor(LONG_DEADLINE_MILLIS);
+    let (handle, engine) = spawn_with_executor(LONG_DEADLINE);
     let client = submit(&handle, 3, 2);
     assert!(matches!(
         client.recv_timeout(WAIT).unwrap(),
@@ -484,7 +494,7 @@ fn a_drain_is_answered_from_the_thread_and_shutdown_returns_it() {
 #[test]
 fn a_dead_executor_fails_every_pending_request_and_returns_the_thread() {
     let mut config = config(8, 8);
-    config.idle_deadline_millis = LONG_DEADLINE_MILLIS;
+    config.idle_deadline = LONG_DEADLINE;
     let (handle, rings, engine) = Engine::spawn(&config).unwrap();
     let client = submit(&handle, 3, 16);
     let mut executor = MockExecutor::constant(rings, 1);

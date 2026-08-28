@@ -12,7 +12,7 @@
 //! fails when either scenario's p99 pass reaches 200 microseconds.
 
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use atoma_core::dispatch::{BucketLadder, CaptureKind, DispatchConfig, SupportLevel};
 use atoma_core::engine::{Engine, EngineConfig, EngineHandle, ExecutorRings, Pass};
@@ -82,7 +82,7 @@ fn decode_config() -> EngineConfig {
         )
         .expect("fits u32"),
         ingress_capacity: requests(live),
-        idle_deadline_millis: 1,
+        idle_deadline: Duration::from_millis(1),
     }
 }
 
@@ -108,7 +108,7 @@ fn churn_config() -> EngineConfig {
         )
         .expect("fits u32"),
         ingress_capacity: requests(live),
-        idle_deadline_millis: 1,
+        idle_deadline: Duration::from_millis(1),
     }
 }
 

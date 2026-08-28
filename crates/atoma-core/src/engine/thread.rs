@@ -39,15 +39,31 @@ pub struct EngineConfig {
     /// overload signal.
     pub ingress_capacity: RequestCount,
     /// How long the thread parks with nothing to do before re-examining its queues, so an
-    /// empty schedule can never wedge it.
-    pub idle_deadline_millis: u64,
+    /// empty schedule can never wedge it. Written in milliseconds wherever configuration is.
+    #[serde(rename = "idle_deadline_millis", with = "millis")]
+    pub idle_deadline: Duration,
 }
 
-impl EngineConfig {
-    /// How long the thread parks with nothing to do.
-    #[must_use]
-    pub fn idle_deadline(&self) -> Duration {
-        Duration::from_millis(self.idle_deadline_millis)
+/// A duration in memory, milliseconds on the wire: a deadline is a duration, and configuration
+/// should not have to spell one out as seconds and nanoseconds.
+mod millis {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        duration: &Duration,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        u64::try_from(duration.as_millis())
+            .unwrap_or(u64::MAX)
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Duration, D::Error> {
+        u64::deserialize(deserializer).map(Duration::from_millis)
     }
 }
 
@@ -174,7 +190,7 @@ impl Engine {
             control: control_receiver,
             heartbeat: heartbeat_publisher,
             parker,
-            idle_deadline: config.idle_deadline(),
+            idle_deadline: config.idle_deadline,
             in_flight: None,
             draining: None,
             passes: 0,
