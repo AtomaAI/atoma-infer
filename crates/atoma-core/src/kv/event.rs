@@ -1,9 +1,10 @@
-//! The cache-event schema: what a cache observer is told, and nothing that tells it.
+//! The cache-event schema: the types describing changes to the cache's contents.
 //!
-//! Schema only — no emitter, no ring, no sink. The shape lands now because retrofitting it is a
-//! wire break: every residence-bearing event carries its [`Tier`] from day one, so a second tier
-//! changes no consumer, and a batch names its [`HashAlgorithm`] so a reader never mixes caches
-//! hashed under different versions.
+//! This module defines only the event types; it contains no emitter, no ring and no sink, so
+//! nothing here produces or delivers an event yet. The schema exists this early because adding
+//! it later would break the wire format: every residence-bearing event carries its [`Tier`]
+//! from day one, so introducing a second tier changes no consumer, and every batch names its
+//! [`HashAlgorithm`], so a reader never mixes caches hashed under different versions.
 
 use serde::{Deserialize, Serialize};
 
