@@ -172,7 +172,8 @@ pub struct Scheduler {
     padding: Vec<RequestSlot>,
     /// The leases behind the dummies' blocks, held until the scheduler is dropped.
     padding_reservation: Option<PaddingReservation>,
-    /// Whether admission may move requests into Running; a drain closes it for good.
+    /// Whether admission may move waiting requests into Running; a drain closes it for good.
+    /// Preempted requests are offered either way: they have already run.
     admission_open: bool,
     budget: TokenBudget,
     step: StepId,

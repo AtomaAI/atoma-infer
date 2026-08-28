@@ -1,9 +1,9 @@
 //! The engine thread: one thread owning all engine state, driving the scheduler and the executor.
 //!
 //! Every pass drains control first, applies the executor's result, drains ingress while the
-//! slab has room, schedules and issues the next step command, answers a drain once nothing is
-//! in flight, and publishes the heartbeat. All state is owned outright by the thread that runs the
-//! pass; no lock sits on the step path.
+//! slab has room, schedules and issues the next step command, answers a drain once every request
+//! that has run is over, and publishes the heartbeat. All state is owned outright by the thread
+//! that runs the pass; no lock sits on the step path.
 
 use std::io::ErrorKind;
 use std::thread::{self, JoinHandle};
@@ -144,7 +144,7 @@ pub struct Engine {
     idle_deadline: Duration,
     /// The pass whose step command is out with the executor, if one is.
     in_flight: Option<Scheduled>,
-    /// The drain waiting for nothing to be in flight, if one is.
+    /// The drain waiting for every live request to be over, if one is.
     draining: Option<Sender<EngineState>>,
     passes: u64,
 }
@@ -365,7 +365,7 @@ impl Engine {
             return;
         }
         if let Some(reply) = self.draining.take() {
-            info!("drained: nothing in flight");
+            info!("drained: nothing running, nothing preempted, nothing in flight");
             send_reply(&reply, self.state());
         }
     }
