@@ -1,20 +1,20 @@
 //! Which captured graph serves a live batch, or why none does.
 //!
 //! A padded batch produces a graph key by exactly one pure function; any token count maps through
-//! a dense lookup to the next captured bucket; a batch no graph serves produces a named rejection
+//! a dense lookup to the next captured bucket; a batch no graph serves produces a named eager
 //! reason carrying the numbers that caused it. The dispatcher owns dispatch truth — executors act
 //! on its result without re-deriving it — with priority full-graph replay, then segmented replay,
 //! then eager.
 
-mod admission;
 mod bucket_ladder;
+mod decision;
 mod dispatcher;
 mod key;
 mod lookup;
 
-pub(crate) use admission::admit;
-pub use admission::{EagerFallbackCounters, LiveBatch, RejectionReason, SupportLevel};
 pub use bucket_ladder::{BucketLadder, BucketLadderError, Platform};
+pub(crate) use decision::decide;
+pub use decision::{EagerFallbackCounters, EagerReason, LiveBatch, SupportLevel};
 pub use dispatcher::{CaptureKind, DispatchConfig, DispatchDecision, Dispatcher};
 pub use key::GraphKey;
 pub use lookup::PaddingLookup;

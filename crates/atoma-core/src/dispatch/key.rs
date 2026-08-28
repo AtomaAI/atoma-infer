@@ -5,8 +5,8 @@ use crate::types::{RequestCount, TokenCount};
 /// Selects one captured graph for a padded batch.
 ///
 /// A key is built by exactly one pure function of the padded batch — the crate-internal
-/// constructor that admission owns. There is no default value and no public field, so adding a
-/// field later fails to compile at the construction site, and code outside this crate can carry
+/// constructor the dispatch decision owns. There is no default value and no public field, so adding
+/// a field later fails to compile at the construction site, and code outside this crate can carry
 /// and compare keys but never mint one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GraphKey {

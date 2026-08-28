@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::dispatch::{
-    admit, BucketLadder, EagerFallbackCounters, GraphKey, LiveBatch, PaddingLookup,
-    RejectionReason, SupportLevel,
+    decide, BucketLadder, EagerFallbackCounters, EagerReason, GraphKey, LiveBatch, PaddingLookup,
+    SupportLevel,
 };
 use crate::types::RequestCount;
 
@@ -41,16 +41,16 @@ pub enum DispatchDecision {
     /// Replay the captured segments the key selects, with eager regions between them.
     SegmentedReplay(GraphKey),
     /// Run the whole step eagerly.
-    Eager(RejectionReason),
+    Eager(EagerReason),
 }
 
 /// Owns dispatch truth: which captured graph serves a live batch, or why none does.
 ///
 /// Built once at Allocation and never modified afterwards — no method changes the bucket ladder,
 /// the captured set or the support level, so no code path recaptures at runtime.
-/// Dispatch priority is full-graph replay, then segmented replay, then eager: an admitted batch
+/// Dispatch priority is full-graph replay, then segmented replay, then eager: a batch with a key
 /// replays the whole pass when the captured set records whole passes, replays segments when it is
-/// split, and every rejected batch runs eagerly.
+/// split, and every batch without one runs eagerly.
 #[derive(Debug)]
 pub struct Dispatcher {
     lookup: PaddingLookup,
@@ -76,7 +76,7 @@ impl Dispatcher {
 
     /// Decides how `batch` runs, counting and logging the fallback when no graph serves it.
     pub fn dispatch(&mut self, batch: LiveBatch) -> DispatchDecision {
-        match admit(
+        match decide(
             batch,
             self.support_level,
             self.captured_max_requests,
@@ -94,7 +94,7 @@ impl Dispatcher {
         }
     }
 
-    /// Eager fallbacks so far, by rejection reason.
+    /// Eager fallbacks so far, by eager reason.
     #[must_use]
     pub fn fallbacks(&self) -> EagerFallbackCounters {
         self.fallbacks
@@ -111,7 +111,7 @@ mod tests {
 
     use super::{CaptureKind, DispatchConfig, DispatchDecision, Dispatcher, EagerFallbackCounters};
     use crate::dispatch::test_support::batch;
-    use crate::dispatch::{BucketLadder, Platform, RejectionReason, SupportLevel};
+    use crate::dispatch::{BucketLadder, EagerReason, Platform, SupportLevel};
     use crate::test_support::{requests, tokens};
 
     /// Log output collected behind the process-global subscriber.
@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn full_captured_set_replays_fully_with_the_admitted_key() {
+    fn full_captured_set_replays_fully_with_its_key() {
         let mut dispatcher = dispatcher(SupportLevel::Always, CaptureKind::Full);
         let DispatchDecision::FullReplay(key) = dispatcher.dispatch(batch(5, 5, true)) else {
             panic!("a full captured set must replay fully");
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn segmented_captured_set_replays_segments_with_the_admitted_key() {
+    fn segmented_captured_set_replays_segments_with_its_key() {
         let mut dispatcher = dispatcher(SupportLevel::Always, CaptureKind::Segmented);
         let DispatchDecision::SegmentedReplay(key) = dispatcher.dispatch(batch(5, 5, true)) else {
             panic!("a segmented captured set must replay segments");
@@ -177,11 +177,11 @@ mod tests {
     }
 
     #[test]
-    fn rejected_batch_dispatches_eagerly_with_its_reason() {
+    fn keyless_batch_dispatches_eagerly_with_its_reason() {
         let mut dispatcher = dispatcher(SupportLevel::Always, CaptureKind::Full);
         assert_eq!(
             dispatcher.dispatch(batch(600, 600, true)),
-            DispatchDecision::Eager(RejectionReason::TokensAboveBucketLadderMaximum {
+            DispatchDecision::Eager(EagerReason::TokensAboveBucketLadderMaximum {
                 token_count: tokens(600),
                 bucket_ladder_maximum: Some(tokens(512)),
             })
@@ -221,7 +221,7 @@ mod tests {
         ));
         assert!(
             !output.contains("token count 3 "),
-            "admitted batches log nothing"
+            "keyed batches log nothing"
         );
     }
 
@@ -262,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn each_rejection_reason_counts_separately() {
+    fn each_eager_reason_counts_separately() {
         let mut full_support = dispatcher(SupportLevel::Always, CaptureKind::Full);
         assert_eq!(full_support.fallbacks(), EagerFallbackCounters::default());
 
