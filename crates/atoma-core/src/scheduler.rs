@@ -668,9 +668,14 @@ impl Scheduler {
                     waiting.remove(position);
                     phase.admit(*step)
                 }
-                (Candidate::Preempted | Candidate::Waiting { .. }, _) => {
-                    unreachable!("each admission queue holds only its own phase")
-                }
+                (
+                    Candidate::Preempted | Candidate::Waiting { .. },
+                    RequestPhase::Waiting(_)
+                    | RequestPhase::Running(_)
+                    | RequestPhase::Preempted(_)
+                    | RequestPhase::Finished(_)
+                    | RequestPhase::Padding,
+                ) => unreachable!("each admission queue holds only its own phase"),
             };
             request.set_phase(RequestPhase::Running(admitted));
             running.push(slot);
