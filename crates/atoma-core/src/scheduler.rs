@@ -1,10 +1,12 @@
 //! The token-budget scheduler.
 //!
 //! One scheduling pass spends a per-step token budget: running requests first, then admission
-//! from the waiting queue over a bounded window. It answers in indices and counts — which
-//! sequences run, how many tokens each computes, which entries sample — never in copied request
-//! state. The scheduler owns the request slab and the block pool outright; nothing here is
-//! shared or locked.
+//! from the preempted stack and the waiting queue over a bounded window. A running request the
+//! pool cannot grow preempts the most recently admitted one, which releases its KV and later
+//! recomputes from the start; nothing is ever swapped out to be brought back. It answers in indices
+//! and counts — which sequences run, how many tokens each computes, which entries sample — never in
+//! copied request state. The scheduler owns the request slab and the block pool outright; nothing
+//! here is shared or locked.
 
 mod budget;
 mod kv;
@@ -74,6 +76,8 @@ impl Entry {
 pub struct Scheduled {
     pub step: StepId,
     pub entries: Vec<Entry>,
+    /// Requests this pass displaced from Running, most recent last.
+    pub preempted: Vec<RequestSlot>,
 }
 
 impl Scheduled {
@@ -122,6 +126,8 @@ pub struct Scheduler {
     running: Vec<RequestSlot>,
     /// Arrival order. Admission examines a bounded window from the front.
     waiting: VecDeque<RequestSlot>,
+    /// Displaced requests, most recent last; admission offers the top first.
+    preempted: Vec<RequestSlot>,
     budget: TokenBudget,
     step: StepId,
     next_request_id: u64,
@@ -146,6 +152,7 @@ impl Scheduler {
             pool,
             running: Vec::with_capacity(budget.max_requests().get()),
             waiting: VecDeque::new(),
+            preempted: Vec::new(),
             budget,
             step: StepId::new(0),
             next_request_id: 0,
@@ -195,6 +202,12 @@ impl Scheduler {
         &self.waiting
     }
 
+    /// Displaced requests, most recent last.
+    #[must_use]
+    pub fn preempted(&self) -> &[RequestSlot] {
+        &self.preempted
+    }
+
     /// Takes `new` in as a Waiting request, or finishes it on the spot when it can never run.
     ///
     /// # Errors
@@ -234,18 +247,20 @@ impl Scheduler {
     }
 
     /// One scheduling pass: requests whose client hung up retire, running requests spend the
-    /// budget first, then admission offers the remainder to the waiting queue over the
+    /// budget first — preempting the most recently admitted when the pool cannot grow them —
+    /// then admission offers the remainder to the preempted stack and the waiting queue over the
     /// configured window.
     pub fn schedule(&mut self) -> Scheduled {
         self.step = StepId::new(self.step.get() + 1);
         self.budget.reset();
         self.retire_cancelled_running();
         let mut entries = Vec::with_capacity(self.budget.max_requests().get());
-        self.schedule_running(&mut entries);
+        let preempted = self.schedule_running(&mut entries);
         self.admit(&mut entries);
         Scheduled {
             step: self.step,
             entries,
+            preempted,
         }
     }
 
@@ -318,12 +333,22 @@ impl Scheduler {
     fn retire(&mut self, slot: RequestSlot, reason: FinishReason) {
         let mut request = self.requests.remove(slot);
         let finished: Finished = match request.phase() {
-            RequestPhase::Waiting(waiting) => waiting.finish(reason),
+            RequestPhase::Waiting(waiting) => {
+                if self.waiting.front() == Some(&slot) {
+                    self.waiting.pop_front();
+                } else {
+                    self.waiting.retain(|waiting| *waiting != slot);
+                }
+                waiting.finish(reason)
+            }
             RequestPhase::Running(running) => {
                 self.running.retain(|running| *running != slot);
                 running.finish(reason)
             }
-            RequestPhase::Preempted(preempted) => preempted.finish(reason),
+            RequestPhase::Preempted(preempted) => {
+                self.preempted.retain(|preempted| *preempted != slot);
+                preempted.finish(reason)
+            }
             RequestPhase::Finished(_) | RequestPhase::Padding => {
                 unreachable!("only live requests retire")
             }
@@ -353,25 +378,44 @@ impl Scheduler {
         }
     }
 
-    /// Budgets every running request in batch order. A request the budget or the pool cannot
-    /// serve this step stays running and simply has no entry.
-    fn schedule_running(&mut self, entries: &mut Vec<Entry>) {
-        let block_size = self.config.block_size;
-        for &slot in &self.running {
+    /// Budgets every running request in batch order, returning the requests preempted on the
+    /// way. A request the budget cannot serve this step stays running with no entry; one the
+    /// pool cannot grow preempts the most recently admitted request — itself, if it is the
+    /// newest — and retries.
+    fn schedule_running(&mut self, entries: &mut Vec<Entry>) -> Vec<RequestSlot> {
+        let mut preempted = Vec::new();
+        let mut position = 0;
+        while position < self.running.len() {
+            let slot = self.running[position];
             let request = self.requests.get_mut(slot).expect("running slots are live");
-            for (index, sequence) in request.sequences_mut().iter_mut().enumerate() {
+            let sequence_count = request.sequences().len();
+            let mut displaced_self = false;
+            for index in 0..sequence_count {
+                let sequence =
+                    &mut self.requests.get_mut(slot).expect("live").sequences_mut()[index];
                 let Some(query_len) = self.budget.offer(sequence.remaining()) else {
-                    return;
+                    return preempted;
                 };
                 let context_len = sequence.computed();
-                if ensure_blocks(
+                let total = sequence.total();
+                let sequence_len = context_len + query_len.get();
+                while ensure_blocks(
                     &mut self.pool,
-                    block_size,
-                    sequence,
-                    context_len + query_len.get(),
+                    self.config.block_size,
+                    &mut self.requests.get_mut(slot).expect("live").sequences_mut()[index],
+                    sequence_len,
                 ) == Err(PoolExhausted)
                 {
-                    continue;
+                    let victim = *self.running.last().expect("this request is running");
+                    self.preempt(victim);
+                    preempted.push(victim);
+                    if victim == slot {
+                        displaced_self = true;
+                        break;
+                    }
+                }
+                if displaced_self {
+                    break;
                 }
                 self.budget.spend(query_len);
                 entries.push(Entry {
@@ -381,30 +425,56 @@ impl Scheduler {
                     ),
                     context_len,
                     query_len,
-                    samples: context_len + query_len.get() == sequence.total(),
+                    samples: sequence_len == total,
                 });
             }
+            if !displaced_self {
+                position += 1;
+            }
         }
+        preempted
     }
 
-    /// Admission: examines up to the window from the front of the waiting queue, first come
-    /// first served, and stops at the first request the budget or the pool cannot serve.
+    /// Preemption: the request at `slot`, the most recently admitted, releases its KV and will
+    /// recompute from the start when it re-enters Running.
+    fn preempt(&mut self, slot: RequestSlot) {
+        assert_eq!(
+            self.running.pop(),
+            Some(slot),
+            "the preemption victim is the most recently admitted request"
+        );
+        let request = self.requests.get_mut(slot).expect("running slots are live");
+        let RequestPhase::Running(running) = request.phase() else {
+            unreachable!("the running queue holds only Running requests")
+        };
+        request.set_phase(RequestPhase::Preempted(running.preempt(self.step)));
+        for sequence in request.sequences_mut() {
+            release_blocks(&mut self.pool, sequence);
+            sequence.reset_for_recompute();
+        }
+        self.preempted.push(slot);
+        debug!(request = request.id().get(), "request preempted");
+    }
+
+    /// Admission: examines up to the window of candidates — the preempted stack top first, last
+    /// in first out, then the front of the waiting queue first come first served — and stops at
+    /// the first request the budget or the pool cannot serve. Admission never preempts.
     fn admit(&mut self, entries: &mut Vec<Entry>) {
         let block_size = self.config.block_size;
         let step = self.step;
         for _ in 0..self.config.window.get() {
-            let Some(&slot) = self.waiting.front() else {
-                return;
+            let (slot, from) = match self.preempted.last() {
+                Some(&slot) => (slot, Candidate::Preempted),
+                None => match self.waiting.front() {
+                    Some(&slot) => (slot, Candidate::Waiting),
+                    None => return,
+                },
             };
-            let request = self.requests.get_mut(slot).expect("waiting slots are live");
+            let request = self.requests.get_mut(slot).expect("candidates are live");
             if request.is_cancelled() {
-                self.waiting.pop_front();
                 self.retire(slot, FinishReason::Cancelled);
                 continue;
             }
-            let RequestPhase::Waiting(waiting) = request.phase() else {
-                unreachable!("the waiting queue holds only Waiting requests")
-            };
             let sequence = &mut request.sequences_mut()[0];
             let total = sequence.total();
             let Some(query_len) = self.budget.offer(sequence.remaining()) else {
@@ -415,8 +485,20 @@ impl Scheduler {
             {
                 return;
             }
-            request.set_phase(RequestPhase::Running(waiting.admit(step)));
-            self.waiting.pop_front();
+            let running = match (from, request.phase()) {
+                (Candidate::Preempted, RequestPhase::Preempted(preempted)) => {
+                    self.preempted.pop();
+                    preempted.admit(step)
+                }
+                (Candidate::Waiting, RequestPhase::Waiting(waiting)) => {
+                    self.waiting.pop_front();
+                    waiting.admit(step)
+                }
+                (Candidate::Preempted | Candidate::Waiting, _) => {
+                    unreachable!("each admission queue holds only its own phase")
+                }
+            };
+            request.set_phase(RequestPhase::Running(running));
             self.running.push(slot);
             self.budget.spend(query_len);
             entries.push(Entry {
@@ -428,6 +510,13 @@ impl Scheduler {
             });
         }
     }
+}
+
+/// Which admission queue a candidate came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Candidate {
+    Preempted,
+    Waiting,
 }
 
 impl Drop for Scheduler {

@@ -10,8 +10,8 @@ pub(crate) struct PoolExhausted;
 
 /// Grows `sequence`'s block table until it covers `tokens` tokens, leasing from `pool`.
 ///
-/// Blocks obtained before the pool runs dry stay in the table: the sequence will need them
-/// whenever it next runs, and a preemption releases them with the rest.
+/// All or nothing: when the pool runs dry the blocks leased by this call go straight back, so
+/// a sequence never holds blocks for a step it is not going to run.
 pub(crate) fn ensure_blocks(
     pool: &mut BlockPool,
     block_size: TokenCount,
@@ -19,8 +19,14 @@ pub(crate) fn ensure_blocks(
     tokens: usize,
 ) -> Result<(), PoolExhausted> {
     let needed = tokens.div_ceil(block_size.get());
+    let held = sequence.block_table.len();
+    let leases_held = sequence.leases.len();
     while sequence.block_table.len() < needed {
         let Some(lease) = pool.lease() else {
+            for lease in sequence.leases.drain(leases_held..) {
+                pool.release(lease);
+            }
+            sequence.block_table.truncate(held);
             return Err(PoolExhausted);
         };
         sequence.block_table.push(lease.block());
