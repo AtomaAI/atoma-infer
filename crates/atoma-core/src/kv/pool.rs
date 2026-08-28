@@ -11,7 +11,10 @@ use std::thread;
 
 use crate::protocol::{BlockHash, BlockId};
 
-/// Link value marking the end of the free list.
+/// The links' null: where a pointer-based list would hold a null pointer, the index-based free
+/// list holds `NIL` — in a block's `prev`/`next` for a missing neighbor, and in `free_head`/
+/// `free_tail` for an empty list. Never a valid block index: indices stay below the pool's
+/// `u32` block count.
 const NIL: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +207,8 @@ impl BlockPool {
         self.blocks.len()
     }
 
+    /// Takes the block at the front of the free list, or `None` when the list is empty.
+    /// Blocks leave from the head and return at the tail, so freed blocks recycle FIFO.
     fn pop_free_head(&mut self) -> Option<BlockId> {
         if self.free_head == NIL {
             return None;
@@ -212,14 +217,18 @@ impl BlockPool {
         let next = self.blocks[head as usize].next;
         self.free_head = next;
         if next == NIL {
+            // The popped head was also the tail, so the list is now empty. A stale tail would
+            // let push_free_tail link the next freed block behind this now-leased one.
             self.free_tail = NIL;
         } else {
+            // The new head has no predecessor.
             self.blocks[next as usize].prev = NIL;
         }
         self.free_count -= 1;
         Some(BlockId::new(head))
     }
 
+    /// Appends `block` at the back of the free list, resetting its metadata to `Free`.
     fn push_free_tail(&mut self, block: BlockId) {
         let index = block.get();
         self.blocks[index as usize] = BlockMeta {
@@ -229,6 +238,7 @@ impl BlockPool {
             next: NIL,
         };
         if self.free_tail == NIL {
+            // Appending to an empty list: this block becomes head and tail at once.
             self.free_head = index;
         } else {
             self.blocks[self.free_tail as usize].next = index;
