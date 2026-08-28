@@ -15,7 +15,8 @@ use crate::types::StepId;
 pub enum Control {
     /// Stop admitting waiting requests and let every request that has run finish; reply with the
     /// engine's state once nothing runs, nothing is preempted and no step is in flight.
-    /// Admission does not resume.
+    /// Admission does not resume. A request that never ran stays waiting and is counted in the
+    /// reply; Shutdown is what finishes those.
     Drain { reply: Sender<EngineState> },
     /// Finish every live request as shut down and return from the thread.
     Shutdown,

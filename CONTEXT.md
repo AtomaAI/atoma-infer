@@ -201,8 +201,10 @@ comes back. Numbered by step id.
 _Avoid_: iteration, tick, cycle
 
 **Scheduled**:
-The output of one scheduling pass: the entries this step runs, the slots it preempted, and the
-block deltas the executor must see. Indices and counts, never copied request state.
+The output of one scheduling pass: the step it is for, the entries this step runs and the slots
+it preempted. Indices and counts, never copied request state. There are no block deltas: a step
+command carries each entry's whole block table, since preemption releases KV rather than moving
+it.
 _Avoid_: schedule, scheduler output, scheduler step, plan
 
 **Entry**:
