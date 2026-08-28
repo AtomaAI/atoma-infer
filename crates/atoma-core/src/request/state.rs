@@ -165,7 +165,8 @@ pub struct Request {
     phase: RequestPhase,
     sampling: SamplingParams,
     stop: StopCriteria,
-    /// The client's channel; a padding dummy has none.
+    /// The client's channel. Absent for exactly one kind of request: a padding dummy, which has
+    /// no client.
     egress: Option<EgressSender>,
     /// Born with one; forking adds more.
     sequences: Vec<Sequence>,
@@ -248,8 +249,18 @@ impl Request {
         self.egress.as_ref()
     }
 
-    /// Sends `event` to the client, if there is one.
+    /// Sends `event` to the client.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when the request is a padding dummy: a dummy has no client, it
+    /// never finishes and its one token is nobody's, so an event reaching it is a bug in the
+    /// caller rather than something to drop quietly.
     pub fn send(&self, event: RequestEvent) {
+        debug_assert!(
+            !self.is_padding(),
+            "a padding dummy has no client to send {event:?} to"
+        );
         if let Some(egress) = &self.egress {
             egress.send(event);
         }
@@ -284,8 +295,7 @@ impl Request {
 mod tests {
     use super::{NewRequest, Request, PADDING_TOKEN};
     use crate::request::{
-        egress, EgressReceiver, FinishReason, RequestEvent, RequestPhase, SamplingParams,
-        StopCriteria, Usage,
+        egress, EgressReceiver, RequestPhase, SamplingParams, StopCriteria, Usage,
     };
     use crate::test_support::tokens;
     use crate::types::{BlockId, RequestId, StepId};
@@ -386,11 +396,6 @@ mod tests {
         assert_eq!(sequence.tokens(), &[PADDING_TOKEN]);
         assert_eq!(sequence.block_table(), &[BlockId::new(4)]);
         assert_eq!(sequence.computed(), 0);
-        dummy.send(RequestEvent::Finished {
-            request: RequestId::new(9),
-            reason: FinishReason::Shutdown,
-            usage: dummy.usage(),
-        });
     }
 
     #[test]
