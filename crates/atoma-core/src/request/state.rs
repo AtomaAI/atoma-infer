@@ -22,7 +22,7 @@ pub struct NewRequest {
 /// One token stream inside a request, with its own computed count and block table.
 ///
 /// Prompt and generated tokens share one buffer, so a chunk of computation is always a
-/// contiguous slice of it — including the recompute after a preemption, which spans both.
+/// contiguous slice of it — including what a preempted request computes again, which spans both.
 #[derive(Debug)]
 pub struct Sequence {
     tokens: Vec<u32>,
@@ -150,8 +150,9 @@ impl Sequence {
         self.tokens.push(token);
     }
 
-    /// Forgets all resident KV, so the sequence recomputes from the start when it next runs.
-    pub fn reset_for_recompute(&mut self) {
+    /// Forgets that any token has resident KV, so the sequence computes from its first token
+    /// again when it next runs.
+    pub fn forget_computed(&mut self) {
         self.computed = 0;
     }
 }
@@ -353,7 +354,7 @@ mod tests {
         assert_eq!(sequence.generated_count(), 1);
         assert_eq!(sequence.tokens(), &[1, 2, 3, 4, 9]);
 
-        sequence.reset_for_recompute();
+        sequence.forget_computed();
         assert_eq!(sequence.computed(), 0);
         assert!(
             sequence.is_prefilling(),

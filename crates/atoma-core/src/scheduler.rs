@@ -607,7 +607,7 @@ impl Scheduler {
         request.set_phase(RequestPhase::Preempted(running.preempt(*step)));
         for sequence in request.sequences_mut() {
             kv.release(sequence);
-            sequence.reset_for_recompute();
+            sequence.forget_computed();
         }
         preempted.push(slot);
         debug!(request = request.id().get(), "request preempted");
@@ -650,12 +650,12 @@ impl Scheduler {
             let context_len = sequence.computed();
             let Some(query_len) = budget.offer(sequence.remaining()) else {
                 kv.release(sequence);
-                sequence.reset_for_recompute();
+                sequence.forget_computed();
                 return;
             };
             if kv.ensure_blocks(sequence, context_len + query_len.get()) == Err(PoolExhausted) {
                 kv.release(sequence);
-                sequence.reset_for_recompute();
+                sequence.forget_computed();
                 return;
             }
             let admitted = match (from, request.phase()) {

@@ -14,7 +14,7 @@
 //! - Rewritten, divergence documented on the test: `prefill_prioritized` (decode-first, mixed
 //!   batches), `prefill_schedule_token_budget` (a prompt over the remaining budget is chunked, not
 //!   refused), `scheduler_schedule_preempt_abort` and `decode_schedule_preempted` (preemption is
-//!   recompute-only from the tail of the running queue; nothing is swapped).
+//!   from the tail of the running queue and the victim computes again; nothing is swapped).
 //! - Dropped, with the machinery they tested: every `schedule_swapped_*`, `infeasible_swap`,
 //!   `decode_swap_beam_search` and `schedule_decode_blocks_to_copy_update` (swap and copy-on-write
 //!   do not exist; preemption recomputes), `scheduler_delay_factor` (no delay factor), and
@@ -693,7 +693,10 @@ fn a_decode_the_pool_cannot_grow_preempts_the_newest_request_which_recomputes() 
     let entry = recompute.entries[0];
     assert_eq!(entry.context_len, 0);
     assert_eq!(entry.query_len, tokens(BLOCK_SIZE + 1));
-    assert!(entry.samples, "the recompute reaches the total and samples");
+    assert!(
+        entry.samples,
+        "computing again reaches the total and samples"
+    );
     assert_eq!(scheduler.running(), [b]);
     assert!(scheduler.preempted().is_empty());
     assert!(scheduler.request(a).is_none());
