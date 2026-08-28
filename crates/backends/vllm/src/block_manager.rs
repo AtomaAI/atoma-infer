@@ -43,8 +43,8 @@ pub struct BlockSpaceManager {
     pub(crate) num_gpu_blocks: usize,
     /// CPU allocator
     pub(crate) cpu_allocator: BlockAllocator,
-    /// GPU allocator, leasing from the atoma-core pool and measuring prefix reuse
-    pub(crate) gpu_allocator: GpuBlockSupply,
+    /// GPU block supply, leasing from the atoma-core pool and measuring prefix reuse
+    pub(crate) gpu_supply: GpuBlockSupply,
     /// Block sliding window
     pub(crate) block_sliding_window: Option<usize>,
 }
@@ -61,14 +61,14 @@ impl BlockSpaceManager {
         let block_sliding_window = sliding_window.map(|sw| sw.div_ceil(block_size));
 
         let cpu_allocator = BlockAllocator::new(block_size, BlockDevice::Cpu, num_cpu_blocks);
-        let gpu_allocator = GpuBlockSupply::new(block_size, num_gpu_blocks);
+        let gpu_supply = GpuBlockSupply::new(block_size, num_gpu_blocks);
 
         Ok(Self {
             block_size,
             block_tables: HashMap::new(),
             num_gpu_blocks,
             cpu_allocator,
-            gpu_allocator,
+            gpu_supply,
             block_sliding_window,
         })
     }
@@ -77,7 +77,7 @@ impl BlockSpaceManager {
     pub fn get_num_free_blocks(&self, device: BlockDevice) -> usize {
         match device {
             BlockDevice::Cpu => self.cpu_allocator.get_num_free_blocks(),
-            BlockDevice::Gpu => self.gpu_allocator.get_num_free_blocks(),
+            BlockDevice::Gpu => self.gpu_supply.get_num_free_blocks(),
         }
     }
 }
@@ -112,7 +112,7 @@ impl BlockSpaceManager {
         let num_required_blocks =
             seq_group.get_num_total_logical_token_blocks(SequenceStatus::Waiting);
         if let Some(mut num_required_blocks) = num_required_blocks {
-            let num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks();
+            let num_free_gpu_blocks = self.gpu_supply.get_num_free_blocks();
 
             if let Some(block_sliding_window) = self.block_sliding_window {
                 num_required_blocks = num_required_blocks.min(block_sliding_window);
@@ -203,7 +203,7 @@ impl BlockSpaceManager {
                     }
                     block.clone()
                 } else {
-                    let block = self.gpu_allocator.allocate()?;
+                    let block = self.gpu_supply.allocate()?;
                     {
                         let mut block_guard = block.write_lock()?;
                         block_guard.set_ref_count_by(
@@ -224,7 +224,7 @@ impl BlockSpaceManager {
                     block_ids.push(BlockId::new(block.read_lock()?.block_number()));
                 }
                 let sequence_ids = seq_group.get_sequences_ids(Some(SequenceStatus::Waiting));
-                self.gpu_allocator
+                self.gpu_supply
                     .index_shared_prompt(&sequence_ids, &token_ids, &block_ids);
             }
 
@@ -255,7 +255,7 @@ impl BlockSpaceManager {
     pub fn can_append_slots(&self, seq_group: &SequenceGroup) -> bool {
         // HEURISTIC: if there is at least one free block
         // for each sequence, we can append
-        let num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks();
+        let num_free_gpu_blocks = self.gpu_supply.get_num_free_blocks();
         let num_seqs = seq_group.get_num_sequences(Some(SequenceStatus::Running));
         num_seqs <= num_free_gpu_blocks
     }
@@ -334,7 +334,7 @@ impl BlockSpaceManager {
                             // In this case, the sequence already has a new logical block to be
                             // appended we need to allocate a new
                             // physical block
-                            let new_block = self.gpu_allocator.allocate()?;
+                            let new_block = self.gpu_supply.allocate()?;
                             block_table.push(new_block);
 
                             return Ok(None);
@@ -343,7 +343,7 @@ impl BlockSpaceManager {
                     None => {
                         // The sequence already has a new logical block to be appended,
                         // we need to allocate a new physical block
-                        let new_block = self.gpu_allocator.allocate()?;
+                        let new_block = self.gpu_supply.allocate()?;
                         block_table.push(new_block);
 
                         return Ok(None);
@@ -362,8 +362,8 @@ impl BlockSpaceManager {
 
             // At this point, the block is shared with other sequences, so we perform Copy on Write
             // (CoW) CoW: Allocate a new block and copy the tokens
-            let new_block = self.gpu_allocator.allocate()?;
-            self.gpu_allocator.free(last_block)?;
+            let new_block = self.gpu_supply.allocate()?;
+            self.gpu_supply.free(last_block)?;
             let (last_block_number, new_block_number) = {
                 (
                     last_block.read_lock()?.block_number(),
@@ -531,12 +531,12 @@ impl BlockSpaceManager {
 
         let blocks = self.get_physical_blocks(seq_group)?;
         let num_swapped_sequences = seq_group.get_num_sequences(Some(SequenceStatus::Swapped));
-        let num_free_blocks = self.gpu_allocator.get_num_free_blocks();
+        let num_free_blocks = self.gpu_supply.get_num_free_blocks();
         // NOTE: Conservatively we assume that every sequence will allocate
         // at least one block free block right after the swap-in
         // NOTE: it should match the logic in `can_append_slot`
         let num_required_blocks = blocks.len() + num_swapped_sequences;
-        if self.gpu_allocator.get_num_total_blocks() < num_required_blocks {
+        if self.gpu_supply.get_num_total_blocks() < num_required_blocks {
             Ok(AllocationStatus::Never)
         } else if num_free_blocks >= num_required_blocks {
             Ok(AllocationStatus::Ok)
@@ -603,7 +603,7 @@ impl BlockSpaceManager {
                     let cpu_block_id = { cpu_block.read_lock()?.block_number() };
                     let gpu_block = if let Entry::Vacant(e) = mapping.entry(cpu_block_id) {
                         // Create a new block
-                        let gpu_block = self.gpu_allocator.allocate()?;
+                        let gpu_block = self.gpu_supply.allocate()?;
                         e.insert(gpu_block.clone());
                         gpu_block
                     } else {
@@ -753,11 +753,11 @@ impl BlockSpaceManager {
                     };
                     new_block_table.push(cpu_block);
                     // Free the CPU block that was allocated into the GPU
-                    self.gpu_allocator.free(gpu_block)?;
+                    self.gpu_supply.free(gpu_block)?;
                 }
                 self.block_tables.insert(*sequence_id, new_block_table);
             }
-            self.gpu_allocator.discard_sequence(*sequence_id);
+            self.gpu_supply.discard_sequence(*sequence_id);
             // NOTE: we update the status of the `Sequence` right after the previous check, and not
             // on the scheduler logic
             let sequence = seq_group.get_sequence_from_id(*sequence_id).unwrap(); // DON'T PANIC: we already checked that `SequenceGroup` contains `Sequence` with
@@ -827,7 +827,7 @@ impl BlockSpaceManager {
             if block_device == BlockDevice::Cpu {
                 self.cpu_allocator.free(block)?;
             } else {
-                self.gpu_allocator.free(&block)?;
+                self.gpu_supply.free(&block)?;
             }
         }
 
@@ -888,7 +888,7 @@ impl BlockSpaceManager {
         self.free_block_table(&block_table)?;
 
         self.block_tables.remove(&sequence_id);
-        self.gpu_allocator.finish_sequence(sequence_id);
+        self.gpu_supply.finish_sequence(sequence_id);
 
         Ok(())
     }
@@ -925,7 +925,7 @@ impl BlockSpaceManager {
             self.free_block_table(bt)?;
         }
         self.block_tables.clear();
-        self.gpu_allocator.clear();
+        self.gpu_supply.clear();
         Ok(())
     }
 
@@ -976,13 +976,13 @@ impl BlockSpaceManager {
     /// # Returns
     /// `usize` - The number of free GPU blocks.
     pub fn get_number_of_free_gpu_blocks(&self) -> usize {
-        self.gpu_allocator.get_num_free_blocks()
+        self.gpu_supply.get_num_free_blocks()
     }
 
     /// Prefix-cache traffic so far: prompt blocks queried at admission, and how many were
     /// already indexed. The end-to-end hit rate is `hits / queries`.
     pub fn prefix_cache_stats(&self) -> PrefixCacheStats {
-        self.gpu_allocator.prefix_cache_stats()
+        self.gpu_supply.prefix_cache_stats()
     }
 
     /// Returns the number of free CPU blocks available in the block manager.
