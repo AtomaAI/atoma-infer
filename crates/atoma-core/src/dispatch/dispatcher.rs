@@ -34,7 +34,8 @@ pub struct DispatchConfig {
 }
 
 /// What the executor does with one live batch. Executors act on this without re-deriving it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DispatchDecision {
     /// Replay the full captured graph the key selects.
     FullReplay(GraphKey),

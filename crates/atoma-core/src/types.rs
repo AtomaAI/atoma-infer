@@ -149,6 +149,9 @@ impl LayerGroupId {
 pub struct TokenCount(NonZeroUsize);
 
 impl TokenCount {
+    /// One token.
+    pub const ONE: Self = Self(NonZeroUsize::MIN);
+
     #[must_use]
     pub const fn new(count: usize) -> Option<Self> {
         match NonZeroUsize::new(count) {
@@ -244,6 +247,11 @@ mod tests {
         assert_eq!(serde_json::to_string(&requests).unwrap(), "2");
         assert_eq!(serde_json::from_str::<TokenCount>("8").unwrap(), tokens);
         assert_eq!(serde_json::from_str::<RequestCount>("2").unwrap(), requests);
+    }
+
+    #[test]
+    fn one_token_is_a_constant() {
+        assert_eq!(TokenCount::ONE, TokenCount::new(1).unwrap());
     }
 
     #[test]

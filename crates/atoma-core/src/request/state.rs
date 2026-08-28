@@ -1,8 +1,13 @@
 //! Request and sequence state as the engine thread holds it: host-native, one owner, no locks.
 
 use crate::kv::{BlockLease, ExtraKeys, HashAlgorithm};
-use crate::request::{EgressSender, RequestPhase, SamplingParams, StopCriteria, Usage, Waiting};
+use crate::request::{
+    EgressSender, RequestEvent, RequestPhase, SamplingParams, StopCriteria, Usage, Waiting,
+};
 use crate::types::{BlockHash, BlockId, RequestId, StepId, TokenCount};
+
+/// The one token a padding dummy computes every step it is inserted into.
+pub const PADDING_TOKEN: u32 = 0;
 
 /// A request as its client submits it: one prompt, one set of sampling parameters, one egress
 /// sink. Everything the engine needs to give it a slot.
@@ -158,7 +163,8 @@ pub struct Request {
     phase: RequestPhase,
     sampling: SamplingParams,
     stop: StopCriteria,
-    egress: EgressSender,
+    /// The client's channel; a padding dummy has none.
+    egress: Option<EgressSender>,
     /// Born with one; forking adds more.
     sequences: Vec<Sequence>,
 }
@@ -178,9 +184,34 @@ impl Request {
             phase: RequestPhase::Waiting(Waiting::new(arrived_at)),
             sampling,
             stop,
-            egress,
+            egress: Some(egress),
             sequences: vec![Sequence::from_prompt(prompt)],
         }
+    }
+
+    /// A padding dummy: one sequence of one token over `block`, held for the process lifetime.
+    /// It never finishes and never enters admission, and it has no client.
+    #[must_use]
+    pub fn padding(id: RequestId, block: BlockId) -> Self {
+        let mut sequence = Sequence::from_prompt(vec![PADDING_TOKEN]);
+        sequence.block_table.push(block);
+        Self {
+            id,
+            phase: RequestPhase::Padding,
+            sampling: SamplingParams::default(),
+            stop: StopCriteria {
+                max_new_tokens: TokenCount::ONE,
+                ignore_eos: true,
+            },
+            egress: None,
+            sequences: vec![sequence],
+        }
+    }
+
+    /// Whether this is a padding dummy.
+    #[must_use]
+    pub fn is_padding(&self) -> bool {
+        matches!(self.phase, RequestPhase::Padding)
     }
 
     #[must_use]
@@ -208,9 +239,17 @@ impl Request {
         self.stop
     }
 
+    /// The client's channel; `None` for a padding dummy.
     #[must_use]
-    pub fn egress(&self) -> &EgressSender {
-        &self.egress
+    pub fn egress(&self) -> Option<&EgressSender> {
+        self.egress.as_ref()
+    }
+
+    /// Sends `event` to the client, if there is one.
+    pub fn send(&self, event: RequestEvent) {
+        if let Some(egress) = &self.egress {
+            egress.send(event);
+        }
     }
 
     #[must_use]
@@ -222,10 +261,10 @@ impl Request {
         &mut self.sequences
     }
 
-    /// Whether the client dropped its egress receiver.
+    /// Whether the client dropped its egress receiver. A dummy has no client to lose.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.egress.is_cancelled()
+        self.egress.as_ref().is_some_and(EgressSender::is_cancelled)
     }
 
     /// Token accounting over every sequence.
@@ -240,12 +279,13 @@ impl Request {
 
 #[cfg(test)]
 mod tests {
-    use super::{NewRequest, Request};
+    use super::{NewRequest, Request, PADDING_TOKEN};
     use crate::request::{
-        egress, EgressReceiver, RequestPhase, SamplingParams, StopCriteria, Usage,
+        egress, EgressReceiver, FinishReason, RequestEvent, RequestPhase, SamplingParams,
+        StopCriteria, Usage,
     };
     use crate::test_support::tokens;
-    use crate::types::{RequestId, StepId};
+    use crate::types::{BlockId, RequestId, StepId};
 
     /// A request over `prompt` with its client's receiver, which the caller keeps alive.
     fn request(prompt: &[u32]) -> (Request, EgressReceiver) {
@@ -330,6 +370,24 @@ mod tests {
     fn advancing_past_the_total_is_a_caller_bug() {
         let (mut request, _receiver) = request(&[1, 2]);
         request.sequences_mut()[0].advance(3);
+    }
+
+    #[test]
+    fn a_padding_dummy_holds_its_block_with_no_client_and_never_cancels() {
+        let dummy = Request::padding(RequestId::new(9), BlockId::new(4));
+        assert!(dummy.is_padding());
+        assert_eq!(dummy.phase(), RequestPhase::Padding);
+        assert!(dummy.egress().is_none());
+        assert!(!dummy.is_cancelled());
+        let sequence = &dummy.sequences()[0];
+        assert_eq!(sequence.tokens(), &[PADDING_TOKEN]);
+        assert_eq!(sequence.block_table(), &[BlockId::new(4)]);
+        assert_eq!(sequence.computed(), 0);
+        dummy.send(RequestEvent::Finished {
+            request: RequestId::new(9),
+            reason: FinishReason::Shutdown,
+            usage: dummy.usage(),
+        });
     }
 
     #[test]

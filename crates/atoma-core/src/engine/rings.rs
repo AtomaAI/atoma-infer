@@ -100,13 +100,20 @@ impl ExecutorRings {
 #[cfg(test)]
 mod tests {
     use super::{rings, RING_CAPACITY};
+    use crate::dispatch::{DispatchDecision, EagerReason};
     use crate::step::{StepCommand, StepResult};
+    use crate::test_support::tokens;
     use crate::types::StepId;
 
     fn command(step: u64) -> StepCommand {
         StepCommand {
             step: StepId::new(step),
             entries: Vec::new(),
+            padding_count: 0,
+            dispatch: DispatchDecision::Eager(EagerReason::TokensAboveBucketLadderMaximum {
+                token_count: tokens(1),
+                bucket_ladder_maximum: None,
+            }),
         }
     }
 

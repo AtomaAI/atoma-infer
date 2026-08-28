@@ -19,4 +19,4 @@ pub use event::{FinishReason, RequestEvent, Usage};
 pub use params::{SamplingParams, StopCriteria};
 pub use phase::{Finished, Preempted, RequestPhase, Running, Waiting};
 pub use slab::RequestSlab;
-pub use state::{NewRequest, Request, Sequence};
+pub use state::{NewRequest, Request, Sequence, PADDING_TOKEN};

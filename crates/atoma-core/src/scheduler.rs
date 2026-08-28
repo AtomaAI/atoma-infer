@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::debug;
 
-use crate::kv::{BlockPool, HashAlgorithm, PrefixIndex};
+use crate::dispatch::LiveBatch;
+use crate::kv::{BlockPool, HashAlgorithm, PaddingReservation, PrefixIndex};
 use crate::request::{
     FinishReason, Finished, NewRequest, Request, RequestEvent, RequestPhase, RequestSlab, Usage,
 };
@@ -111,6 +112,32 @@ impl Scheduled {
     pub fn sampling_entries(&self) -> impl Iterator<Item = &Entry> {
         self.entries.iter().filter(|entry| entry.samples)
     }
+
+    /// Live requests in the batch: entries address sequences, and a request's sequences sit
+    /// together in batch order.
+    #[must_use]
+    pub fn request_count(&self) -> usize {
+        self.entries
+            .iter()
+            .fold((0, None), |(count, last), entry| {
+                if last == Some(entry.slot) {
+                    (count, last)
+                } else {
+                    (count + 1, Some(entry.slot))
+                }
+            })
+            .0
+    }
+
+    /// The shape of this pass before padding, or `None` when nothing was scheduled.
+    #[must_use]
+    pub fn live_batch(&self) -> Option<LiveBatch> {
+        Some(LiveBatch {
+            token_count: TokenCount::new(self.token_count())?,
+            request_count: RequestCount::new(self.request_count())?,
+            uniform_decode: self.is_uniform_decode(),
+        })
+    }
 }
 
 /// A configuration the scheduler refuses to start under.
@@ -138,6 +165,10 @@ pub struct Scheduler {
     waiting: VecDeque<RequestSlot>,
     /// Displaced requests, most recent last; admission offers the top first.
     preempted: Vec<RequestSlot>,
+    /// The padding dummies' slots, in reservation order. Never in any queue.
+    padding: Vec<RequestSlot>,
+    /// The leases behind the dummies' blocks, held until the scheduler is dropped.
+    padding_reservation: Option<PaddingReservation>,
     budget: TokenBudget,
     step: StepId,
     next_request_id: u64,
@@ -164,6 +195,8 @@ impl Scheduler {
             running: Vec::with_capacity(budget.max_requests().get()),
             waiting: VecDeque::new(),
             preempted: Vec::new(),
+            padding: Vec::new(),
+            padding_reservation: None,
             budget,
             step: StepId::new(0),
             next_request_id: 0,
@@ -208,16 +241,47 @@ impl Scheduler {
         self.requests.get(slot)
     }
 
-    /// Live requests, in every phase.
+    /// Live requests, in every phase; padding dummies are not counted.
     #[must_use]
     pub fn request_count(&self) -> usize {
-        self.requests.len()
+        self.requests.len() - self.padding.len()
     }
 
     /// Whether the slab can take another request.
     #[must_use]
     pub fn has_room(&self) -> bool {
-        self.requests.len() < self.config.max_requests.get()
+        self.request_count() < self.config.max_requests.get()
+    }
+
+    /// Builds a scheduler over `pool` with the padding dummies of `reservation` in its slab:
+    /// one request per reserved block, occupying its slot from now on, never finishing and
+    /// never entering admission. The reservation was taken from `pool`, and returns to it when
+    /// the scheduler is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerError::PoolTooSmallForMaxModelLength`] when what the reservation left
+    /// of the pool cannot hold one maximum-length request.
+    pub fn with_padding(
+        config: SchedulerConfig,
+        pool: BlockPool,
+        reservation: PaddingReservation,
+    ) -> Result<Self, SchedulerError> {
+        let mut scheduler = Self::new(config, pool)?;
+        for block in reservation.block_ids() {
+            let id = RequestId::new(scheduler.next_request_id);
+            scheduler.next_request_id += 1;
+            let slot = scheduler.requests.insert(Request::padding(id, block));
+            scheduler.padding.push(slot);
+        }
+        scheduler.padding_reservation = Some(reservation);
+        Ok(scheduler)
+    }
+
+    /// The padding dummies' slots, in reservation order.
+    #[must_use]
+    pub fn padding(&self) -> &[RequestSlot] {
+        &self.padding
     }
 
     #[must_use]
@@ -325,7 +389,7 @@ impl Scheduler {
             let Some(token) = token else {
                 continue;
             };
-            request.egress().send(RequestEvent::Token {
+            request.send(RequestEvent::Token {
                 request: request.id(),
                 sequence: entry.sequence,
                 token,
@@ -394,7 +458,7 @@ impl Scheduler {
             kv.release(sequence);
         }
         request.set_phase(RequestPhase::Finished(finished));
-        request.egress().send(RequestEvent::Finished {
+        request.send(RequestEvent::Finished {
             request: request.id(),
             reason: finished.reason(),
             usage: request.usage(),
@@ -488,6 +552,8 @@ impl Scheduler {
             running: _,
             waiting: _,
             preempted,
+            padding: _,
+            padding_reservation: _,
             budget: _,
             step,
             next_request_id: _,
@@ -532,6 +598,8 @@ impl Scheduler {
                 running,
                 waiting,
                 preempted,
+                padding: _,
+                padding_reservation: _,
                 budget,
                 step,
                 next_request_id: _,
@@ -655,6 +723,9 @@ impl Drop for Scheduler {
             for sequence in request.sequences_mut() {
                 kv.release(sequence);
             }
+        }
+        if let Some(reservation) = self.padding_reservation.take() {
+            reservation.release(&mut self.pool);
         }
     }
 }
