@@ -5,6 +5,7 @@
 //! allocation on push or pop. Their capacity is the pipeline depth — one step in flight today,
 //! with room for a second when the executor can overlap.
 
+use crossbeam_utils::sync::Unparker;
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
 use crate::step::{StepCommand, StepResult};
@@ -19,16 +20,19 @@ pub struct EngineRings {
     results: Consumer<StepResult>,
 }
 
-/// The executor thread's ends: it consumes commands and produces results.
+/// The executor thread's ends: it consumes commands and produces results, waking the engine
+/// thread after every result.
 #[derive(Debug)]
 pub struct ExecutorRings {
     commands: Consumer<StepCommand>,
     results: Producer<StepResult>,
+    wake: Unparker,
 }
 
-/// Opens both rings, handing each thread its ends.
+/// Opens both rings, handing each thread its ends; `wake` unparks the engine thread after
+/// every result the executor pushes.
 #[must_use]
-pub fn rings() -> (EngineRings, ExecutorRings) {
+pub fn rings(wake: Unparker) -> (EngineRings, ExecutorRings) {
     let (command_producer, command_consumer) = RingBuffer::new(RING_CAPACITY);
     let (result_producer, result_consumer) = RingBuffer::new(RING_CAPACITY);
     (
@@ -39,6 +43,7 @@ pub fn rings() -> (EngineRings, ExecutorRings) {
         ExecutorRings {
             commands: command_consumer,
             results: result_producer,
+            wake,
         },
     )
 }
@@ -73,13 +78,21 @@ impl EngineRings {
     }
 }
 
+impl Drop for ExecutorRings {
+    /// The executor leaving is an event the engine must see at once, not at its deadline.
+    fn drop(&mut self) {
+        self.wake.unpark();
+    }
+}
+
 impl ExecutorRings {
     /// The next step command, if the engine has issued one.
     pub fn pop_command(&mut self) -> Option<StepCommand> {
         self.commands.pop().ok()
     }
 
-    /// Pushes `result` for the engine, handing it back when the ring is full.
+    /// Pushes `result` for the engine and wakes it, handing the result back when the ring is
+    /// full.
     ///
     /// # Errors
     ///
@@ -87,7 +100,9 @@ impl ExecutorRings {
     pub fn push_result(&mut self, result: StepResult) -> Result<(), StepResult> {
         self.results
             .push(result)
-            .map_err(|PushError::Full(result)| result)
+            .map_err(|PushError::Full(result)| result)?;
+        self.wake.unpark();
+        Ok(())
     }
 
     /// Whether the engine dropped its ends: no command will ever arrive again.
@@ -99,6 +114,11 @@ impl ExecutorRings {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
+    use crossbeam_utils::sync::Parker;
+
     use super::{rings, RING_CAPACITY};
     use crate::dispatch::{DispatchDecision, EagerReason};
     use crate::step::{StepCommand, StepResult};
@@ -119,7 +139,8 @@ mod tests {
 
     #[test]
     fn commands_and_results_cross_in_order_and_the_rings_bound_what_is_in_flight() {
-        let (mut engine, mut executor) = rings();
+        let parker = Parker::new();
+        let (mut engine, mut executor) = rings(parker.unparker().clone());
         assert!(engine.can_push());
         assert_eq!(executor.pop_command(), None, "nothing issued yet");
         assert_eq!(engine.pop_result(), None, "nothing produced yet");
@@ -163,14 +184,50 @@ mod tests {
 
     #[test]
     fn each_side_sees_the_other_leave() {
-        let (engine, executor) = rings();
+        let parker = Parker::new();
+        let (engine, executor) = rings(parker.unparker().clone());
         assert!(!engine.executor_gone());
         assert!(!executor.engine_gone());
         drop(executor);
         assert!(engine.executor_gone());
 
-        let (engine, executor) = rings();
+        let (engine, executor) = rings(parker.unparker().clone());
         drop(engine);
         assert!(executor.engine_gone());
+    }
+
+    #[test]
+    fn the_executor_leaving_wakes_a_parked_engine_thread() {
+        let parker = Parker::new();
+        let (engine, executor) = rings(parker.unparker().clone());
+        let engine_thread = thread::spawn(move || {
+            parker.park();
+            engine.executor_gone()
+        });
+        thread::sleep(Duration::from_millis(10));
+        assert!(!engine_thread.is_finished(), "parked until woken");
+
+        drop(executor);
+        assert!(
+            engine_thread.join().unwrap(),
+            "woken, and the loss is visible"
+        );
+    }
+
+    #[test]
+    fn a_pushed_result_wakes_a_parked_engine_thread() {
+        let parker = Parker::new();
+        let (_engine, mut executor) = rings(parker.unparker().clone());
+        let engine_thread = thread::spawn(move || parker.park());
+        thread::sleep(Duration::from_millis(10));
+        assert!(!engine_thread.is_finished(), "parked until woken");
+
+        executor
+            .push_result(StepResult {
+                step: StepId::new(1),
+                sampled: Vec::new(),
+            })
+            .unwrap();
+        engine_thread.join().unwrap();
     }
 }

@@ -5,6 +5,8 @@
 //! in flight, and publishes the heartbeat. All state is owned outright by the thread that runs the
 //! pass; no lock sits on the step path.
 
+use std::io::ErrorKind;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crossbeam_utils::sync::Parker;
@@ -67,6 +69,9 @@ pub enum EngineError {
         bucket: TokenCount,
         reserved: usize,
     },
+    /// The operating system refused the thread.
+    #[error("the engine thread could not be spawned: {0:?}")]
+    ThreadSpawn(ErrorKind),
 }
 
 /// What the engine's clients hold: ingress, control and the heartbeat.
@@ -75,6 +80,30 @@ pub struct EngineHandle {
     pub ingress: IngressSender,
     pub control: ControlSender,
     pub heartbeat: HeartbeatReader,
+}
+
+/// The running engine thread. It returns on shutdown or when the executor is gone, after every
+/// live request has been told.
+#[derive(Debug)]
+pub struct EngineThread {
+    join: JoinHandle<()>,
+}
+
+impl EngineThread {
+    /// Waits for the thread to return.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the engine thread panicked, carrying its panic on.
+    pub fn join(self) {
+        self.join.join().expect("the engine thread panicked");
+    }
+
+    /// Whether the thread has returned.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.join.is_finished()
+    }
 }
 
 /// Whether the loop goes on after a pass.
@@ -136,7 +165,7 @@ impl Engine {
             ingress(config.ingress_capacity.get(), parker.unparker().clone());
         let (control_sender, control_receiver) = control(parker.unparker().clone());
         let (heartbeat_publisher, heartbeat_reader) = heartbeat();
-        let (engine_rings, executor_rings) = rings();
+        let (engine_rings, executor_rings) = rings(parker.unparker().clone());
         let engine = Self {
             scheduler,
             dispatcher: Dispatcher::new(&config.dispatch),
@@ -156,6 +185,33 @@ impl Engine {
             heartbeat: heartbeat_reader,
         };
         Ok((engine, handle, executor_rings))
+    }
+
+    /// Builds the engine and runs it on its own thread, named `atoma-engine`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] for the same configurations [`Engine::new`] refuses, and when the
+    /// thread cannot be spawned.
+    pub fn spawn(
+        config: &EngineConfig,
+    ) -> Result<(EngineHandle, ExecutorRings, EngineThread), EngineError> {
+        let (engine, handle, executor_rings) = Self::new(config)?;
+        let join = thread::Builder::new()
+            .name("atoma-engine".to_owned())
+            .spawn(move || engine.run())
+            .map_err(|error| EngineError::ThreadSpawn(error.kind()))?;
+        Ok((handle, executor_rings, EngineThread { join }))
+    }
+
+    /// Passes until shutdown or the executor is gone, parking between passes until ingress,
+    /// control, the executor or the idle deadline wakes the thread.
+    pub fn run(mut self) {
+        info!("engine thread running");
+        while self.pass() == Pass::Continue {
+            self.park();
+        }
+        info!(passes = self.passes, "engine thread returning");
     }
 
     /// One pass: control first, then the executor's result, then ingress — so a slot the result

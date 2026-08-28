@@ -1,22 +1,32 @@
-//! Engine tests: every one drives the engine's pass in lockstep with a mock executor on the far
-//! side of the rings. No thread, no device.
+//! Engine tests: every one drives the engine with a mock executor on the far side of the rings —
+//! in lockstep from the test thread for the pass, and on threads of their own for the loop. No
+//! device.
+
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::dispatch::{BucketLadder, CaptureKind, DispatchConfig, SupportLevel};
 use crate::engine::mock::MockExecutor;
 use crate::engine::{
-    Control, Engine, EngineConfig, EngineError, EngineHandle, IngressRefused, Pass,
+    Control, Engine, EngineConfig, EngineError, EngineHandle, EngineThread, IngressRefused, Pass,
 };
 use crate::kv::HashAlgorithm;
 use crate::request::{
     egress, EgressReceiver, FinishReason, NewRequest, RequestEvent, SamplingParams, StopCriteria,
+    Usage,
 };
 use crate::scheduler::{AdmissionPolicy, SchedulerConfig};
 use crate::test_support::{requests, tokens};
+use crate::types::RequestId;
 
 const BLOCK_SIZE: usize = 4;
 const MAX_BATCH: usize = 4;
 const BLOCKS: usize = 16;
 const EOS: u32 = 99;
+
+/// Long enough that a test finishing in time proves a wake, not the deadline.
+const LONG_DEADLINE_MILLIS: u64 = 10_000;
+const WAIT: Duration = Duration::from_secs(5);
 
 fn config(max_requests: usize, ingress_capacity: usize) -> EngineConfig {
     EngineConfig {
@@ -318,4 +328,123 @@ fn a_bucket_ladder_the_reservation_cannot_pad_to_is_refused() {
         Engine::new(&too_small).unwrap_err(),
         EngineError::Padding(_)
     ));
+}
+
+/// Spawns the engine with a long idle deadline and the mock executor on its own thread.
+fn spawn_with_executor(idle_deadline_millis: u64) -> (EngineHandle, EngineThread) {
+    let mut config = config(8, 8);
+    config.idle_deadline_millis = idle_deadline_millis;
+    let (handle, rings, engine) = Engine::spawn(&config).unwrap();
+    let executor = MockExecutor::constant(rings, 1);
+    thread::spawn(move || executor.run_until_engine_gone());
+    (handle, engine)
+}
+
+/// A request runs to its finish on the thread with nothing but wakes: ingress wakes the engine
+/// to issue the step, and the executor's result wakes it to apply it, long before the deadline.
+#[test]
+fn the_thread_wakes_on_ingress_and_on_the_executor() {
+    let (handle, engine) = spawn_with_executor(LONG_DEADLINE_MILLIS);
+    let started = Instant::now();
+    let client = submit(&handle, 3, 2);
+
+    assert!(matches!(
+        client.recv_timeout(WAIT).unwrap(),
+        RequestEvent::Token { token: 1, .. }
+    ));
+    assert!(matches!(
+        client.recv_timeout(WAIT).unwrap(),
+        RequestEvent::Token { token: 1, .. }
+    ));
+    assert!(matches!(
+        client.recv_timeout(WAIT).unwrap(),
+        RequestEvent::Finished {
+            reason: FinishReason::MaxNewTokens,
+            ..
+        }
+    ));
+    assert!(started.elapsed() < Duration::from_millis(LONG_DEADLINE_MILLIS));
+
+    handle.control.try_send(Control::Shutdown).unwrap();
+    engine.join();
+}
+
+/// With nothing to do the thread still passes at its deadline, so an empty schedule can never
+/// wedge it: the heartbeat keeps advancing with no wake at all.
+#[test]
+fn the_thread_never_wedges_on_an_empty_schedule() {
+    let (handle, engine) = spawn_with_executor(1);
+    let deadline = Instant::now() + WAIT;
+    while handle.heartbeat.read().pass < 5 {
+        assert!(Instant::now() < deadline, "the heartbeat stopped");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(handle.heartbeat.read().age(SystemTime::now()) < WAIT);
+
+    handle.control.try_send(Control::Shutdown).unwrap();
+    engine.join();
+    assert!(handle.ingress.is_engine_gone());
+}
+
+#[test]
+fn a_drain_is_answered_from_the_thread_and_shutdown_returns_it() {
+    let (handle, engine) = spawn_with_executor(LONG_DEADLINE_MILLIS);
+    let client = submit(&handle, 3, 2);
+    assert!(matches!(
+        client.recv_timeout(WAIT).unwrap(),
+        RequestEvent::Token { .. }
+    ));
+    let (reply, drained) = flume::bounded(1);
+    handle.control.try_send(Control::Drain { reply }).unwrap();
+
+    let state = drained.recv_timeout(WAIT).unwrap();
+    assert!(state.draining);
+    assert_eq!(state.running, 0);
+    assert!(!state.step_in_flight);
+    assert_eq!(
+        client.try_iter().last(),
+        Some(RequestEvent::Finished {
+            request: RequestId::new(3),
+            reason: FinishReason::MaxNewTokens,
+            usage: Usage {
+                prompt_tokens: 3,
+                generated_tokens: 2
+            },
+        }),
+        "the running request finished before the drain was answered"
+    );
+
+    let late = submit(&handle, 3, 2);
+    handle.control.try_send(Control::Shutdown).unwrap();
+    engine.join();
+    assert_eq!(finish_reason(&late), Some(FinishReason::Shutdown));
+    assert!(handle.ingress.is_engine_gone());
+    assert!(handle.control.try_send(Control::Shutdown).is_err());
+}
+
+#[test]
+fn a_dead_executor_fails_every_pending_request_and_returns_the_thread() {
+    let mut config = config(8, 8);
+    config.idle_deadline_millis = LONG_DEADLINE_MILLIS;
+    let (handle, rings, engine) = Engine::spawn(&config).unwrap();
+    let client = submit(&handle, 3, 16);
+    let mut executor = MockExecutor::constant(rings, 1);
+    let deadline = Instant::now() + WAIT;
+    while !executor.serve_one() {
+        assert!(Instant::now() < deadline, "the step was never issued");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(matches!(
+        client.recv_timeout(WAIT).unwrap(),
+        RequestEvent::Token { .. }
+    ));
+
+    drop(executor);
+    let deadline = Instant::now() + WAIT;
+    while !engine.is_finished() {
+        assert!(Instant::now() < deadline, "the thread never noticed");
+        thread::sleep(Duration::from_millis(1));
+    }
+    engine.join();
+    assert_eq!(finish_reason(&client), Some(FinishReason::ExecutorLost));
 }
