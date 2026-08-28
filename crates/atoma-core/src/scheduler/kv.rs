@@ -29,8 +29,7 @@ impl Kv<'_> {
     /// them. Returns the blocks claimed.
     pub(crate) fn claim_prefix(&mut self, sequence: &mut Sequence) -> usize {
         debug_assert!(sequence.block_table.is_empty() && sequence.pinned == 0);
-        let candidates = sequence.hashable_prefix_blocks(self.block_size);
-        let hits = self.index.lookup(&sequence.chain[..candidates]);
+        let hits = self.index.lookup(sequence.hashable_prefix(self.block_size));
         if hits == 0 {
             return 0;
         }

@@ -71,11 +71,12 @@ impl Sequence {
         }
     }
 
-    /// Full blocks a prefix lookup may claim: every full block except the one holding the last
-    /// token, so at least one token is always computed and a logit exists to sample from.
+    /// The chain hashes a prefix lookup may claim: every full block except the one holding the
+    /// last token, so at least one token is always computed and a logit exists to sample from.
     #[must_use]
-    pub(crate) fn hashable_prefix_blocks(&self, block_size: TokenCount) -> usize {
-        (self.tokens.len().saturating_sub(1) / block_size.get()).min(self.chain.len())
+    pub(crate) fn hashable_prefix(&self, block_size: TokenCount) -> &[BlockHash] {
+        let blocks = (self.tokens.len().saturating_sub(1) / block_size.get()).min(self.chain.len());
+        &self.chain[..blocks]
     }
 
     /// The ordered block ids the sequence's KV occupies.

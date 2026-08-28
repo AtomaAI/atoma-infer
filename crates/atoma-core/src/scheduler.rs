@@ -727,8 +727,7 @@ impl Scheduler {
                 .get(slot)
                 .expect("waiting slots are live")
                 .sequences()[0];
-            let candidates = sequence.hashable_prefix_blocks(block_size);
-            let hits = self.index.lookup(&sequence.chain[..candidates]);
+            let hits = self.index.lookup(sequence.hashable_prefix(block_size));
             if best.is_none_or(|(_, best_hits)| hits > best_hits) {
                 best = Some((position, hits));
             }
