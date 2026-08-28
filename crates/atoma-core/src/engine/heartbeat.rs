@@ -34,14 +34,6 @@ pub struct Heartbeat {
     pub at: SystemTime,
 }
 
-impl Heartbeat {
-    /// How long ago the last pass completed, as of `now`.
-    #[must_use]
-    pub fn age(&self, now: SystemTime) -> Duration {
-        now.duration_since(self.at).unwrap_or(Duration::ZERO)
-    }
-}
-
 /// Opens a heartbeat: the engine thread publishes, anyone reads.
 #[must_use]
 pub fn heartbeat() -> (HeartbeatPublisher, HeartbeatReader) {
@@ -94,7 +86,6 @@ mod tests {
         let beat = reader.read();
         assert_eq!(beat.pass, 7);
         assert!(beat.at >= before - Duration::from_millis(1));
-        assert!(beat.age(SystemTime::now()) < Duration::from_secs(1));
-        assert_eq!(beat.age(before), Duration::ZERO, "never negative");
+        assert!(beat.at <= SystemTime::now());
     }
 }

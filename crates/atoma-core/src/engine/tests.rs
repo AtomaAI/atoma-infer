@@ -89,6 +89,16 @@ fn finish_reason(receiver: &EgressReceiver) -> Option<FinishReason> {
     })
 }
 
+/// Asserts the engine thread has exited: ingress refuses a request as a gone engine rather
+/// than as overload.
+fn assert_engine_gone(handle: &EngineHandle) {
+    let (request, _client) = new_request(1, 1);
+    assert!(matches!(
+        handle.ingress.try_send(request),
+        Err(IngressRefused::EngineGone(_))
+    ));
+}
+
 /// One engine pass followed by the executor serving whatever it issued.
 fn turn(engine: &mut Engine, executor: &mut MockExecutor) -> Pass {
     let pass = engine.pass();
@@ -310,7 +320,7 @@ fn a_gone_executor_fails_every_pending_request_and_exits() {
     assert_eq!(engine.pass(), Pass::Exit);
     assert_eq!(finish_reason(&running), Some(FinishReason::ExecutorLost));
     assert_eq!(finish_reason(&waiting), Some(FinishReason::ExecutorLost));
-    assert!(handle.ingress.is_engine_gone() || engine.state().live_requests == 0);
+    assert_eq!(engine.state().live_requests, 0);
 }
 
 #[test]
@@ -427,11 +437,12 @@ fn the_thread_never_wedges_on_an_empty_schedule() {
         assert!(Instant::now() < deadline, "the heartbeat stopped");
         thread::sleep(Duration::from_millis(1));
     }
-    assert!(handle.heartbeat.read().age(SystemTime::now()) < WAIT);
+    let beat = handle.heartbeat.read();
+    assert!(SystemTime::now().duration_since(beat.at).unwrap() < WAIT);
 
     handle.control.try_send(Control::Shutdown).unwrap();
     engine.join();
-    assert!(handle.ingress.is_engine_gone());
+    assert_engine_gone(&handle);
 }
 
 #[test]
@@ -466,7 +477,7 @@ fn a_drain_is_answered_from_the_thread_and_shutdown_returns_it() {
     handle.control.try_send(Control::Shutdown).unwrap();
     engine.join();
     assert_eq!(finish_reason(&late), Some(FinishReason::Shutdown));
-    assert!(handle.ingress.is_engine_gone());
+    assert_engine_gone(&handle);
     assert!(handle.control.try_send(Control::Shutdown).is_err());
 }
 

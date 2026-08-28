@@ -59,13 +59,6 @@ impl IngressSender {
             Err(TrySendError::Disconnected(request)) => Err(IngressRefused::EngineGone(request)),
         }
     }
-
-    /// Whether the engine thread has exited: the liveness check an API front puts behind its
-    /// health endpoint.
-    #[must_use]
-    pub fn is_engine_gone(&self) -> bool {
-        self.sender.is_disconnected()
-    }
 }
 
 impl IngressReceiver {
@@ -139,9 +132,7 @@ mod tests {
     fn a_gone_engine_is_reported_as_such_not_as_overload() {
         let parker = Parker::new();
         let (sender, receiver) = ingress(1, parker.unparker().clone());
-        assert!(!sender.is_engine_gone());
         drop(receiver);
-        assert!(sender.is_engine_gone());
         let mut clients = Vec::new();
         assert!(matches!(
             sender.try_send(request(&mut clients)),
