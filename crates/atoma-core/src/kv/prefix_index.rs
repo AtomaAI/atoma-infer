@@ -7,8 +7,28 @@
 //! slot ids — which slot holds a hash's bytes is the pool's separate residence lookup.
 
 use std::collections::HashMap;
+use std::mem;
 
 use crate::protocol::BlockHash;
+
+/// One slab slot: an occupied node, or a vacancy threading the free list.
+#[derive(Debug)]
+enum Slot {
+    Occupied(Node),
+    /// A removed node's slot, linking the next vacancy; `None` ends the free list.
+    Vacant {
+        next_free: Option<u32>,
+    },
+}
+
+impl Slot {
+    fn occupied(&self) -> Option<&Node> {
+        match self {
+            Slot::Occupied(node) => Some(node),
+            Slot::Vacant { next_free: _ } => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Node {
@@ -26,8 +46,9 @@ struct Node {
 /// Single-owner, like the pool: `&mut self` everywhere, no lock, no reference-counted sharing.
 #[derive(Debug, Default)]
 pub struct PrefixIndex {
-    slots: Vec<Option<Node>>,
-    free_slots: Vec<u32>,
+    slots: Vec<Slot>,
+    /// Head of the free list threaded through the vacant slots.
+    free_head: Option<u32>,
     node_by_hash: HashMap<BlockHash, u32>,
     clock: u64,
 }
@@ -98,7 +119,7 @@ impl PrefixIndex {
         let victim = self
             .slots
             .iter()
-            .flatten()
+            .filter_map(Slot::occupied)
             .filter(|node| node.pins == 0 && node.child_count == 0)
             .min_by_key(|node| node.last_touch)?
             .hash;
@@ -117,8 +138,10 @@ impl PrefixIndex {
             return false;
         }
         let parent = node.parent;
-        self.slots[slot as usize] = None;
-        self.free_slots.push(slot);
+        self.slots[slot as usize] = Slot::Vacant {
+            next_free: self.free_head,
+        };
+        self.free_head = Some(slot);
         self.node_by_hash.remove(&hash);
         if let Some(parent) = parent {
             self.node(parent).child_count -= 1;
@@ -155,11 +178,15 @@ impl PrefixIndex {
             pins: 0,
             last_touch: self.clock,
         };
-        let slot = if let Some(slot) = self.free_slots.pop() {
-            self.slots[slot as usize] = Some(node);
+        let slot = if let Some(slot) = self.free_head {
+            let vacated = mem::replace(&mut self.slots[slot as usize], Slot::Occupied(node));
+            let Slot::Vacant { next_free } = vacated else {
+                unreachable!("the free list links only vacant slots")
+            };
+            self.free_head = next_free;
             slot
         } else {
-            self.slots.push(Some(node));
+            self.slots.push(Slot::Occupied(node));
             u32::try_from(self.slots.len() - 1).expect("node count fits u32")
         };
         self.node_by_hash.insert(hash, slot);
@@ -167,9 +194,10 @@ impl PrefixIndex {
     }
 
     fn node(&mut self, slot: u32) -> &mut Node {
-        self.slots[slot as usize]
-            .as_mut()
-            .expect("slot indices are only handed out for occupied slots")
+        let Slot::Occupied(node) = &mut self.slots[slot as usize] else {
+            unreachable!("slot indices are handed out only for occupied slots")
+        };
+        node
     }
 }
 
