@@ -19,7 +19,7 @@ use tracing::debug;
 
 use crate::kv::BlockPool;
 use crate::request::{
-    FinishReason, NewRequest, Request, RequestEvent, RequestPhase, RequestSlab, Usage,
+    FinishReason, Finished, NewRequest, Request, RequestEvent, RequestPhase, RequestSlab, Usage,
 };
 use crate::scheduler::kv::{ensure_blocks, release_blocks, PoolExhausted};
 use crate::types::{RequestCount, RequestId, RequestSlot, SequenceIndex, StepId, TokenCount};
@@ -42,6 +42,9 @@ pub struct SchedulerConfig {
     pub window: RequestCount,
     /// Requests the slab holds before intake is refused.
     pub max_requests: RequestCount,
+    /// The model's end-of-sequence token ids; sampling one finishes a request that does not
+    /// ignore it.
+    pub eos_token_ids: Vec<u32>,
 }
 
 /// One row of a [`Scheduled`]: a sequence, what it computes this step, and whether it samples.
@@ -230,11 +233,13 @@ impl Scheduler {
         Ok(slot)
     }
 
-    /// One scheduling pass: running requests spend the budget first, then admission offers the
-    /// remainder to the waiting queue over the configured window.
+    /// One scheduling pass: requests whose client hung up retire, running requests spend the
+    /// budget first, then admission offers the remainder to the waiting queue over the
+    /// configured window.
     pub fn schedule(&mut self) -> Scheduled {
         self.step = StepId::new(self.step.get() + 1);
         self.budget.reset();
+        self.retire_cancelled_running();
         let mut entries = Vec::with_capacity(self.budget.max_requests().get());
         self.schedule_running(&mut entries);
         self.admit(&mut entries);
@@ -245,7 +250,8 @@ impl Scheduler {
     }
 
     /// Records the tokens step `scheduled` computed, appending each sampling entry's token from
-    /// `sampled`, in entry order.
+    /// `sampled` in entry order, telling every client what it got, and finishing the requests
+    /// that reached a stop criterion.
     ///
     /// # Panics
     ///
@@ -253,6 +259,7 @@ impl Scheduler {
     /// broke the step protocol, and the caller validates before applying.
     pub fn apply(&mut self, scheduled: &Scheduled, sampled: &[u32]) {
         let mut sampled = sampled.iter().copied();
+        let mut finished = Vec::new();
         for entry in &scheduled.entries {
             let request = self
                 .requests
@@ -260,17 +267,90 @@ impl Scheduler {
                 .expect("a scheduled slot stays live until its result is applied");
             let sequence = &mut request.sequences_mut()[entry.sequence.get() as usize];
             sequence.advance(entry.query_len.get());
-            if entry.samples {
-                let token = sampled
-                    .next()
-                    .expect("one sampled token per sampling entry");
-                sequence.push_token(token);
+            if !entry.samples {
+                continue;
+            }
+            let token = sampled
+                .next()
+                .expect("one sampled token per sampling entry");
+            sequence.push_token(token);
+            request.egress().send(RequestEvent::Token {
+                request: request.id(),
+                sequence: entry.sequence,
+                token,
+            });
+            if let Some(reason) = self.stop_reason(entry.slot, entry.sequence, token) {
+                finished.push((entry.slot, reason));
             }
         }
         assert!(
             sampled.next().is_none(),
             "more sampled tokens than sampling entries"
         );
+        for (slot, reason) in finished {
+            self.retire(slot, reason);
+        }
+    }
+
+    /// Why the request at `slot` stops after sampling `token`, if it does.
+    fn stop_reason(
+        &self,
+        slot: RequestSlot,
+        sequence: SequenceIndex,
+        token: u32,
+    ) -> Option<FinishReason> {
+        let request = self.requests.get(slot).expect("checked live by the caller");
+        let sequence = &request.sequences()[sequence.get() as usize];
+        let stop = request.stop();
+        if self.config.eos_token_ids.contains(&token) && !stop.ignore_eos {
+            Some(FinishReason::EndOfSequence)
+        } else if sequence.generated_count() >= stop.max_new_tokens.get() {
+            Some(FinishReason::MaxNewTokens)
+        } else if sequence.total() >= self.config.max_model_len.get() {
+            Some(FinishReason::MaxModelLength)
+        } else {
+            None
+        }
+    }
+
+    /// Finishes the request at `slot` for `reason`: its KV returns to the pool, its client hears
+    /// the finish, and its slot is freed. Works from any live phase.
+    fn retire(&mut self, slot: RequestSlot, reason: FinishReason) {
+        let mut request = self.requests.remove(slot);
+        let finished: Finished = match request.phase() {
+            RequestPhase::Waiting(waiting) => waiting.finish(reason),
+            RequestPhase::Running(running) => {
+                self.running.retain(|running| *running != slot);
+                running.finish(reason)
+            }
+            RequestPhase::Preempted(preempted) => preempted.finish(reason),
+            RequestPhase::Finished(_) | RequestPhase::Padding => {
+                unreachable!("only live requests retire")
+            }
+        };
+        for sequence in request.sequences_mut() {
+            release_blocks(&mut self.pool, sequence);
+        }
+        request.set_phase(RequestPhase::Finished(finished));
+        request.egress().send(RequestEvent::Finished {
+            request: request.id(),
+            reason: finished.reason(),
+            usage: request.usage(),
+        });
+        debug!(request = request.id().get(), reason = ?finished.reason(), "request finished");
+    }
+
+    /// Retires every running request whose client hung up, before any budget is spent on it.
+    fn retire_cancelled_running(&mut self) {
+        let mut cancelled = Vec::new();
+        for &slot in &self.running {
+            if self.requests.get(slot).is_some_and(Request::is_cancelled) {
+                cancelled.push(slot);
+            }
+        }
+        for slot in cancelled {
+            self.retire(slot, FinishReason::Cancelled);
+        }
     }
 
     /// Budgets every running request in batch order. A request the budget or the pool cannot
@@ -317,6 +397,11 @@ impl Scheduler {
                 return;
             };
             let request = self.requests.get_mut(slot).expect("waiting slots are live");
+            if request.is_cancelled() {
+                self.waiting.pop_front();
+                self.retire(slot, FinishReason::Cancelled);
+                continue;
+            }
             let RequestPhase::Waiting(waiting) = request.phase() else {
                 unreachable!("the waiting queue holds only Waiting requests")
             };

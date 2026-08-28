@@ -4,7 +4,11 @@
 //!
 //! - Ported with semantics intact: `add_sequence_group`, `schedule_simple`, `max_seqs`,
 //!   `prefill_schedule_max_prompt_len`, `prefill_schedule_max_seqs`,
-//!   `prefill_schedule_no_block_manager_capacity`, `scheduling_budget` (in `budget.rs`).
+//!   `prefill_schedule_no_block_manager_capacity`, `scheduling_budget` (in `budget.rs`),
+//!   `finished_sequence_groups_return_their_blocks`,
+//!   `sequential_requests_do_not_exhaust_the_block_pool`,
+//!   `abort_removes_the_sequence_group_from_every_queue` and `scheduler_abort_sequence_group`
+//!   (abort is the client dropping its egress receiver).
 //! - Rewritten, divergence documented on the test: `prefill_prioritized` (decode-first, mixed
 //!   batches), `prefill_schedule_token_budget` (a prompt over the remaining budget is chunked, not
 //!   refused).
@@ -18,7 +22,7 @@ use std::collections::VecDeque;
 use crate::kv::BlockPool;
 use crate::request::{
     egress, EgressReceiver, FinishReason, NewRequest, RequestEvent, RequestPhase, SamplingParams,
-    StopCriteria,
+    StopCriteria, Usage,
 };
 use crate::scheduler::{Scheduled, Scheduler, SchedulerConfig, SchedulerError};
 use crate::test_support::{requests, tokens};
@@ -27,6 +31,8 @@ use crate::types::{RequestSlot, StepId};
 const BLOCK_SIZE: usize = 4;
 const WINDOW: usize = 8;
 const MAX_REQUESTS: usize = 64;
+/// The end-of-sequence token; prompts count up from one and never reach it.
+const EOS: u32 = 99;
 
 /// A scheduler over `blocks` blocks whose max model length is exactly what the pool holds.
 fn scheduler(blocks: u32, token_budget: usize, max_batch: usize) -> Scheduler {
@@ -45,6 +51,7 @@ fn config(blocks: u32, token_budget: usize, max_batch: usize) -> SchedulerConfig
         block_size: tokens(BLOCK_SIZE),
         window: requests(WINDOW),
         max_requests: requests(MAX_REQUESTS),
+        eos_token_ids: vec![EOS],
     }
 }
 
@@ -88,10 +95,27 @@ fn new_request(
 
 /// Schedules one pass and applies it with token `1` sampled for every sampling entry.
 fn step(scheduler: &mut Scheduler) -> Scheduled {
+    step_sampling(scheduler, 1)
+}
+
+/// Schedules one pass and applies it with `token` sampled for every sampling entry.
+fn step_sampling(scheduler: &mut Scheduler, token: u32) -> Scheduled {
     let scheduled = scheduler.schedule();
-    let sampled = vec![1; scheduled.sampling_entries().count()];
+    let sampled = vec![token; scheduled.sampling_entries().count()];
     scheduler.apply(&scheduled, &sampled);
     scheduled
+}
+
+/// Every event a client has received so far.
+fn events(receiver: &EgressReceiver) -> Vec<RequestEvent> {
+    receiver.try_iter().collect()
+}
+
+fn finish_reason(receiver: &EgressReceiver) -> Option<FinishReason> {
+    events(receiver).into_iter().find_map(|event| match event {
+        RequestEvent::Finished { reason, .. } => Some(reason),
+        RequestEvent::Token { .. } => None,
+    })
 }
 
 fn slots(scheduled: &Scheduled) -> Vec<RequestSlot> {
@@ -313,7 +337,7 @@ fn a_prompt_the_pool_cannot_hold_now_waits_and_a_pool_too_small_is_refused() {
     let first = clients.submit(&mut scheduler, 7, 16);
     let second = clients.submit(&mut scheduler, 7, 16);
 
-    let scheduled = step(&mut scheduler);
+    let scheduled = scheduler.schedule();
     assert_eq!(slots(&scheduled), [first]);
     assert_eq!(scheduler.pool().free_count(), 0);
     assert_eq!(
@@ -321,6 +345,7 @@ fn a_prompt_the_pool_cannot_hold_now_waits_and_a_pool_too_small_is_refused() {
         &VecDeque::from([second]),
         "waits for blocks"
     );
+    scheduler.apply(&scheduled, &[1]);
 
     assert_eq!(
         Scheduler::new(config(4, 1000, 64), BlockPool::new(3)).unwrap_err(),
@@ -406,4 +431,178 @@ fn applying_fewer_tokens_than_sampling_entries_is_a_protocol_violation() {
     clients.submit(&mut scheduler, 4, 16);
     let scheduled = scheduler.schedule();
     scheduler.apply(&scheduled, &[]);
+}
+
+/// Port of `test_finished_sequence_groups_return_their_blocks`.
+#[test]
+fn finished_requests_return_their_blocks() {
+    let mut scheduler = scheduler(8, 100, 4);
+    let mut clients = Clients::default();
+    let baseline = scheduler.pool().free_count();
+    let submitted: Vec<_> = (0..4)
+        .map(|_| clients.submit(&mut scheduler, BLOCK_SIZE, 1))
+        .collect();
+
+    let scheduled = scheduler.schedule();
+    assert_eq!(
+        scheduler.pool().free_count(),
+        baseline - 4,
+        "one block per prompt"
+    );
+    scheduler.apply(&scheduled, &[1; 4]);
+
+    assert!(
+        scheduler.running().is_empty(),
+        "one token was all each asked for"
+    );
+    assert_eq!(
+        scheduler.request_count(),
+        0,
+        "finished requests free their slots"
+    );
+    assert_eq!(
+        scheduler.pool().free_count(),
+        baseline,
+        "every block came back"
+    );
+    for (slot, receiver) in submitted.iter().zip(&clients.receivers) {
+        assert!(scheduler.request(*slot).is_none());
+        let events = events(receiver);
+        assert!(matches!(events[0], RequestEvent::Token { token: 1, .. }));
+        assert!(matches!(
+            events[1],
+            RequestEvent::Finished {
+                reason: FinishReason::MaxNewTokens,
+                usage: Usage {
+                    prompt_tokens: BLOCK_SIZE,
+                    generated_tokens: 1
+                },
+                ..
+            }
+        ));
+        assert_eq!(events.len(), 2);
+    }
+}
+
+/// Port of `test_sequential_requests_do_not_exhaust_the_block_pool`: a pool smaller than the
+/// request stream keeps serving because every finished request returns its blocks.
+#[test]
+fn sequential_requests_do_not_exhaust_the_block_pool() {
+    let mut scheduler = scheduler(4, 100, 1);
+    let mut clients = Clients::default();
+    let baseline = scheduler.pool().free_count();
+    for i in 0..32 {
+        let slot = clients.submit(&mut scheduler, BLOCK_SIZE, 1);
+        let scheduled = step(&mut scheduler);
+        assert_eq!(slots(&scheduled), [slot], "request {i} was never scheduled");
+        assert_eq!(
+            scheduler.pool().free_count(),
+            baseline,
+            "request {i} leaked blocks"
+        );
+    }
+}
+
+/// Port of `test_abort_removes_the_sequence_group_from_every_queue` for the waiting queue: the
+/// client dropping its receiver is the abort; the cancelled request never admits and the survivor
+/// takes its place.
+#[test]
+fn a_dropped_receiver_retires_only_that_request_from_waiting() {
+    let mut scheduler = scheduler(8, 100, 4);
+    let mut clients = Clients::default();
+    let cancelled = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    let survivor = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    drop(clients.receivers.remove(0));
+
+    let scheduled = step(&mut scheduler);
+    assert_eq!(slots(&scheduled), [survivor]);
+    assert!(scheduler.request(cancelled).is_none());
+    assert_eq!(scheduler.request_count(), 1);
+}
+
+/// The same for the running queue: the cancelled request's blocks return and the survivor keeps
+/// decoding.
+#[test]
+fn a_dropped_receiver_retires_only_that_request_from_running() {
+    let mut scheduler = scheduler(8, 100, 4);
+    let mut clients = Clients::default();
+    let baseline = scheduler.pool().free_count();
+    let cancelled = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    let survivor = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    assert_eq!(slots(&step(&mut scheduler)), [cancelled, survivor]);
+    drop(clients.receivers.remove(0));
+
+    let scheduled = step(&mut scheduler);
+    assert_eq!(slots(&scheduled), [survivor]);
+    assert_eq!(scheduler.running(), [survivor]);
+    assert_eq!(scheduler.pool().free_count(), baseline - 2);
+    assert!(matches!(
+        events(&clients.receivers[0]).last(),
+        Some(RequestEvent::Token { token: 1, .. })
+    ));
+}
+
+/// Port of `test_scheduler_abort_sequence_group`: every client hanging up empties the scheduler.
+#[test]
+fn every_client_hanging_up_empties_the_scheduler() {
+    let mut scheduler = scheduler(8, 100, 64);
+    let mut clients = Clients::default();
+    for _ in 0..4 {
+        clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    }
+    step(&mut scheduler);
+    assert_eq!(scheduler.request_count(), 4);
+    clients.receivers.clear();
+    let scheduled = step(&mut scheduler);
+    assert!(scheduled.is_empty());
+    assert_eq!(scheduler.request_count(), 0);
+    assert_eq!(scheduler.pool().free_count(), 8);
+}
+
+#[test]
+fn an_end_of_sequence_token_finishes_a_request_unless_it_ignores_eos() {
+    let mut scheduler = scheduler(8, 100, 64);
+    let mut clients = Clients::default();
+    let stops = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    let (sender, receiver) = egress();
+    let ignores = scheduler
+        .intake(NewRequest {
+            stop: StopCriteria {
+                max_new_tokens: tokens(16),
+                ignore_eos: true,
+            },
+            ..new_request(BLOCK_SIZE, 16, sender)
+        })
+        .unwrap();
+    clients.receivers.push(receiver);
+
+    let scheduled = step_sampling(&mut scheduler, EOS);
+    assert_eq!(slots(&scheduled), [stops, ignores]);
+    assert_eq!(scheduler.running(), [ignores]);
+    assert_eq!(
+        finish_reason(&clients.receivers[0]),
+        Some(FinishReason::EndOfSequence)
+    );
+    assert_eq!(finish_reason(&clients.receivers[1]), None);
+    assert_eq!(
+        scheduler.request(ignores).unwrap().sequences()[0].tokens(),
+        &[1, 2, 3, 4, EOS]
+    );
+}
+
+#[test]
+fn reaching_the_max_model_length_finishes_a_request() {
+    let mut scheduler = scheduler(2, 100, 64);
+    let mut clients = Clients::default();
+    let slot = clients.submit(&mut scheduler, 6, 16);
+
+    step(&mut scheduler);
+    assert_eq!(scheduler.request(slot).unwrap().sequences()[0].total(), 7);
+    step(&mut scheduler);
+    assert!(scheduler.request(slot).is_none(), "eight of eight tokens");
+    assert_eq!(
+        finish_reason(&clients.receivers[0]),
+        Some(FinishReason::MaxModelLength)
+    );
+    assert_eq!(scheduler.pool().free_count(), 2);
 }
