@@ -88,7 +88,7 @@ mod tests {
         assert!(!sender.is_cancelled());
         drop(receiver);
         assert!(sender.is_cancelled());
-        // Nothing to unwrap, nothing to ignore: the send is a statement.
+        // Sending after the cancel returns nothing, so there is no failure to handle here.
         sender.send(token(1));
         assert!(sender.is_cancelled());
     }

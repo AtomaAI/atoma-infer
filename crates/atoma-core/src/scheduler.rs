@@ -6,10 +6,9 @@
 //! hashed and indexed at once. A running request the pool cannot grow evicts unpinned cache
 //! first and only then preempts the most recently admitted request, which releases its KV and
 //! later recomputes from whatever the index still holds; nothing is ever swapped out to be
-//! brought back. It answers in indices
-//! and counts — which sequences run, how many tokens each computes, which entries sample — never in
-//! copied request state. The scheduler owns the request slab and the block pool outright; nothing
-//! here is shared or locked.
+//! brought back. A pass answers in indices and counts — which sequences run, how many tokens each
+//! computes, which entries sample — never in copied request state. The scheduler owns the request
+//! slab and the block pool outright; nothing here is shared or locked.
 
 mod admission;
 mod budget;
