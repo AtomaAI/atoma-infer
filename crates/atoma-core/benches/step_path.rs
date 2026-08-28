@@ -49,7 +49,7 @@ const CHURN_NEW_TOKENS: usize = 16;
 const CHURN_MAX_BATCH: usize = 64;
 const CHURN_MAX_MODEL_TOKENS: usize = CHURN_PROMPT_TOKENS + CHURN_NEW_TOKENS + 1;
 
-fn count(value: usize) -> TokenCount {
+fn tokens(value: usize) -> TokenCount {
     TokenCount::new(value).expect("bench counts are nonzero")
 }
 
@@ -66,10 +66,10 @@ fn decode_config() -> EngineConfig {
     let live = DECODE_BATCH + DECODE_WAITING;
     EngineConfig {
         scheduler: SchedulerConfig {
-            token_budget: count(DECODE_BATCH * DECODE_CONTEXT_TOKENS),
+            token_budget: tokens(DECODE_BATCH * DECODE_CONTEXT_TOKENS),
             max_batch: requests(DECODE_BATCH),
-            max_model_len: count(DECODE_CONTEXT_TOKENS + decode_headroom),
-            block_size: count(BLOCK_SIZE),
+            max_model_len: tokens(DECODE_CONTEXT_TOKENS + decode_headroom),
+            block_size: tokens(BLOCK_SIZE),
             window: requests(DECODE_WAITING),
             admission: AdmissionPolicy::LongestPrefixMatch,
             max_requests: requests(live),
@@ -92,10 +92,10 @@ fn churn_config() -> EngineConfig {
     let max_batch = CHURN_MAX_BATCH;
     EngineConfig {
         scheduler: SchedulerConfig {
-            token_budget: count(2048),
+            token_budget: tokens(2048),
             max_batch: requests(max_batch),
-            max_model_len: count(CHURN_MAX_MODEL_TOKENS),
-            block_size: count(BLOCK_SIZE),
+            max_model_len: tokens(CHURN_MAX_MODEL_TOKENS),
+            block_size: tokens(BLOCK_SIZE),
             window: requests(CHURN_WAITING),
             admission: AdmissionPolicy::LongestPrefixMatch,
             max_requests: requests(live),
@@ -127,7 +127,7 @@ fn new_request(prompt: Vec<u32>, max_new_tokens: usize) -> (NewRequest, EgressRe
         prompt,
         sampling: SamplingParams::default(),
         stop: StopCriteria {
-            max_new_tokens: count(max_new_tokens),
+            max_new_tokens: tokens(max_new_tokens),
             ignore_eos: true,
         },
         egress: sender,
@@ -177,8 +177,8 @@ fn record(histogram: &mut Histogram<u64>, micros: u128) {
         .expect("within bounds");
 }
 
-/// Drains every client, dropping those whose request finished, and returns how many finished.
-fn recycle(clients: &mut Vec<EgressReceiver>) -> usize {
+/// Drains every client and drops those whose request finished, returning how many did.
+fn take_finished(clients: &mut Vec<EgressReceiver>) -> usize {
     let before = clients.len();
     clients.retain(|client| {
         let mut running = true;
@@ -263,7 +263,7 @@ fn measure_churn() -> Histogram<u64> {
         assert_eq!(engine.pass(), Pass::Continue);
         let elapsed = started.elapsed();
         answer(&mut rings);
-        let done = recycle(&mut clients);
+        let done = take_finished(&mut clients);
         finished += done;
         for _ in 0..done {
             let (request, receiver) = new_request(family_prompt(next), CHURN_NEW_TOKENS);
@@ -319,8 +319,10 @@ fn main() -> ExitCode {
     tracing_subscriber::fmt().with_target(false).init();
     let decode = measure_decode();
     let churn = measure_churn();
-    let breached = over_limit("decode", &decode) | over_limit("prefix churn", &churn);
-    if breached {
+    // Both are reported before either can fail the run.
+    let decode_over = over_limit("decode", &decode);
+    let churn_over = over_limit("prefix churn", &churn);
+    if decode_over || churn_over {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
