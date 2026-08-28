@@ -162,11 +162,18 @@ _Avoid_: seq len (in prose), total (in a step command)
 The longest sequence the model serves. The only meaning "context window" carries here.
 _Avoid_: context length (for the maximum), max context
 
+**Intake**:
+Taking a submitted request off ingress into Waiting: minting its request id, giving it a slab
+slot and queueing it — or finishing it on the spot when its prompt can never run. The one
+transition into Waiting, and never a word for admission.
+_Avoid_: enqueue, accept, submit (for this transition), admission (for this)
+
 **Admission**:
 Moving a request from Waiting or Preempted into Running under the admission policy, which
 examines a bounded window of candidates per pass and offers preempted requests first, last-in
 first-out. The one transition into Running; nothing else is called admission.
-_Avoid_: scheduling (for this transition), pickup, intake, resume
+_Avoid_: scheduling (for this transition), pickup, intake (which is the transition into
+Waiting), resume
 
 **Preemption**:
 Releasing a running request's KV and returning it to run again from whatever the prefix index
