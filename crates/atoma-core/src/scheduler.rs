@@ -11,6 +11,7 @@
 //! copied request state. The scheduler owns the request slab and the block pool outright; nothing
 //! here is shared or locked.
 
+mod admission;
 mod budget;
 mod kv;
 #[cfg(test)]
@@ -29,6 +30,7 @@ use crate::request::{
 use crate::scheduler::kv::{Kv, PoolExhausted};
 use crate::types::{RequestCount, RequestId, RequestSlot, SequenceIndex, StepId, TokenCount};
 
+pub use admission::AdmissionPolicy;
 pub use budget::TokenBudget;
 
 /// What the scheduler is built from, fixed for the process lifetime.
@@ -45,6 +47,8 @@ pub struct SchedulerConfig {
     pub block_size: TokenCount,
     /// Admission candidates one pass examines.
     pub window: RequestCount,
+    /// How admission orders the window.
+    pub admission: AdmissionPolicy,
     /// Requests the slab holds before intake is refused.
     pub max_requests: RequestCount,
     /// The model's end-of-sequence token ids; sampling one finishes a request that does not
@@ -508,17 +512,13 @@ impl Scheduler {
     }
 
     /// Admission: examines up to the window of candidates — the preempted stack top first, last
-    /// in first out, then the front of the waiting queue first come first served — claims each
+    /// in first out, then the waiting request the policy picks from the window — claims each
     /// one's cached prefix, and stops at the first request the budget or the pool cannot serve.
     /// Admission never preempts.
     fn admit(&mut self, entries: &mut Vec<Entry>) {
         for _ in 0..self.config.window.get() {
-            let (slot, from) = match self.preempted.last() {
-                Some(&slot) => (slot, Candidate::Preempted),
-                None => match self.waiting.front() {
-                    Some(&slot) => (slot, Candidate::Waiting),
-                    None => return,
-                },
+            let Some((slot, from)) = self.next_candidate() else {
+                return;
             };
             if self.requests.get(slot).is_some_and(Request::is_cancelled) {
                 self.retire(slot, FinishReason::Cancelled);
@@ -562,11 +562,11 @@ impl Scheduler {
                     preempted.pop();
                     phase.admit(*step)
                 }
-                (Candidate::Waiting, RequestPhase::Waiting(phase)) => {
-                    waiting.pop_front();
+                (Candidate::Waiting { position }, RequestPhase::Waiting(phase)) => {
+                    waiting.remove(position);
                     phase.admit(*step)
                 }
-                (Candidate::Preempted | Candidate::Waiting, _) => {
+                (Candidate::Preempted | Candidate::Waiting { .. }, _) => {
                     unreachable!("each admission queue holds only its own phase")
                 }
             };
@@ -584,11 +584,67 @@ impl Scheduler {
     }
 }
 
+impl Scheduler {
+    /// The next admission candidate: the preempted stack top, or the waiting request the policy
+    /// picks from the window. Cancelled waiting requests inside the window retire on the way.
+    fn next_candidate(&mut self) -> Option<(RequestSlot, Candidate)> {
+        if let Some(&slot) = self.preempted.last() {
+            return Some((slot, Candidate::Preempted));
+        }
+        self.retire_cancelled_in_window();
+        let position = match self.config.admission {
+            AdmissionPolicy::Fcfs => 0,
+            AdmissionPolicy::LongestPrefixMatch => self.longest_prefix_position()?,
+        };
+        self.waiting
+            .get(position)
+            .map(|&slot| (slot, Candidate::Waiting { position }))
+    }
+
+    /// Retires every cancelled request within the window, so none sits there unexamined.
+    fn retire_cancelled_in_window(&mut self) {
+        let mut cancelled = Vec::new();
+        for &slot in self.waiting.iter().take(self.config.window.get()) {
+            if self.requests.get(slot).is_some_and(Request::is_cancelled) {
+                cancelled.push(slot);
+            }
+        }
+        for slot in cancelled {
+            self.retire(slot, FinishReason::Cancelled);
+        }
+    }
+
+    /// The position in the waiting queue, within the window, of the request with the most
+    /// cached prefix blocks; ties go to the earliest arrival. A selection, never a sort.
+    fn longest_prefix_position(&mut self) -> Option<usize> {
+        let block_size = self.config.block_size;
+        let mut best: Option<(usize, usize)> = None;
+        for (position, &slot) in self
+            .waiting
+            .iter()
+            .take(self.config.window.get())
+            .enumerate()
+        {
+            let sequence = &self
+                .requests
+                .get(slot)
+                .expect("waiting slots are live")
+                .sequences()[0];
+            let candidates = sequence.hashable_prefix_blocks(block_size);
+            let hits = self.index.lookup(&sequence.chain[..candidates]);
+            if best.is_none_or(|(_, best_hits)| hits > best_hits) {
+                best = Some((position, hits));
+            }
+        }
+        best.map(|(position, _)| position)
+    }
+}
+
 /// Which admission queue a candidate came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Candidate {
     Preempted,
-    Waiting,
+    Waiting { position: usize },
 }
 
 impl Drop for Scheduler {
