@@ -1,20 +1,19 @@
 //! The block pool: preallocated device-block bookkeeping owned by one thread.
 //!
-//! Every block is preallocated and addressed by index; the free list is an intrusive
-//! doubly-linked list of indices, so no step-path operation allocates, locks, or chases heap
-//! pointers. A block leaves the pool only as a [`BlockLease`], and nothing frees or reassigns a
-//! block by id: the only paths back to the free list are surrendering the lease or evicting an
-//! unleased cached block, so a leased block cannot be evicted by construction.
+//! Every block is preallocated and addressed by index; the free list and the cached list are
+//! intrusive doubly-linked lists of indices, so no step-path operation allocates, locks, or
+//! chases heap pointers. A block leaves the pool only as a [`BlockLease`], and nothing frees or
+//! reassigns a block by id: the only paths back to the free list are surrendering the lease or
+//! evicting an unleased cached block, so a leased block cannot be evicted by construction.
 
 use std::collections::HashMap;
 use std::thread;
 
 use crate::types::{BlockHash, BlockId};
 
-/// The links' null: where a pointer-based list would hold a null pointer, the index-based free
-/// list holds `NIL` — in a block's `prev`/`next` for a missing neighbor, and in `free_head`/
-/// `free_tail` for an empty list. Never a valid block index: indices stay below the pool's
-/// `u32` block count.
+/// The links' null: where a pointer-based list would hold a null pointer, the index-based lists
+/// hold `NIL` — in a block's `prev`/`next` for a missing neighbor, and in a list's `head`/`tail`
+/// when it is empty. Never a valid block index: indices stay below the pool's `u32` block count.
 const NIL: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +22,7 @@ enum BlockState {
     Free,
     /// Held by exactly one live [`BlockLease`].
     Leased,
-    /// Holding identified bytes with no lease: evictable.
+    /// On the cached list, holding identified bytes with no lease: evictable.
     Cached,
 }
 
@@ -34,6 +33,63 @@ struct BlockMeta {
     hash: Option<BlockHash>,
     prev: u32,
     next: u32,
+}
+
+/// The ends and length of one list threaded through the blocks' `prev`/`next` links.
+///
+/// A block sits on at most one list at a time — free or cached, never both, and a leased block
+/// on neither — so every list shares the same two links per block. Blocks leave from the head
+/// and join at the tail, so each list recycles FIFO.
+#[derive(Debug, Clone, Copy)]
+struct BlockList {
+    head: u32,
+    tail: u32,
+    len: u32,
+}
+
+impl BlockList {
+    const EMPTY: Self = Self {
+        head: NIL,
+        tail: NIL,
+        len: 0,
+    };
+
+    fn push_tail(&mut self, blocks: &mut [BlockMeta], index: u32) {
+        blocks[index as usize].prev = self.tail;
+        blocks[index as usize].next = NIL;
+        if self.tail == NIL {
+            self.head = index;
+        } else {
+            blocks[self.tail as usize].next = index;
+        }
+        self.tail = index;
+        self.len += 1;
+    }
+
+    fn unlink(&mut self, blocks: &mut [BlockMeta], index: u32) {
+        let prev = blocks[index as usize].prev;
+        let next = blocks[index as usize].next;
+        if prev == NIL {
+            self.head = next;
+        } else {
+            blocks[prev as usize].next = next;
+        }
+        if next == NIL {
+            self.tail = prev;
+        } else {
+            blocks[next as usize].prev = prev;
+        }
+        self.len -= 1;
+    }
+
+    fn pop_head(&mut self, blocks: &mut [BlockMeta]) -> Option<u32> {
+        if self.head == NIL {
+            return None;
+        }
+        let head = self.head;
+        self.unlink(blocks, head);
+        Some(head)
+    }
 }
 
 /// Holds one pool block for exactly one owner.
@@ -70,7 +126,7 @@ impl Drop for BlockLease {
     }
 }
 
-/// Preallocated, index-based pool of device blocks with an intrusive free list.
+/// Preallocated, index-based pool of device blocks with intrusive free and cached lists.
 ///
 /// Single-owner: `&mut self` everywhere, no lock, no reference count. Identity stays separate
 /// from residence — [`BlockPool::residence`] answers which slot holds a hash's bytes, and every
@@ -80,45 +136,42 @@ pub struct BlockPool {
     blocks: Box<[BlockMeta]>,
     /// Which slot holds each assigned hash's bytes, leased or cached.
     by_hash: HashMap<BlockHash, BlockId>,
-    free_head: u32,
-    free_tail: u32,
-    free_count: u32,
-    cached_count: u32,
+    free: BlockList,
+    /// Cached blocks in the order they were released, so the longest-cached evicts first.
+    cached: BlockList,
 }
 
 impl BlockPool {
     /// Builds a pool of `block_count` free blocks, allocating everything it will ever hold.
     #[must_use]
     pub fn new(block_count: u32) -> Self {
-        let blocks = (0..block_count)
-            .map(|index| BlockMeta {
+        let mut blocks: Box<[BlockMeta]> = (0..block_count)
+            .map(|_| BlockMeta {
                 state: BlockState::Free,
                 hash: None,
-                prev: index.checked_sub(1).unwrap_or(NIL),
-                next: if index + 1 < block_count {
-                    index + 1
-                } else {
-                    NIL
-                },
+                prev: NIL,
+                next: NIL,
             })
             .collect();
+        let mut free = BlockList::EMPTY;
+        for index in 0..block_count {
+            free.push_tail(&mut blocks, index);
+        }
         Self {
             blocks,
             by_hash: HashMap::with_capacity(block_count as usize),
-            free_head: if block_count == 0 { NIL } else { 0 },
-            free_tail: block_count.checked_sub(1).unwrap_or(NIL),
-            free_count: block_count,
-            cached_count: 0,
+            free,
+            cached: BlockList::EMPTY,
         }
     }
 
     /// Leases the block at the head of the free list, or `None` when every block is leased or
     /// cached. The caller decides whether to evict and retry.
     pub fn lease(&mut self) -> Option<BlockLease> {
-        let head = self.pop_free_head()?;
-        self.blocks[head.index()].state = BlockState::Leased;
+        let head = self.free.pop_head(&mut self.blocks)?;
+        self.blocks[head as usize].state = BlockState::Leased;
         Some(BlockLease {
-            block: head,
+            block: BlockId::new(head),
             released: false,
         })
     }
@@ -141,12 +194,12 @@ impl BlockPool {
     /// an anonymous block returns straight to the free list.
     pub fn release(&mut self, mut lease: BlockLease) {
         lease.released = true;
-        let index = lease.block.index();
-        if self.blocks[index].hash.is_some() {
-            self.blocks[index].state = BlockState::Cached;
-            self.cached_count += 1;
+        let index = lease.block.get();
+        if self.blocks[index as usize].hash.is_some() {
+            self.blocks[index as usize].state = BlockState::Cached;
+            self.cached.push_tail(&mut self.blocks, index);
         } else {
-            self.push_free_tail(lease.block);
+            self.free_block(index);
         }
     }
 
@@ -156,28 +209,24 @@ impl BlockPool {
     /// leased, since a lease keeps its block out of the cached state entirely.
     pub fn evict(&mut self, hash: BlockHash) -> Option<BlockId> {
         let block = *self.by_hash.get(&hash)?;
-        let meta = &mut self.blocks[block.index()];
-        if meta.state != BlockState::Cached {
+        let index = block.get();
+        if self.blocks[index as usize].state != BlockState::Cached {
             return None;
         }
-        meta.hash = None;
+        self.cached.unlink(&mut self.blocks, index);
         self.by_hash.remove(&hash);
-        self.cached_count -= 1;
-        self.push_free_tail(block);
+        self.free_block(index);
         Some(block)
     }
 
-    /// Evicts some cached block regardless of which hash it holds, returning the hash and the
-    /// freed slot; `None` when nothing is cached. For callers whose cached bytes have no
+    /// Evicts the longest-cached block regardless of which hash it holds, returning the hash and
+    /// the freed slot; `None` when nothing is cached. For callers whose cached bytes have no
     /// reader; a pin-aware caller evicts by hash instead.
     pub fn evict_any(&mut self) -> Option<(BlockHash, BlockId)> {
-        let hash = self.blocks.iter().find_map(|meta| {
-            if meta.state == BlockState::Cached {
-                meta.hash
-            } else {
-                None
-            }
-        })?;
+        if self.cached.head == NIL {
+            return None;
+        }
+        let hash = self.blocks[self.cached.head as usize].hash?;
         let block = self.evict(hash)?;
         Some((hash, block))
     }
@@ -192,13 +241,13 @@ impl BlockPool {
     /// Blocks on the free list.
     #[must_use]
     pub fn free_count(&self) -> usize {
-        self.free_count as usize
+        self.free.len as usize
     }
 
     /// Blocks a lease could obtain: free now, plus cached blocks an eviction would free.
     #[must_use]
     pub fn available(&self) -> usize {
-        (self.free_count + self.cached_count) as usize
+        (self.free.len + self.cached.len) as usize
     }
 
     /// Every block this pool was built with.
@@ -207,44 +256,11 @@ impl BlockPool {
         self.blocks.len()
     }
 
-    /// Takes the block at the front of the free list, or `None` when the list is empty.
-    /// Blocks leave from the head and return at the tail, so freed blocks recycle FIFO.
-    fn pop_free_head(&mut self) -> Option<BlockId> {
-        if self.free_head == NIL {
-            return None;
-        }
-        let head = self.free_head;
-        let next = self.blocks[head as usize].next;
-        self.free_head = next;
-        if next == NIL {
-            // The popped head was also the tail, so the list is now empty. A stale tail would
-            // let push_free_tail link the next freed block behind this now-leased one.
-            self.free_tail = NIL;
-        } else {
-            // The new head has no predecessor.
-            self.blocks[next as usize].prev = NIL;
-        }
-        self.free_count -= 1;
-        Some(BlockId::new(head))
-    }
-
-    /// Appends `block` at the back of the free list, resetting its metadata to `Free`.
-    fn push_free_tail(&mut self, block: BlockId) {
-        let index = block.get();
-        self.blocks[index as usize] = BlockMeta {
-            state: BlockState::Free,
-            hash: None,
-            prev: self.free_tail,
-            next: NIL,
-        };
-        if self.free_tail == NIL {
-            // Appending to an empty list: this block becomes head and tail at once.
-            self.free_head = index;
-        } else {
-            self.blocks[self.free_tail as usize].next = index;
-        }
-        self.free_tail = index;
-        self.free_count += 1;
+    /// Returns an off-list block to the back of the free list, anonymous and `Free`.
+    fn free_block(&mut self, index: u32) {
+        self.blocks[index as usize].state = BlockState::Free;
+        self.blocks[index as usize].hash = None;
+        self.free.push_tail(&mut self.blocks, index);
     }
 }
 
@@ -254,11 +270,21 @@ mod tests {
 
     use super::{BlockLease, BlockPool};
     use crate::kv::test_support::hash_of;
+    use crate::types::BlockHash;
 
     fn release_all(pool: &mut BlockPool, leases: Vec<BlockLease>) {
         for lease in leases {
             pool.release(lease);
         }
+    }
+
+    /// Leases one block, claims `hash` for it and releases it, so it is resident as cache.
+    fn cache(pool: &mut BlockPool, hash: BlockHash) {
+        let lease = pool
+            .lease()
+            .expect("the pool has a free block to cache into");
+        assert!(pool.assign_hash(&lease, hash));
+        pool.release(lease);
     }
 
     #[test]
@@ -317,10 +343,8 @@ mod tests {
     #[test]
     fn evicting_a_cached_block_frees_it_and_forgets_its_residence() {
         let mut pool = BlockPool::new(1);
-        let lease = pool.lease().unwrap();
         let hash = hash_of(&[1, 2, 3, 4]);
-        assert!(pool.assign_hash(&lease, hash));
-        pool.release(lease);
+        cache(&mut pool, hash);
         assert_eq!(pool.free_count(), 0);
 
         let freed = pool.evict(hash).expect("a cached block evicts");
@@ -399,12 +423,45 @@ mod tests {
     }
 
     #[test]
+    fn evict_any_takes_the_longest_cached_block_first() {
+        let mut pool = BlockPool::new(3);
+        let hashes = [hash_of(&[1]), hash_of(&[2]), hash_of(&[3])];
+        for hash in hashes {
+            cache(&mut pool, hash);
+        }
+        assert_eq!(pool.available(), 3);
+
+        assert_eq!(pool.evict_any().map(|(hash, _)| hash), Some(hashes[0]));
+        assert_eq!(pool.evict_any().map(|(hash, _)| hash), Some(hashes[1]));
+        assert_eq!(pool.evict_any().map(|(hash, _)| hash), Some(hashes[2]));
+        assert_eq!(pool.free_count(), 3);
+    }
+
+    #[test]
+    fn evicting_by_hash_from_the_middle_keeps_the_cached_order() {
+        let mut pool = BlockPool::new(3);
+        let hashes = [hash_of(&[1]), hash_of(&[2]), hash_of(&[3])];
+        for hash in hashes {
+            cache(&mut pool, hash);
+        }
+
+        assert!(pool.evict(hashes[1]).is_some());
+        assert_eq!(pool.available(), 3);
+        assert_eq!(pool.free_count(), 1);
+        assert_eq!(pool.evict_any().map(|(hash, _)| hash), Some(hashes[0]));
+        assert_eq!(pool.evict_any().map(|(hash, _)| hash), Some(hashes[2]));
+        assert_eq!(pool.evict_any(), None);
+        assert_eq!(pool.free_count(), 3);
+    }
+
+    #[test]
     fn a_zero_capacity_pool_leases_nothing() {
         let mut pool = BlockPool::new(0);
         assert_eq!(pool.block_count(), 0);
         assert_eq!(pool.free_count(), 0);
         assert_eq!(pool.available(), 0);
         assert!(pool.lease().is_none());
+        assert_eq!(pool.evict_any(), None);
     }
 
     #[cfg(debug_assertions)]
