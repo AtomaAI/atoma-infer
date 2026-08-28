@@ -220,16 +220,38 @@ impl Scheduler {
         &self.index
     }
 
-    /// The KV substrate and the request slab, borrowed apart so a sequence and the pool can
-    /// change together.
-    fn kv_and_requests(&mut self) -> (Kv<'_>, &mut RequestSlab) {
-        let kv = Kv {
-            pool: &mut self.pool,
-            index: &mut self.index,
-            algorithm: self.config.hash_algorithm,
-            block_size: self.config.block_size,
-        };
-        (kv, &mut self.requests)
+    /// The scheduler borrowed apart, so a sequence, the KV substrate, the queues and the budget
+    /// can change together in one pass.
+    fn parts(&mut self) -> Parts<'_> {
+        let Scheduler {
+            config,
+            requests,
+            pool,
+            index,
+            running,
+            waiting,
+            preempted,
+            padding: _,
+            padding_reservation: _,
+            admission_open: _,
+            budget,
+            step,
+            next_request_id: _,
+        } = self;
+        Parts {
+            kv: Kv {
+                pool,
+                index,
+                algorithm: config.hash_algorithm,
+                block_size: config.block_size,
+            },
+            requests,
+            running,
+            waiting,
+            preempted,
+            budget,
+            step: *step,
+        }
     }
 
     /// The step the last pass scheduled.
@@ -400,8 +422,9 @@ impl Scheduler {
         let mut sampled = sampled.iter().copied();
         let mut finished = Vec::new();
         for entry in &scheduled.entries {
-            let (mut kv, requests) = self.kv_and_requests();
-            let request = requests
+            let mut parts = self.parts();
+            let request = parts
+                .requests
                 .get_mut(entry.slot)
                 .expect("a scheduled slot stays live until its result is applied");
             let sequence = &mut request.sequences_mut()[entry.sequence.get() as usize];
@@ -413,7 +436,7 @@ impl Scheduler {
                 sequence.push_token(token);
                 token
             });
-            kv.cache_filled_blocks(sequence);
+            parts.kv.cache_filled_blocks(sequence);
             let Some(token) = token else {
                 continue;
             };
@@ -481,9 +504,9 @@ impl Scheduler {
                 unreachable!("only live requests retire")
             }
         };
-        let (mut kv, _) = self.kv_and_requests();
+        let mut parts = self.parts();
         for sequence in request.sequences_mut() {
-            kv.release(sequence);
+            parts.kv.release(sequence);
         }
         request.set_phase(RequestPhase::Finished(finished));
         request.send(RequestEvent::Finished {
@@ -536,10 +559,10 @@ impl Scheduler {
                 let total = sequence.total();
                 let sequence_len = context_len + query_len.get();
                 while {
-                    let (mut kv, requests) = self.kv_and_requests();
+                    let mut parts = self.parts();
                     let sequence =
-                        &mut requests.get_mut(slot).expect("live").sequences_mut()[index];
-                    kv.ensure_blocks(sequence, sequence_len)
+                        &mut parts.requests.get_mut(slot).expect("live").sequences_mut()[index];
+                    parts.kv.ensure_blocks(sequence, sequence_len)
                 } == Err(PoolExhausted)
                 {
                     let victim = *self.running.last().expect("this request is running");
@@ -579,37 +602,20 @@ impl Scheduler {
             Some(slot),
             "the preemption victim is the most recently admitted request"
         );
-        let Scheduler {
-            config,
-            requests,
-            pool,
-            index,
-            running: _,
-            waiting: _,
-            preempted,
-            padding: _,
-            padding_reservation: _,
-            admission_open: _,
-            budget: _,
-            step,
-            next_request_id: _,
-        } = self;
-        let mut kv = Kv {
-            pool,
-            index,
-            algorithm: config.hash_algorithm,
-            block_size: config.block_size,
-        };
-        let request = requests.get_mut(slot).expect("running slots are live");
+        let mut parts = self.parts();
+        let request = parts
+            .requests
+            .get_mut(slot)
+            .expect("running slots are live");
         let RequestPhase::Running(running) = request.phase() else {
             unreachable!("the running queue holds only Running requests")
         };
-        request.set_phase(RequestPhase::Preempted(running.preempt(*step)));
+        request.set_phase(RequestPhase::Preempted(running.preempt(parts.step)));
         for sequence in request.sequences_mut() {
-            kv.release(sequence);
+            parts.kv.release(sequence);
             sequence.forget_computed();
         }
-        preempted.push(slot);
+        parts.preempted.push(slot);
         debug!(request = request.id().get(), "request preempted");
     }
 
@@ -622,50 +628,34 @@ impl Scheduler {
             let Some((slot, from)) = self.next_candidate() else {
                 return;
             };
-            let Scheduler {
-                config,
-                requests,
-                pool,
-                index,
-                running,
-                waiting,
-                preempted,
-                padding: _,
-                padding_reservation: _,
-                admission_open: _,
-                budget,
-                step,
-                next_request_id: _,
-            } = self;
-            let mut kv = Kv {
-                pool,
-                index,
-                algorithm: config.hash_algorithm,
-                block_size: config.block_size,
-            };
-            let request = requests.get_mut(slot).expect("candidates are live");
+            let mut parts = self.parts();
+            let request = parts.requests.get_mut(slot).expect("candidates are live");
             let sequence = &mut request.sequences_mut()[0];
             let total = sequence.total();
-            kv.claim_prefix(sequence);
+            parts.kv.claim_prefix(sequence);
             let context_len = sequence.computed();
-            let Some(query_len) = budget.offer(sequence.remaining()) else {
-                kv.release(sequence);
+            let Some(query_len) = parts.budget.offer(sequence.remaining()) else {
+                parts.kv.release(sequence);
                 sequence.forget_computed();
                 return;
             };
-            if kv.ensure_blocks(sequence, context_len + query_len.get()) == Err(PoolExhausted) {
-                kv.release(sequence);
+            if parts
+                .kv
+                .ensure_blocks(sequence, context_len + query_len.get())
+                == Err(PoolExhausted)
+            {
+                parts.kv.release(sequence);
                 sequence.forget_computed();
                 return;
             }
             let admitted = match (from, request.phase()) {
                 (Candidate::Preempted, RequestPhase::Preempted(phase)) => {
-                    preempted.pop();
-                    phase.admit(*step)
+                    parts.preempted.pop();
+                    phase.admit(parts.step)
                 }
                 (Candidate::Waiting { position }, RequestPhase::Waiting(phase)) => {
-                    waiting.remove(position);
-                    phase.admit(*step)
+                    parts.waiting.remove(position);
+                    phase.admit(parts.step)
                 }
                 (
                     Candidate::Preempted | Candidate::Waiting { .. },
@@ -677,8 +667,8 @@ impl Scheduler {
                 ) => unreachable!("each admission queue holds only its own phase"),
             };
             request.set_phase(RequestPhase::Running(admitted));
-            running.push(slot);
-            budget.spend(query_len);
+            parts.running.push(slot);
+            parts.budget.spend(query_len);
             entries.push(Entry {
                 slot,
                 sequence: SequenceIndex::new(0),
@@ -736,6 +726,19 @@ impl Scheduler {
     }
 }
 
+/// The scheduler's state borrowed field by field, so one pass can move a request between
+/// queues while its sequences change what they hold.
+struct Parts<'a> {
+    kv: Kv<'a>,
+    requests: &'a mut RequestSlab,
+    running: &'a mut Vec<RequestSlot>,
+    waiting: &'a mut VecDeque<RequestSlot>,
+    preempted: &'a mut Vec<RequestSlot>,
+    budget: &'a mut TokenBudget,
+    /// The step being scheduled; the phase a transition produces is stamped with it.
+    step: StepId,
+}
+
 /// Which admission queue a candidate came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Candidate {
@@ -746,10 +749,10 @@ enum Candidate {
 impl Drop for Scheduler {
     /// Returns every block to the pool so no lease outlives the scheduler unreleased.
     fn drop(&mut self) {
-        let (mut kv, requests) = self.kv_and_requests();
-        for (_, request) in requests.iter_mut() {
+        let mut parts = self.parts();
+        for (_, request) in parts.requests.iter_mut() {
             for sequence in request.sequences_mut() {
-                kv.release(sequence);
+                parts.kv.release(sequence);
             }
         }
         if let Some(reservation) = self.padding_reservation.take() {
