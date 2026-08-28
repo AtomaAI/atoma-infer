@@ -27,11 +27,6 @@ impl TokenBudget {
     }
 
     #[must_use]
-    pub fn max_tokens(&self) -> TokenCount {
-        self.max_tokens
-    }
-
-    #[must_use]
     pub fn max_requests(&self) -> RequestCount {
         self.max_requests
     }
@@ -82,18 +77,6 @@ impl TokenBudget {
         self.requests_spent += 1;
     }
 
-    /// Query tokens spent so far this pass.
-    #[must_use]
-    pub fn tokens_spent(&self) -> usize {
-        self.tokens_spent
-    }
-
-    /// Entries spent so far this pass.
-    #[must_use]
-    pub fn requests_spent(&self) -> usize {
-        self.requests_spent
-    }
-
     /// Starts a new pass with nothing spent.
     pub fn reset(&mut self) {
         self.tokens_spent = 0;
@@ -121,8 +104,7 @@ mod tests {
 
         budget.spend(tokens(2));
         assert_eq!(budget.tokens_remaining(), 2);
-        assert_eq!(budget.tokens_spent(), 2);
-        assert_eq!(budget.requests_spent(), 1);
+        assert_eq!(budget.requests_remaining(), 3, "one entry spent");
         assert!(budget.fits(tokens(2)));
         assert!(!budget.fits(tokens(3)));
 

@@ -130,7 +130,7 @@ fn a_request_flows_from_ingress_through_the_executor_to_its_finish() {
     assert_eq!(finish_reason(&client), Some(FinishReason::MaxNewTokens));
     assert!(!executor.serve_one(), "nothing left to run");
     assert_eq!(engine.state().live_requests, 0);
-    assert_eq!(engine.passes(), 3);
+    assert_eq!(handle.heartbeat.read().pass, 3, "one beat per pass");
 }
 
 /// Control is drained before ingress: a state query sent behind a burst of requests is

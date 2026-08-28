@@ -243,7 +243,7 @@ impl Engine {
 
     /// Parks until ingress, control or the executor wakes the thread, or the idle deadline
     /// passes — whichever is first. A spurious wake costs one pass and nothing else.
-    pub fn park(&self) {
+    fn park(&self) {
         self.parker.park_timeout(self.idle_deadline);
     }
 
@@ -263,15 +263,9 @@ impl Engine {
         }
     }
 
-    #[must_use]
-    pub fn scheduler(&self) -> &Scheduler {
+    #[cfg(test)]
+    pub(crate) fn scheduler(&self) -> &Scheduler {
         &self.scheduler
-    }
-
-    /// Passes completed so far.
-    #[must_use]
-    pub fn passes(&self) -> u64 {
-        self.passes
     }
 
     /// Every control message, before anything else.

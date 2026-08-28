@@ -2,15 +2,15 @@
 //! thread: step commands one way, step results the other.
 //!
 //! Rings are not channels: each has exactly one producer and one consumer, no lock and no
-//! allocation on push or pop. Their capacity is the pipeline depth — one step in flight today,
-//! with room for a second when the executor can overlap.
+//! allocation on push or pop.
 
 use crossbeam_utils::sync::Unparker;
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
 use crate::step::{StepCommand, StepResult};
 
-/// Steps either ring holds: pipeline-ready, not overlap.
+/// Steps either ring holds. The engine keeps one step in flight, so two always leaves room for
+/// the push that follows a pop.
 pub const RING_CAPACITY: usize = 2;
 
 /// The engine thread's ends: it produces commands and consumes results.
@@ -49,12 +49,6 @@ pub fn rings(wake: Unparker) -> (EngineRings, ExecutorRings) {
 }
 
 impl EngineRings {
-    /// Whether the command ring has room for another step.
-    #[must_use]
-    pub fn can_push(&self) -> bool {
-        self.commands.slots() > 0
-    }
-
     /// Pushes `command` for the executor, handing it back when the ring is full.
     ///
     /// # Errors
@@ -141,14 +135,12 @@ mod tests {
     fn commands_and_results_cross_in_order_and_the_rings_bound_what_is_in_flight() {
         let parker = Parker::new();
         let (mut engine, mut executor) = rings(parker.unparker().clone());
-        assert!(engine.can_push());
         assert_eq!(executor.pop_command(), None, "nothing issued yet");
         assert_eq!(engine.pop_result(), None, "nothing produced yet");
 
         for step in 1..=RING_CAPACITY as u64 {
             engine.push_command(command(step)).unwrap();
         }
-        assert!(!engine.can_push());
         assert_eq!(
             engine.push_command(command(99)),
             Err(command(99)),
@@ -156,7 +148,9 @@ mod tests {
         );
 
         assert_eq!(executor.pop_command(), Some(command(1)));
-        assert!(engine.can_push(), "popping frees a slot");
+        engine
+            .push_command(command(3))
+            .expect("popping frees a slot");
         for step in 1..=RING_CAPACITY as u64 {
             executor
                 .push_result(StepResult {

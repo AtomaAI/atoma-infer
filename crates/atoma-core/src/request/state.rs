@@ -243,12 +243,6 @@ impl Request {
         self.stop
     }
 
-    /// The client's channel; `None` for a padding dummy.
-    #[must_use]
-    pub fn egress(&self) -> Option<&EgressSender> {
-        self.egress.as_ref()
-    }
-
     /// Sends `event` to the client.
     ///
     /// # Panics
@@ -390,8 +384,7 @@ mod tests {
         let dummy = Request::padding(RequestId::new(9), BlockId::new(4));
         assert!(dummy.is_padding());
         assert_eq!(dummy.phase(), RequestPhase::Padding);
-        assert!(dummy.egress().is_none());
-        assert!(!dummy.is_cancelled());
+        assert!(!dummy.is_cancelled(), "it has no client to lose");
         let sequence = &dummy.sequences()[0];
         assert_eq!(sequence.tokens(), &[PADDING_TOKEN]);
         assert_eq!(sequence.block_table(), &[BlockId::new(4)]);
