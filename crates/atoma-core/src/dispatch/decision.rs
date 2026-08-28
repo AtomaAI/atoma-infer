@@ -1,4 +1,5 @@
-//! Admission: exactly one graph key for a live batch, or exactly one named rejection reason.
+//! The dispatch decision: exactly one graph key for a live batch, or exactly one named reason
+//! it runs eagerly.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -33,14 +34,14 @@ pub enum SupportLevel {
 
 /// Why a batch fell back to eager execution, carrying the numbers that caused it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum RejectionReason {
+pub enum EagerReason {
     /// No bucket holds this many tokens.
     #[error(
         "token count {token_count} exceeds every captured bucket; {}",
         bucket_ladder_maximum_clause(*.bucket_ladder_maximum)
     )]
     TokensAboveBucketLadderMaximum {
-        /// Tokens in the rejected batch before padding.
+        /// Tokens in the batch before padding.
         token_count: TokenCount,
         /// The largest captured bucket; `None` for an empty bucket ladder.
         bucket_ladder_maximum: Option<TokenCount>,
@@ -48,7 +49,7 @@ pub enum RejectionReason {
     /// More live requests than any captured graph was built to serve.
     #[error("request count {request_count} is above the captured maximum {captured_maximum}")]
     RequestsAboveCapturedMaximum {
-        /// Live requests in the rejected batch.
+        /// Live requests in the batch.
         request_count: RequestCount,
         /// The largest request count any captured graph serves.
         captured_maximum: RequestCount,
@@ -63,24 +64,24 @@ pub enum RejectionReason {
         support_level: SupportLevel,
         /// The weakest level whose captured routine is valid for this batch.
         required: SupportLevel,
-        /// Tokens in the rejected batch before padding.
+        /// Tokens in the batch before padding.
         token_count: TokenCount,
-        /// Live requests in the rejected batch.
+        /// Live requests in the batch.
         request_count: RequestCount,
     },
     /// Only uniform-decode batches are captured.
     #[error("batch of {token_count} tokens over {request_count} requests is not uniform decode")]
     NotUniformDecode {
-        /// Tokens in the rejected batch before padding.
+        /// Tokens in the batch before padding.
         token_count: TokenCount,
-        /// Live requests in the rejected batch.
+        /// Live requests in the batch.
         request_count: RequestCount,
     },
 }
 
-/// Eager fallbacks so far, by rejection reason.
+/// Eager fallbacks so far, by eager reason.
 ///
-/// Lives beside [`RejectionReason`] so a new variant and its counter are one edit; the running
+/// Lives beside [`EagerReason`] so a new variant and its counter are one edit; the running
 /// instance is owned by [`crate::dispatch::Dispatcher`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EagerFallbackCounters {
@@ -95,21 +96,21 @@ pub struct EagerFallbackCounters {
 }
 
 impl EagerFallbackCounters {
-    pub(crate) fn count(&mut self, reason: &RejectionReason) {
+    pub(crate) fn count(&mut self, reason: &EagerReason) {
         match reason {
-            RejectionReason::TokensAboveBucketLadderMaximum {
+            EagerReason::TokensAboveBucketLadderMaximum {
                 token_count: _,
                 bucket_ladder_maximum: _,
             } => {
                 self.tokens_above_bucket_ladder_maximum += 1;
             }
-            RejectionReason::RequestsAboveCapturedMaximum {
+            EagerReason::RequestsAboveCapturedMaximum {
                 request_count: _,
                 captured_maximum: _,
             } => {
                 self.requests_above_captured_maximum += 1;
             }
-            RejectionReason::SupportLevelInsufficient {
+            EagerReason::SupportLevelInsufficient {
                 support_level: _,
                 required: _,
                 token_count: _,
@@ -117,7 +118,7 @@ impl EagerFallbackCounters {
             } => {
                 self.support_level_insufficient += 1;
             }
-            RejectionReason::NotUniformDecode {
+            EagerReason::NotUniformDecode {
                 token_count: _,
                 request_count: _,
             } => {
@@ -127,37 +128,37 @@ impl EagerFallbackCounters {
     }
 }
 
-/// Admits `batch` to exactly one graph key, or rejects it for exactly one reason.
+/// Decides `batch`: exactly one graph key, or exactly one reason it runs eagerly.
 ///
-/// Crate-internal: [`crate::dispatch::Dispatcher`] is the only public admission surface, so
+/// Crate-internal: [`crate::dispatch::Dispatcher`] is the only public dispatch surface, so
 /// executors cannot re-derive dispatch truth outside this crate.
 ///
 /// Checks run in a fixed order, so a batch failing several lands on the first: token count
 /// against the bucket ladder, request count against the captured maximum, uniform decode,
 /// then backend support level against the live batch. Uniform decode comes before support so a
-/// rejection never names a support gap that closing would not actually fix.
+/// reason never names a support gap that closing would not actually fix.
 ///
 /// The uniform-decode check trusts no flag alone: a token count that does not divide evenly
-/// among the requests cannot be uniform decode, so such a batch is rejected whatever it claims.
+/// among the requests cannot be uniform decode, so such a batch runs eagerly whatever it claims.
 ///
 /// # Errors
 ///
-/// Returns the [`RejectionReason`] naming the first failed check, carrying the numbers that
+/// Returns the [`EagerReason`] naming the first failed check, carrying the numbers that
 /// caused it.
-pub(crate) fn admit(
+pub(crate) fn decide(
     batch: LiveBatch,
     support_level: SupportLevel,
     captured_max_requests: RequestCount,
     lookup: &PaddingLookup,
-) -> Result<GraphKey, RejectionReason> {
+) -> Result<GraphKey, EagerReason> {
     let Some(padded_token_count) = lookup.bucket_for(batch.token_count) else {
-        return Err(RejectionReason::TokensAboveBucketLadderMaximum {
+        return Err(EagerReason::TokensAboveBucketLadderMaximum {
             token_count: batch.token_count,
             bucket_ladder_maximum: lookup.bucket_ladder_maximum(),
         });
     };
     if batch.request_count > captured_max_requests {
-        return Err(RejectionReason::RequestsAboveCapturedMaximum {
+        return Err(EagerReason::RequestsAboveCapturedMaximum {
             request_count: batch.request_count,
             captured_maximum: captured_max_requests,
         });
@@ -168,14 +169,14 @@ pub(crate) fn admit(
             .get()
             .is_multiple_of(batch.request_count.get())
     {
-        return Err(RejectionReason::NotUniformDecode {
+        return Err(EagerReason::NotUniformDecode {
             token_count: batch.token_count,
             request_count: batch.request_count,
         });
     }
     let required = required_support(batch);
     if support_level < required {
-        return Err(RejectionReason::SupportLevelInsufficient {
+        return Err(EagerReason::SupportLevelInsufficient {
             support_level,
             required,
             token_count: batch.token_count,
@@ -189,7 +190,7 @@ pub(crate) fn admit(
     ))
 }
 
-/// Renders the bucket-ladder half of the tokens rejection: the maximum, or the empty ladder.
+/// Renders the bucket-ladder half of the tokens reason: the maximum, or the empty ladder.
 fn bucket_ladder_maximum_clause(bucket_ladder_maximum: Option<TokenCount>) -> String {
     bucket_ladder_maximum.map_or_else(
         || "the bucket ladder is empty".to_owned(),
@@ -199,7 +200,7 @@ fn bucket_ladder_maximum_clause(bucket_ladder_maximum: Option<TokenCount>) -> St
 
 /// The weakest support level whose captured routine is valid for a uniform-decode `batch`.
 ///
-/// Non-uniform batches are rejected before support is judged, so no batch ever requires
+/// Non-uniform batches go eager before support is judged, so no batch ever requires
 /// [`SupportLevel::Always`] here.
 fn required_support(batch: LiveBatch) -> SupportLevel {
     if batch.token_count.get() == batch.request_count.get() {
@@ -211,7 +212,7 @@ fn required_support(batch: LiveBatch) -> SupportLevel {
 
 #[cfg(test)]
 mod tests {
-    use super::{admit, RejectionReason, SupportLevel};
+    use super::{decide, EagerReason, SupportLevel};
     use crate::dispatch::test_support::batch;
     use crate::dispatch::{BucketLadder, PaddingLookup, Platform};
     use crate::test_support::{requests, tokens};
@@ -221,8 +222,8 @@ mod tests {
     }
 
     #[test]
-    fn admitted_batch_pads_to_its_bucket_and_binds_its_request_count() {
-        let key = admit(
+    fn keyed_batch_pads_to_its_bucket_and_binds_its_request_count() {
+        let key = decide(
             batch(5, 5, true),
             SupportLevel::Always,
             requests(512),
@@ -237,14 +238,14 @@ mod tests {
     #[test]
     fn keys_bind_the_exact_request_count_not_only_the_bucket() {
         let lookup = hopper_lookup();
-        let five = admit(
+        let five = decide(
             batch(5, 5, true),
             SupportLevel::Always,
             requests(512),
             &lookup,
         )
         .unwrap();
-        let six = admit(
+        let six = decide(
             batch(6, 6, true),
             SupportLevel::Always,
             requests(512),
@@ -256,9 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn bucket_ladder_boundary_admits_exactly_and_rejects_one_past() {
+    fn bucket_ladder_boundary_keys_exactly_and_goes_eager_one_past() {
         let lookup = hopper_lookup();
-        let at_max = admit(
+        let at_max = decide(
             batch(512, 512, true),
             SupportLevel::Always,
             requests(512),
@@ -267,13 +268,13 @@ mod tests {
         .unwrap();
         assert_eq!(at_max.padded_token_count(), tokens(512));
         assert_eq!(
-            admit(
+            decide(
                 batch(513, 513, true),
                 SupportLevel::Always,
                 requests(1024),
                 &lookup
             ),
-            Err(RejectionReason::TokensAboveBucketLadderMaximum {
+            Err(EagerReason::TokensAboveBucketLadderMaximum {
                 token_count: tokens(513),
                 bucket_ladder_maximum: Some(tokens(512)),
             })
@@ -281,15 +282,15 @@ mod tests {
     }
 
     #[test]
-    fn requests_above_captured_maximum_reject_with_both_numbers() {
+    fn requests_above_captured_maximum_go_eager_with_both_numbers() {
         assert_eq!(
-            admit(
+            decide(
                 batch(8, 8, true),
                 SupportLevel::Always,
                 requests(4),
                 &hopper_lookup()
             ),
-            Err(RejectionReason::RequestsAboveCapturedMaximum {
+            Err(EagerReason::RequestsAboveCapturedMaximum {
                 request_count: requests(8),
                 captured_maximum: requests(4),
             })
@@ -297,8 +298,8 @@ mod tests {
     }
 
     #[test]
-    fn captured_maximum_boundary_admits_exactly() {
-        assert!(admit(
+    fn captured_maximum_boundary_keys_exactly() {
+        assert!(decide(
             batch(4, 4, true),
             SupportLevel::Always,
             requests(4),
@@ -310,7 +311,7 @@ mod tests {
     #[test]
     fn single_token_decode_needs_at_least_that_support_level() {
         let lookup = hopper_lookup();
-        assert!(admit(
+        assert!(decide(
             batch(8, 8, true),
             SupportLevel::UniformSingleTokenDecode,
             requests(512),
@@ -318,13 +319,13 @@ mod tests {
         )
         .is_ok());
         assert_eq!(
-            admit(
+            decide(
                 batch(8, 8, true),
                 SupportLevel::Never,
                 requests(512),
                 &lookup
             ),
-            Err(RejectionReason::SupportLevelInsufficient {
+            Err(EagerReason::SupportLevelInsufficient {
                 support_level: SupportLevel::Never,
                 required: SupportLevel::UniformSingleTokenDecode,
                 token_count: tokens(8),
@@ -338,20 +339,20 @@ mod tests {
         // Four requests decoding four tokens each: uniform, but not single-token.
         let lookup = hopper_lookup();
         assert_eq!(
-            admit(
+            decide(
                 batch(16, 4, true),
                 SupportLevel::UniformSingleTokenDecode,
                 requests(512),
                 &lookup
             ),
-            Err(RejectionReason::SupportLevelInsufficient {
+            Err(EagerReason::SupportLevelInsufficient {
                 support_level: SupportLevel::UniformSingleTokenDecode,
                 required: SupportLevel::UniformBatch,
                 token_count: tokens(16),
                 request_count: requests(4),
             })
         );
-        assert!(admit(
+        assert!(decide(
             batch(16, 4, true),
             SupportLevel::UniformBatch,
             requests(512),
@@ -361,15 +362,15 @@ mod tests {
     }
 
     #[test]
-    fn non_uniform_batch_is_rejected_even_at_full_support() {
+    fn non_uniform_batch_goes_eager_even_at_full_support() {
         assert_eq!(
-            admit(
+            decide(
                 batch(16, 4, false),
                 SupportLevel::Always,
                 requests(512),
                 &hopper_lookup()
             ),
-            Err(RejectionReason::NotUniformDecode {
+            Err(EagerReason::NotUniformDecode {
                 token_count: tokens(16),
                 request_count: requests(4),
             })
@@ -377,17 +378,17 @@ mod tests {
     }
 
     #[test]
-    fn non_uniform_batch_is_rejected_as_not_uniform_regardless_of_support() {
-        // Not a support gap: no support level admits a non-uniform batch, so the reason must
+    fn non_uniform_batch_goes_eager_as_not_uniform_regardless_of_support() {
+        // Not a support gap: no support level keys a non-uniform batch, so the reason must
         // name the uniformity, not a level that closing would not fix.
         assert_eq!(
-            admit(
+            decide(
                 batch(16, 4, false),
                 SupportLevel::UniformBatch,
                 requests(512),
                 &hopper_lookup()
             ),
-            Err(RejectionReason::NotUniformDecode {
+            Err(EagerReason::NotUniformDecode {
                 token_count: tokens(16),
                 request_count: requests(4),
             })
@@ -395,19 +396,19 @@ mod tests {
     }
 
     #[test]
-    fn tokens_that_cannot_divide_evenly_are_rejected_as_not_uniform() {
+    fn tokens_that_cannot_divide_evenly_go_eager_as_not_uniform() {
         // Five tokens over two requests, or two tokens over four, cannot be uniform decode
         // whatever the flag claims.
         let lookup = hopper_lookup();
         for (token_count, request_count) in [(5, 2), (2, 4)] {
             assert_eq!(
-                admit(
+                decide(
                     batch(token_count, request_count, true),
                     SupportLevel::Always,
                     requests(512),
                     &lookup
                 ),
-                Err(RejectionReason::NotUniformDecode {
+                Err(EagerReason::NotUniformDecode {
                     token_count: tokens(token_count),
                     request_count: requests(request_count),
                 })
@@ -419,13 +420,13 @@ mod tests {
     fn batch_failing_every_check_lands_on_the_first_reason() {
         // Above the bucket ladder, above the captured maximum, unsupported and not uniform.
         assert_eq!(
-            admit(
+            decide(
                 batch(600, 600, false),
                 SupportLevel::Never,
                 requests(4),
                 &hopper_lookup()
             ),
-            Err(RejectionReason::TokensAboveBucketLadderMaximum {
+            Err(EagerReason::TokensAboveBucketLadderMaximum {
                 token_count: tokens(600),
                 bucket_ladder_maximum: Some(tokens(512)),
             })
@@ -433,16 +434,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_bucket_ladder_rejects_everything_with_no_maximum() {
+    fn empty_bucket_ladder_sends_everything_eager_with_no_maximum() {
         let lookup = PaddingLookup::new(&BucketLadder::new(Vec::new()).unwrap());
         assert_eq!(
-            admit(
+            decide(
                 batch(1, 1, true),
                 SupportLevel::Always,
                 requests(512),
                 &lookup
             ),
-            Err(RejectionReason::TokensAboveBucketLadderMaximum {
+            Err(EagerReason::TokensAboveBucketLadderMaximum {
                 token_count: tokens(1),
                 bucket_ladder_maximum: None,
             })
@@ -450,8 +451,8 @@ mod tests {
     }
 
     #[test]
-    fn rejection_reasons_render_their_numbers() {
-        let reason = admit(
+    fn eager_reasons_render_their_numbers() {
+        let reason = decide(
             batch(600, 600, true),
             SupportLevel::Always,
             requests(512),
@@ -465,9 +466,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_bucket_ladder_rejection_names_the_empty_ladder() {
+    fn empty_bucket_ladder_reason_names_the_empty_ladder() {
         let lookup = PaddingLookup::new(&BucketLadder::new(Vec::new()).unwrap());
-        let reason = admit(
+        let reason = decide(
             batch(1, 1, true),
             SupportLevel::Always,
             requests(512),
