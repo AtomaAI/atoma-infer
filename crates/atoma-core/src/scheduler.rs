@@ -25,7 +25,8 @@ use tracing::debug;
 use crate::dispatch::LiveBatch;
 use crate::kv::{BlockPool, HashAlgorithm, PaddingReservation, PrefixIndex};
 use crate::request::{
-    FinishReason, Finished, NewRequest, Request, RequestEvent, RequestPhase, RequestSlab, Usage,
+    FinishReason, Finished, NewRequest, Request, RequestEvent, RequestPhase, RequestSlab, Sequence,
+    Usage,
 };
 use crate::scheduler::kv::{Kv, PoolExhausted};
 use crate::types::{RequestCount, RequestId, RequestSlot, SequenceIndex, StepId, TokenCount};
@@ -653,56 +654,75 @@ impl Scheduler {
             let Some((slot, from)) = self.next_candidate() else {
                 return;
             };
-            let mut parts = self.parts();
-            let request = parts.requests.get_mut(slot).expect("candidates are live");
-            let sequence = &mut request.sequences_mut()[0];
-            let total = sequence.total();
-            parts.kv.claim_prefix(sequence);
-            let context_len = sequence.computed();
-            let Some(query_len) = parts.budget.offer(sequence.remaining()) else {
-                parts.kv.release(sequence);
-                sequence.forget_computed();
-                return;
-            };
-            if parts
-                .kv
-                .ensure_blocks(sequence, context_len + query_len.get())
-                == Err(PoolExhausted)
-            {
-                parts.kv.release(sequence);
-                sequence.forget_computed();
+            if self.admit_candidate(slot, from, entries) == Admitted::No {
                 return;
             }
-            let admitted = match (from, request.phase()) {
-                (Candidate::Preempted, RequestPhase::Preempted(phase)) => {
-                    parts.preempted.pop();
-                    phase.admit(parts.step)
-                }
-                (Candidate::Waiting { position }, RequestPhase::Waiting(phase)) => {
-                    parts.waiting.remove(position);
-                    phase.admit(parts.step)
-                }
-                (
-                    Candidate::Preempted | Candidate::Waiting { .. },
-                    RequestPhase::Waiting(_)
-                    | RequestPhase::Running(_)
-                    | RequestPhase::Preempted(_)
-                    | RequestPhase::Finished(_)
-                    | RequestPhase::Padding,
-                ) => unreachable!("each admission queue holds only its own phase"),
-            };
-            request.set_phase(RequestPhase::Running(admitted));
-            parts.running.push(slot);
-            parts.budget.spend(query_len);
-            entries.push(Entry {
-                slot,
-                sequence: SequenceIndex::new(0),
-                context_len,
-                query_len,
-                samples: context_len + query_len.get() == total,
-            });
         }
     }
+
+    /// Admits one candidate: it claims its cached prefix, takes an entry out of the budget and
+    /// leaves the queue it came from. A candidate the budget or the pool cannot serve goes back
+    /// untouched, and its refusal ends this pass's admission.
+    fn admit_candidate(
+        &mut self,
+        slot: RequestSlot,
+        from: Candidate,
+        entries: &mut Vec<Entry>,
+    ) -> Admitted {
+        let mut parts = self.parts();
+        let request = parts.requests.get_mut(slot).expect("candidates are live");
+        let sequence = &mut request.sequences_mut()[0];
+        let total = sequence.total();
+        parts.kv.claim_prefix(sequence);
+        let context_len = sequence.computed();
+        let Some(query_len) = parts.budget.offer(sequence.remaining()) else {
+            return give_back(&mut parts.kv, sequence);
+        };
+        if parts
+            .kv
+            .ensure_blocks(sequence, context_len + query_len.get())
+            == Err(PoolExhausted)
+        {
+            return give_back(&mut parts.kv, sequence);
+        }
+        let admitted = match (from, request.phase()) {
+            (Candidate::Preempted, RequestPhase::Preempted(phase)) => {
+                parts.preempted.pop();
+                phase.admit(parts.step)
+            }
+            (Candidate::Waiting { position }, RequestPhase::Waiting(phase)) => {
+                parts.waiting.remove(position);
+                phase.admit(parts.step)
+            }
+            (
+                Candidate::Preempted | Candidate::Waiting { .. },
+                RequestPhase::Waiting(_)
+                | RequestPhase::Running(_)
+                | RequestPhase::Preempted(_)
+                | RequestPhase::Finished(_)
+                | RequestPhase::Padding,
+            ) => unreachable!("each admission queue holds only its own phase"),
+        };
+        request.set_phase(RequestPhase::Running(admitted));
+        parts.running.push(slot);
+        parts.budget.spend(query_len);
+        entries.push(Entry {
+            slot,
+            sequence: SequenceIndex::new(0),
+            context_len,
+            query_len,
+            samples: context_len + query_len.get() == total,
+        });
+        Admitted::Yes
+    }
+}
+
+/// Puts a refused candidate back as it was: what its claim pinned or leased goes back to the
+/// pool, and the sequence forgets what the claim counted as computed.
+fn give_back(kv: &mut Kv<'_>, sequence: &mut Sequence) -> Admitted {
+    kv.release(sequence);
+    sequence.forget_computed();
+    Admitted::No
 }
 
 impl Scheduler {
@@ -762,6 +782,13 @@ struct Parts<'a> {
     budget: &'a mut TokenBudget,
     /// The step being scheduled; the phase a transition produces is stamped with it.
     step: StepId,
+}
+
+/// Whether a candidate was admitted, or put back for the pool or the budget to allow later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admitted {
+    Yes,
+    No,
 }
 
 /// How a running request's turn at the budget ended.
