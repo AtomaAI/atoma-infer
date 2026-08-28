@@ -55,20 +55,6 @@ pub enum RequestPhase {
     Padding,
 }
 
-impl RequestPhase {
-    /// Whether the request is in the Running phase.
-    #[must_use]
-    pub fn is_running(self) -> bool {
-        matches!(self, RequestPhase::Running(_))
-    }
-
-    /// Whether the request is over — finished, or a dummy that never runs on its own account.
-    #[must_use]
-    pub fn is_finished(self) -> bool {
-        matches!(self, RequestPhase::Finished(_))
-    }
-}
-
 /// Taken in and not yet admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Waiting {
@@ -177,11 +163,9 @@ mod tests {
 
         let running = waiting.admit(StepId::new(2));
         assert_eq!(running.admitted_at(), StepId::new(2));
-        assert!(RequestPhase::Running(running).is_running());
 
         let preempted = running.preempt(StepId::new(5));
         assert_eq!(preempted.preempted_at(), StepId::new(5));
-        assert!(!RequestPhase::Preempted(preempted).is_running());
 
         let readmitted = preempted.admit(StepId::new(6));
         assert_eq!(readmitted.admitted_at(), StepId::new(6));
@@ -205,8 +189,9 @@ mod tests {
             preempted.finish(FinishReason::Shutdown).reason(),
             FinishReason::Shutdown
         );
-        assert!(RequestPhase::Finished(running.finish(FinishReason::MaxNewTokens)).is_finished());
-        assert!(!RequestPhase::Padding.is_finished());
-        assert!(!RequestPhase::Padding.is_running());
+        assert!(matches!(
+            RequestPhase::Finished(running.finish(FinishReason::MaxNewTokens)),
+            RequestPhase::Finished(_)
+        ));
     }
 }
