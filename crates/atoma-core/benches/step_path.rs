@@ -1,31 +1,53 @@
 //! The step-path latency gate: schedule, command build and result apply, measured on the host
-//! with no GPU, at a representative batch.
+//! with no GPU, over two batches that between them cover every branch of a pass.
 //!
-//! Sixty-four requests decode at a 1024-token context while eight prompts wait in the admission
-//! window under longest prefix match. Each measured pass applies the previous step's result,
-//! schedules the next step, builds its command and pushes it to the ring; the mock executor
-//! answers between passes, untimed. The gate fails when the p99 pass reaches 200 microseconds.
+//! In the decode scenario sixty-four requests decode at a 1024-token context while eight prompts
+//! wait in the admission window under longest prefix match. In the churn scenario prompts share
+//! one of a few prefixes, so admission claims cached blocks, and they finish after a handful of
+//! decodes, so every measured pass also retires requests and leases against a pool with nothing
+//! free — where a block comes only from evicting cache.
+//!
+//! Each measured pass applies the previous step's result, schedules the next step, builds its
+//! command and pushes it to the ring; the mock executor answers between passes, untimed. The gate
+//! fails when either scenario's p99 pass reaches 200 microseconds.
 
 use std::process::ExitCode;
 use std::time::Instant;
 
 use atoma_core::dispatch::{BucketLadder, CaptureKind, DispatchConfig, SupportLevel};
-use atoma_core::engine::{Engine, EngineConfig, ExecutorRings, Pass};
+use atoma_core::engine::{Engine, EngineConfig, EngineHandle, ExecutorRings, Pass};
 use atoma_core::kv::HashAlgorithm;
-use atoma_core::request::{egress, EgressReceiver, NewRequest, SamplingParams, StopCriteria};
+use atoma_core::request::{
+    egress, EgressReceiver, NewRequest, RequestEvent, SamplingParams, StopCriteria,
+};
 use atoma_core::scheduler::{AdmissionPolicy, SchedulerConfig};
 use atoma_core::step::StepResult;
 use atoma_core::types::{RequestCount, TokenCount};
 use hdrhistogram::Histogram;
 use tracing::{error, info};
 
-const BATCH: usize = 64;
-const CONTEXT_TOKENS: usize = 1024;
-const WAITING: usize = 8;
 const BLOCK_SIZE: usize = 16;
 const WARMUP_PASSES: usize = 200;
 const MEASURED_PASSES: usize = 2000;
 const P99_LIMIT_MICROS: u64 = 200;
+
+const DECODE_BATCH: usize = 64;
+const DECODE_CONTEXT_TOKENS: usize = 1024;
+const DECODE_WAITING: usize = 8;
+/// More than the run can generate, so no decode ever finishes and the window stays full.
+const DECODE_NEW_TOKENS: usize = 1_000_000;
+
+const CHURN_BATCH: usize = 32;
+const CHURN_WAITING: usize = 8;
+const CHURN_PROMPT_TOKENS: usize = 128;
+/// Tokens a churn prompt shares with every other prompt of its family: the cached prefix
+/// admission claims.
+const CHURN_SHARED_TOKENS: usize = 64;
+const CHURN_FAMILIES: u32 = 8;
+const CHURN_NEW_TOKENS: usize = 16;
+/// The entry cap: a bucket of the ladder, so the reservation can pad a full batch up to it.
+const CHURN_MAX_BATCH: usize = 64;
+const CHURN_MAX_MODEL_TOKENS: usize = CHURN_PROMPT_TOKENS + CHURN_NEW_TOKENS + 1;
 
 fn count(value: usize) -> TokenCount {
     TokenCount::new(value).expect("bench counts are nonzero")
@@ -35,51 +57,101 @@ fn requests(value: usize) -> RequestCount {
     RequestCount::new(value).expect("bench counts are nonzero")
 }
 
-fn config() -> EngineConfig {
+fn blocks_for(tokens: usize) -> usize {
+    tokens.div_ceil(BLOCK_SIZE)
+}
+
+fn decode_config() -> EngineConfig {
     let decode_headroom = MEASURED_PASSES + WARMUP_PASSES + BLOCK_SIZE;
+    let live = DECODE_BATCH + DECODE_WAITING;
     EngineConfig {
         scheduler: SchedulerConfig {
-            token_budget: count(BATCH * CONTEXT_TOKENS),
-            max_batch: requests(BATCH),
-            max_model_len: count(CONTEXT_TOKENS + decode_headroom),
+            token_budget: count(DECODE_BATCH * DECODE_CONTEXT_TOKENS),
+            max_batch: requests(DECODE_BATCH),
+            max_model_len: count(DECODE_CONTEXT_TOKENS + decode_headroom),
             block_size: count(BLOCK_SIZE),
-            window: requests(WAITING),
+            window: requests(DECODE_WAITING),
             admission: AdmissionPolicy::LongestPrefixMatch,
-            max_requests: requests(BATCH + WAITING),
+            max_requests: requests(live),
             eos_token_ids: Vec::new(),
             hash_algorithm: HashAlgorithm::Sha256V1,
         },
-        dispatch: DispatchConfig {
-            bucket_ladder: BucketLadder::new(vec![1, 2, 4, 8, 16, 32, 64]).expect("nonzero"),
-            captured_max_requests: requests(BATCH),
-            support_level: SupportLevel::Always,
-            capture_kind: CaptureKind::Full,
-        },
+        dispatch: dispatch_config(DECODE_BATCH),
         block_count: u32::try_from(
-            (BATCH + WAITING) * (CONTEXT_TOKENS + decode_headroom) / BLOCK_SIZE + BATCH,
+            live * blocks_for(DECODE_CONTEXT_TOKENS + decode_headroom) + DECODE_BATCH,
         )
         .expect("fits u32"),
-        ingress_capacity: requests(BATCH + WAITING),
+        ingress_capacity: requests(live),
         idle_deadline_millis: 1,
     }
 }
 
-/// A prompt of `len` tokens unique to request `index`, so nothing hits the prefix cache.
-fn request(index: u32, len: usize) -> (NewRequest, EgressReceiver) {
+/// A pool that holds the running batch and little more, so cached blocks are evicted to lease.
+fn churn_config() -> EngineConfig {
+    let live = CHURN_BATCH + CHURN_WAITING;
+    let max_batch = CHURN_MAX_BATCH;
+    EngineConfig {
+        scheduler: SchedulerConfig {
+            token_budget: count(2048),
+            max_batch: requests(max_batch),
+            max_model_len: count(CHURN_MAX_MODEL_TOKENS),
+            block_size: count(BLOCK_SIZE),
+            window: requests(CHURN_WAITING),
+            admission: AdmissionPolicy::LongestPrefixMatch,
+            max_requests: requests(live),
+            eos_token_ids: Vec::new(),
+            hash_algorithm: HashAlgorithm::Sha256V1,
+        },
+        dispatch: dispatch_config(max_batch),
+        block_count: u32::try_from(
+            max_batch - 1 + (CHURN_BATCH + 4) * blocks_for(CHURN_MAX_MODEL_TOKENS),
+        )
+        .expect("fits u32"),
+        ingress_capacity: requests(live),
+        idle_deadline_millis: 1,
+    }
+}
+
+fn dispatch_config(max_batch: usize) -> DispatchConfig {
+    DispatchConfig {
+        bucket_ladder: BucketLadder::new(vec![1, 2, 4, 8, 16, 32, 64]).expect("nonzero"),
+        captured_max_requests: requests(max_batch),
+        support_level: SupportLevel::Always,
+        capture_kind: CaptureKind::Full,
+    }
+}
+
+fn new_request(prompt: Vec<u32>, max_new_tokens: usize) -> (NewRequest, EgressReceiver) {
     let (sender, receiver) = egress();
-    let base = index * 1_000_000;
     let request = NewRequest {
-        prompt: (0..u32::try_from(len).expect("fits u32"))
-            .map(|offset| base + offset)
-            .collect(),
+        prompt,
         sampling: SamplingParams::default(),
         stop: StopCriteria {
-            max_new_tokens: count(1_000_000),
+            max_new_tokens: count(max_new_tokens),
             ignore_eos: true,
         },
         egress: sender,
     };
     (request, receiver)
+}
+
+/// A prompt of `len` tokens unique to request `index`, so nothing hits the prefix cache.
+fn unique_prompt(index: u32, len: usize) -> Vec<u32> {
+    let base = index * 1_000_000;
+    (0..u32::try_from(len).expect("fits u32"))
+        .map(|offset| base + offset)
+        .collect()
+}
+
+/// A prompt whose leading blocks are its family's, shared with every other prompt of that
+/// family, and whose tail is its own.
+fn family_prompt(index: u32) -> Vec<u32> {
+    let family = index % CHURN_FAMILIES;
+    let shared = (0..u32::try_from(CHURN_SHARED_TOKENS).expect("fits u32"))
+        .map(|offset| family * 100_000 + offset);
+    let own = (0..u32::try_from(CHURN_PROMPT_TOKENS - CHURN_SHARED_TOKENS).expect("fits u32"))
+        .map(|offset| 10_000_000 + index * 1_000 + offset);
+    shared.chain(own).collect()
 }
 
 /// Answers the step in flight, if one is, with one token per sampling entry.
@@ -95,27 +167,63 @@ fn answer(rings: &mut ExecutorRings) {
     }
 }
 
-fn main() -> ExitCode {
-    tracing_subscriber::fmt().with_target(false).init();
+fn new_histogram() -> Histogram<u64> {
+    Histogram::new_with_bounds(1, 10_000_000, 3).expect("valid histogram bounds")
+}
+
+fn record(histogram: &mut Histogram<u64>, micros: u128) {
+    histogram
+        .record(u64::try_from(micros).expect("fits u64"))
+        .expect("within bounds");
+}
+
+/// Drains every client, dropping those whose request finished, and returns how many finished.
+fn recycle(clients: &mut Vec<EgressReceiver>) -> usize {
+    let before = clients.len();
+    clients.retain(|client| {
+        let mut running = true;
+        while let Ok(event) = client.try_recv() {
+            if matches!(event, RequestEvent::Finished { .. }) {
+                running = false;
+            }
+        }
+        running
+    });
+    before - clients.len()
+}
+
+fn submit(handle: &EngineHandle, request: NewRequest) {
+    handle.ingress.try_send(request).expect("ingress has room");
+}
+
+/// Sixty-four requests decoding at a long context, with a full admission window behind them.
+fn measure_decode() -> Histogram<u64> {
     let (mut engine, handle, mut rings) =
-        Engine::new(&config()).expect("the bench configuration is valid");
-    let mut clients = Vec::with_capacity(BATCH + WAITING);
-    for index in 0..BATCH {
-        let (request, receiver) = request(u32::try_from(index).expect("fits"), CONTEXT_TOKENS);
-        handle.ingress.try_send(request).expect("ingress has room");
+        Engine::new(&decode_config()).expect("the bench configuration is valid");
+    let mut clients = Vec::with_capacity(DECODE_BATCH + DECODE_WAITING);
+    for index in 0..DECODE_BATCH {
+        let index = u32::try_from(index).expect("fits u32");
+        let (request, receiver) = new_request(
+            unique_prompt(index, DECODE_CONTEXT_TOKENS),
+            DECODE_NEW_TOKENS,
+        );
+        submit(&handle, request);
         clients.push(receiver);
     }
     // The first pass takes every prompt in and prefills them all under the wide budget.
     assert_eq!(engine.pass(), Pass::Continue);
     answer(&mut rings);
-    for index in BATCH..BATCH + WAITING {
-        let (request, receiver) = request(u32::try_from(index).expect("fits"), CONTEXT_TOKENS);
-        handle.ingress.try_send(request).expect("ingress has room");
+    for index in DECODE_BATCH..DECODE_BATCH + DECODE_WAITING {
+        let index = u32::try_from(index).expect("fits u32");
+        let (request, receiver) = new_request(
+            unique_prompt(index, DECODE_CONTEXT_TOKENS),
+            DECODE_NEW_TOKENS,
+        );
+        submit(&handle, request);
         clients.push(receiver);
     }
 
-    let mut histogram: Histogram<u64> =
-        Histogram::new_with_bounds(1, 10_000_000, 3).expect("valid histogram bounds");
+    let mut histogram = new_histogram();
     for pass in 0..WARMUP_PASSES + MEASURED_PASSES {
         let started = Instant::now();
         assert_eq!(engine.pass(), Pass::Continue);
@@ -125,20 +233,69 @@ fn main() -> ExitCode {
             while client.try_recv().is_ok() {}
         }
         if pass >= WARMUP_PASSES {
-            histogram
-                .record(u64::try_from(elapsed.as_micros()).expect("fits u64"))
-                .expect("within bounds");
+            record(&mut histogram, elapsed.as_micros());
         }
     }
     let state = engine.state();
-    assert_eq!(state.running, BATCH, "every decode is still running");
-    assert_eq!(state.waiting, WAITING, "the window is still full");
+    assert_eq!(state.running, DECODE_BATCH, "every decode is still running");
+    assert_eq!(state.waiting, DECODE_WAITING, "the window is still full");
+    histogram
+}
 
+/// Prompts that share a family prefix, run a handful of decodes and finish, replaced as they go:
+/// every pass admits over prefix hits, evicts to lease, and retires what finished.
+fn measure_churn() -> Histogram<u64> {
+    let (mut engine, handle, mut rings) =
+        Engine::new(&churn_config()).expect("the bench configuration is valid");
+    let mut clients = Vec::with_capacity(CHURN_BATCH + CHURN_WAITING);
+    let mut next: u32 = 0;
+    let mut finished = 0;
+    for _ in 0..CHURN_BATCH + CHURN_WAITING {
+        let (request, receiver) = new_request(family_prompt(next), CHURN_NEW_TOKENS);
+        submit(&handle, request);
+        clients.push(receiver);
+        next += 1;
+    }
+
+    let mut histogram = new_histogram();
+    for pass in 0..WARMUP_PASSES + MEASURED_PASSES {
+        let started = Instant::now();
+        assert_eq!(engine.pass(), Pass::Continue);
+        let elapsed = started.elapsed();
+        answer(&mut rings);
+        let done = recycle(&mut clients);
+        finished += done;
+        for _ in 0..done {
+            let (request, receiver) = new_request(family_prompt(next), CHURN_NEW_TOKENS);
+            submit(&handle, request);
+            clients.push(receiver);
+            next += 1;
+        }
+        if pass >= WARMUP_PASSES {
+            record(&mut histogram, elapsed.as_micros());
+        }
+    }
+    assert!(
+        finished > MEASURED_PASSES / CHURN_NEW_TOKENS,
+        "requests finished and were replaced throughout: {finished}"
+    );
+    let state = engine.state();
+    assert_eq!(
+        state.free_blocks, 0,
+        "the pool is committed, so a block comes only from evicting cache"
+    );
+    assert!(
+        state.available_blocks > 0,
+        "finished requests left cache behind for the next prompt of their family to claim"
+    );
+    histogram
+}
+
+/// Reports one scenario, returning whether its p99 reached the limit.
+fn over_limit(scenario: &'static str, histogram: &Histogram<u64>) -> bool {
     let p99 = histogram.value_at_quantile(0.99);
     info!(
-        batch = BATCH,
-        context_tokens = CONTEXT_TOKENS,
-        waiting = WAITING,
+        scenario,
         passes = MEASURED_PASSES,
         p50_us = histogram.value_at_quantile(0.5),
         p90_us = histogram.value_at_quantile(0.9),
@@ -148,10 +305,22 @@ fn main() -> ExitCode {
     );
     if p99 >= P99_LIMIT_MICROS {
         error!(
+            scenario,
             p99_us = p99,
             limit_us = P99_LIMIT_MICROS,
             "step-path p99 is over the limit"
         );
+        return true;
+    }
+    false
+}
+
+fn main() -> ExitCode {
+    tracing_subscriber::fmt().with_target(false).init();
+    let decode = measure_decode();
+    let churn = measure_churn();
+    let breached = over_limit("decode", &decode) | over_limit("prefix churn", &churn);
+    if breached {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
