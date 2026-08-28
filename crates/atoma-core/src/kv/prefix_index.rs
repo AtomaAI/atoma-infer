@@ -3,10 +3,12 @@
 //! A radix tree over block-sized runs, stored as an index-based slab. Because a chain hash
 //! commits to its whole prefix, each run's node is found by its hash in one map probe, so
 //! longest-prefix match is a single traversal of the query's hashes; parent links and child
-//! counts keep the tree shape for leaf-only eviction. The index answers in block hashes, never
-//! slot ids — which slot holds a hash's bytes is the pool's separate residence lookup.
+//! counts keep the tree shape for leaf-only eviction, and the unpinned leaves sit in a set
+//! ordered by recency so the eviction victim is found without a scan. The index answers in block
+//! hashes, never slot ids — which slot holds a hash's bytes is the pool's separate residence
+//! lookup.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::mem;
 
 use crate::types::BlockHash;
@@ -21,15 +23,6 @@ enum Slot {
     },
 }
 
-impl Slot {
-    fn occupied(&self) -> Option<&Node> {
-        match self {
-            Slot::Occupied(node) => Some(node),
-            Slot::Vacant { next_free: _ } => None,
-        }
-    }
-}
-
 #[derive(Debug)]
 struct Node {
     hash: BlockHash,
@@ -41,6 +34,13 @@ struct Node {
     last_touch: u64,
 }
 
+impl Node {
+    /// Whether nothing pins the node and nothing hangs below it: the only removable shape.
+    fn is_unpinned_leaf(&self) -> bool {
+        self.pins == 0 && self.child_count == 0
+    }
+}
+
 /// Radix index over chains of block hashes, with pins and leaf-only LRU eviction.
 ///
 /// Single-owner, like the pool: `&mut self` everywhere, no lock, no reference-counted sharing.
@@ -50,6 +50,9 @@ pub struct PrefixIndex {
     /// Head of the free list threaded through the vacant slots.
     free_head: Option<u32>,
     node_by_hash: HashMap<BlockHash, u32>,
+    /// Exactly the unpinned leaves, keyed by `(last_touch, slot)` so the first entry is the
+    /// least recently touched.
+    evictable: BTreeSet<(u64, u32)>,
     clock: u64,
 }
 
@@ -70,7 +73,7 @@ impl PrefixIndex {
             let Some(&slot) = self.node_by_hash.get(hash) else {
                 break;
             };
-            self.node(slot).last_touch = clock;
+            self.update_node(slot, |node| node.last_touch = clock);
             matched += 1;
         }
         matched
@@ -89,42 +92,44 @@ impl PrefixIndex {
                 Some(&slot) => slot,
                 None => self.create_node(*hash, parent),
             };
-            let node = self.node(slot);
-            node.pins += 1;
-            node.last_touch = clock;
+            self.update_node(slot, |node| {
+                node.pins += 1;
+                node.last_touch = clock;
+            });
             parent = Some(slot);
         }
     }
 
-    /// Releases one pin on every node of `hashes`. Call with the exact path a prior
+    /// Releases one pin on every node of `hashes`, the exact path a prior
     /// [`PrefixIndex::insert`] stored; the nodes cannot have been removed while pinned.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `hashes` is not a stored, still-pinned path. Releasing a pin the caller never
+    /// took would let a live sequence's prefix be evicted from under it, so the bug surfaces here
+    /// instead of as a corrupted cache later.
     pub fn unpin(&mut self, hashes: &[BlockHash]) {
         self.clock += 1;
         let clock = self.clock;
         for hash in hashes {
             let Some(&slot) = self.node_by_hash.get(hash) else {
-                debug_assert!(false, "unpin of a path never inserted: {hash:?}");
-                continue;
+                panic!("unpin of a path never inserted: {hash:?}");
             };
-            let node = self.node(slot);
-            debug_assert!(node.pins > 0, "unpin below zero for {hash:?}");
-            node.pins = node.pins.saturating_sub(1);
-            node.last_touch = clock;
+            self.update_node(slot, |node| {
+                assert!(node.pins > 0, "unpin of an unpinned node: {hash:?}");
+                node.pins -= 1;
+                node.last_touch = clock;
+            });
         }
     }
 
     /// Removes and returns the least-recently-touched unpinned leaf, or `None` when every node
     /// is pinned or interior. The caller evicts the hash's bytes from wherever they reside.
     pub fn evict_lru(&mut self) -> Option<BlockHash> {
-        let victim = self
-            .slots
-            .iter()
-            .filter_map(Slot::occupied)
-            .filter(|node| node.pins == 0 && node.child_count == 0)
-            .min_by_key(|node| node.last_touch)?
-            .hash;
-        self.remove_leaf(victim);
-        Some(victim)
+        let &(_, slot) = self.evictable.first()?;
+        let hash = self.node(slot).hash;
+        self.vacate(slot);
+        Some(hash)
     }
 
     /// Removes `hash`'s node if it is an unpinned leaf, returning whether it was removed.
@@ -133,19 +138,10 @@ impl PrefixIndex {
         let Some(&slot) = self.node_by_hash.get(&hash) else {
             return false;
         };
-        let node = self.node(slot);
-        if node.pins > 0 || node.child_count > 0 {
+        if !self.node(slot).is_unpinned_leaf() {
             return false;
         }
-        let parent = node.parent;
-        self.slots[slot as usize] = Slot::Vacant {
-            next_free: self.free_head,
-        };
-        self.free_head = Some(slot);
-        self.node_by_hash.remove(&hash);
-        if let Some(parent) = parent {
-            self.node(parent).child_count -= 1;
-        }
+        self.vacate(slot);
         true
     }
 
@@ -167,9 +163,40 @@ impl PrefixIndex {
         self.node_by_hash.is_empty()
     }
 
+    /// Removes the unpinned leaf at `slot`, recycling its slot and unhooking it from its parent.
+    fn vacate(&mut self, slot: u32) {
+        let node = self.node(slot);
+        let key = (node.last_touch, slot);
+        let hash = node.hash;
+        let parent = node.parent;
+        self.evictable.remove(&key);
+        self.slots[slot as usize] = Slot::Vacant {
+            next_free: self.free_head,
+        };
+        self.free_head = Some(slot);
+        self.node_by_hash.remove(&hash);
+        if let Some(parent) = parent {
+            self.update_node(parent, |node| node.child_count -= 1);
+        }
+    }
+
+    /// Applies `update` to the node at `slot`, keeping its `evictable` membership in step with
+    /// whatever pins, children or recency the update changed.
+    fn update_node(&mut self, slot: u32, update: impl FnOnce(&mut Node)) {
+        let node = self.node(slot);
+        let before = (node.last_touch, slot);
+        update(node);
+        let after = (node.last_touch, slot);
+        let evictable = node.is_unpinned_leaf();
+        self.evictable.remove(&before);
+        if evictable {
+            self.evictable.insert(after);
+        }
+    }
+
     fn create_node(&mut self, hash: BlockHash, parent: Option<u32>) -> u32 {
         if let Some(parent) = parent {
-            self.node(parent).child_count += 1;
+            self.update_node(parent, |node| node.child_count += 1);
         }
         let node = Node {
             hash,
@@ -207,13 +234,14 @@ mod tests {
     use proptest::prelude::*;
 
     use super::PrefixIndex;
+    use crate::kv::test_support::hash_of;
     use crate::kv::{ExtraKeys, HashAlgorithm};
-    use crate::types::{BlockHash, TokenCount};
+    use crate::test_support::tokens;
+    use crate::types::BlockHash;
 
     /// Chains `tokens` with block size 2 so short test sequences span several runs.
-    fn chain(tokens: &[u32]) -> Vec<BlockHash> {
-        let block_size = TokenCount::new(2).expect("test block size is nonzero");
-        HashAlgorithm::Sha256V1.chain(block_size, tokens, ExtraKeys::none())
+    fn chain(tokens_ids: &[u32]) -> Vec<BlockHash> {
+        HashAlgorithm::Sha256V1.chain(tokens(2), tokens_ids, ExtraKeys::none())
     }
 
     #[test]
@@ -324,6 +352,19 @@ mod tests {
     }
 
     #[test]
+    fn a_leaf_repinned_by_a_later_insert_leaves_the_eviction_order() {
+        let mut index = PrefixIndex::new();
+        let path = chain(&[1, 2, 3, 4]);
+        index.insert(&path);
+        index.unpin(&path);
+
+        index.insert(&path);
+        assert_eq!(index.evict_lru(), None, "re-pinned, nothing evicts");
+        index.unpin(&path);
+        assert_eq!(index.evict_lru(), Some(path[1]));
+    }
+
+    #[test]
     fn remove_leaf_refuses_pinned_and_interior_nodes() {
         let mut index = PrefixIndex::new();
         let path = chain(&[1, 2, 3, 4]);
@@ -349,6 +390,23 @@ mod tests {
         index.insert(&path);
         assert_eq!(index.lookup(&path), 2);
         assert_eq!(index.len(), 2);
+        index.unpin(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "never inserted")]
+    fn unpinning_a_path_never_inserted_is_a_caller_bug() {
+        let mut index = PrefixIndex::new();
+        index.unpin(&[hash_of(&[1, 2])]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unpinned node")]
+    fn unpinning_twice_is_a_caller_bug() {
+        let mut index = PrefixIndex::new();
+        let path = chain(&[1, 2, 3, 4]);
+        index.insert(&path);
+        index.unpin(&path);
         index.unpin(&path);
     }
 
@@ -383,6 +441,41 @@ mod tests {
             for hashes in &stored_chains {
                 index.unpin(hashes);
             }
+        }
+
+        /// Oracle: after every path is unpinned, draining `evict_lru` removes exactly the stored
+        /// nodes, each only once it has no children left — so the drain order is a valid
+        /// leaf-first order and the index ends empty.
+        #[test]
+        fn draining_eviction_is_leaf_first_and_empties_the_index(
+            stored in vec(vec(0_u32..3, 0..12), 0..6),
+        ) {
+            let mut index = PrefixIndex::new();
+            let stored_chains: Vec<Vec<_>> = stored.iter().map(|tokens| chain(tokens)).collect();
+            for hashes in &stored_chains {
+                index.insert(hashes);
+            }
+            for hashes in &stored_chains {
+                index.unpin(hashes);
+            }
+            let stored_nodes = index.len();
+
+            let mut evicted = Vec::new();
+            while let Some(hash) = index.evict_lru() {
+                for stored_chain in &stored_chains {
+                    if let Some(position) = stored_chain.iter().position(|h| *h == hash) {
+                        for child in &stored_chain[position + 1..] {
+                            prop_assert!(
+                                evicted.contains(child),
+                                "a node evicted before its child"
+                            );
+                        }
+                    }
+                }
+                evicted.push(hash);
+            }
+            prop_assert_eq!(evicted.len(), stored_nodes);
+            prop_assert!(index.is_empty());
         }
     }
 }
