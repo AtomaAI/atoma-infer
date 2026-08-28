@@ -32,6 +32,7 @@ candle-transformers = "0.11.0"
 chrono = "0.4.45"
 clap = "4.5.18"
 config = "0.15.25"
+crossbeam-utils = "0.8.22"
 cuda-runtime-sys = "0.3.0-alpha.1"
 cudarc = { version = "0.19.8", features = [
     "cublas",
