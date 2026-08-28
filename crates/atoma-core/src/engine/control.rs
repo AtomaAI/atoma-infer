@@ -13,8 +13,9 @@ use crate::types::StepId;
 /// A message to the engine thread.
 #[derive(Debug)]
 pub enum Control {
-    /// Stop admission and let running requests finish; reply with the engine's state once
-    /// nothing runs and no step is in flight. Admission does not resume.
+    /// Stop admitting waiting requests and let every request that has run finish; reply with the
+    /// engine's state once nothing runs, nothing is preempted and no step is in flight.
+    /// Admission does not resume.
     Drain { reply: Sender<EngineState> },
     /// Finish every live request as shut down and return from the thread.
     Shutdown,

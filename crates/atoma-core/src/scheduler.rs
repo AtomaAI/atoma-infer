@@ -287,7 +287,9 @@ impl Scheduler {
         &self.padding
     }
 
-    /// Stops admission for good: running requests finish, nothing else enters Running.
+    /// Stops admission for waiting requests, for good. Running requests finish, and preempted
+    /// requests — running requests the pool displaced — still re-enter to finish; nothing that
+    /// has never run enters Running again.
     pub fn close_admission(&mut self) {
         self.admission_open = false;
     }
@@ -610,9 +612,6 @@ impl Scheduler {
     /// one's cached prefix, and stops at the first request the budget or the pool cannot serve.
     /// Admission never preempts.
     fn admit(&mut self, entries: &mut Vec<Entry>) {
-        if !self.admission_open {
-            return;
-        }
         for _ in 0..self.config.window.get() {
             let Some((slot, from)) = self.next_candidate() else {
                 return;
@@ -685,11 +684,15 @@ impl Scheduler {
 }
 
 impl Scheduler {
-    /// The next admission candidate: the preempted stack top, or the waiting request the policy
-    /// picks from the window. Cancelled waiting requests inside the window retire on the way.
+    /// The next admission candidate: the preempted stack top, or — while admission is open —
+    /// the waiting request the policy picks from the window. A closed admission still offers the
+    /// preempted stack, since those are running requests on their way to finishing.
     fn next_candidate(&mut self) -> Option<(RequestSlot, Candidate)> {
         if let Some(&slot) = self.preempted.last() {
             return Some((slot, Candidate::Preempted));
+        }
+        if !self.admission_open {
+            return None;
         }
         self.retire_cancelled_in_window();
         let position = match self.config.admission {

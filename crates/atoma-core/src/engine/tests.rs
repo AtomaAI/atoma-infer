@@ -231,6 +231,54 @@ fn a_drain_stops_admission_and_reports_once_nothing_is_in_flight() {
     assert_eq!(engine.state().waiting, 1);
 }
 
+/// A preempted request is a running request the pool displaced, so a drain waits for it: it
+/// re-enters, finishes and tells its client before the drain is answered.
+#[test]
+fn a_drain_waits_for_a_preempted_request_to_finish() {
+    // Two one-block requests and no block to grow either: the second decode preempts.
+    let mut config = config(8, 8);
+    config.scheduler.max_model_len = tokens(2 * BLOCK_SIZE);
+    config.block_count = u32::try_from(MAX_BATCH - 1 + 2).unwrap();
+    let (mut engine, handle, rings) = Engine::new(&config).unwrap();
+    let mut executor = MockExecutor::constant(rings, 1);
+    let first = submit(&handle, BLOCK_SIZE, 16);
+    let second = submit(&handle, BLOCK_SIZE, 16);
+
+    turn(&mut engine, &mut executor);
+    assert_eq!(engine.state().running, 2, "both prefill together");
+    turn(&mut engine, &mut executor);
+    assert_eq!(engine.state().preempted, 1, "the pool cannot grow both");
+
+    let (reply, drained) = flume::bounded(1);
+    handle.control.try_send(Control::Drain { reply }).unwrap();
+    turn(&mut engine, &mut executor);
+    assert!(engine.state().draining);
+    assert!(
+        drained.try_recv().is_err(),
+        "a preempted request is still live"
+    );
+
+    let mut answer = None;
+    for _ in 0..16 {
+        turn(&mut engine, &mut executor);
+        if let Ok(state) = drained.try_recv() {
+            answer = Some(state);
+            break;
+        }
+    }
+    let state = answer.expect("the preempted request re-entered and finished");
+    assert_eq!(state.running, 0);
+    assert_eq!(state.preempted, 0);
+    assert!(!state.step_in_flight);
+    assert_eq!(state.live_requests, 0);
+    assert_eq!(finish_reason(&first), Some(FinishReason::MaxModelLength));
+    assert_eq!(
+        finish_reason(&second),
+        Some(FinishReason::MaxModelLength),
+        "the preempted request was told, not stranded"
+    );
+}
+
 #[test]
 fn shutdown_finishes_every_live_request_and_exits() {
     let (mut engine, handle, mut executor) = engine(2, 8);

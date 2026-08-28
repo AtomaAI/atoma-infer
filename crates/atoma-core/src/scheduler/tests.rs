@@ -1087,6 +1087,38 @@ fn closing_admission_lets_running_requests_finish_and_admits_nothing_more() {
     assert!(step(&mut scheduler).is_empty(), "nothing is admitted after");
 }
 
+/// A closed admission refuses only requests that have never run. A preempted request is a
+/// running request the pool displaced, so it re-enters and finishes; without that it would hold
+/// a live slot with no way back into Running until shutdown.
+#[test]
+fn a_closed_admission_still_re_admits_preempted_requests() {
+    let mut scheduler = scheduler(2, 64, 2);
+    let mut clients = Clients::default();
+    let a = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    let b = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    assert_eq!(slots(&step(&mut scheduler)), [a, b]);
+    assert_eq!(
+        step(&mut scheduler).preempted,
+        [b],
+        "the pool cannot grow both"
+    );
+
+    scheduler.close_admission();
+    let never_ran = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    drop(clients.receivers.remove(0));
+
+    let readmit = step(&mut scheduler);
+    assert_eq!(slots(&readmit), [b], "the preempted request re-enters");
+    assert_eq!(readmit.entries[0].context_len, 0, "and recomputes");
+    assert_eq!(scheduler.running(), [b]);
+    assert!(scheduler.preempted().is_empty());
+    assert_eq!(
+        scheduler.waiting(),
+        &VecDeque::from([never_ran]),
+        "what never ran stays waiting"
+    );
+}
+
 #[test]
 fn finishing_everything_tells_every_client_and_keeps_the_dummies() {
     let mut scheduler = scheduler(8, 100, 64);

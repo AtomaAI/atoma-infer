@@ -279,7 +279,7 @@ impl Engine {
         while let Some(control) = self.control.try_recv() {
             match control {
                 Control::Drain { reply } => {
-                    info!("draining: admission closed");
+                    info!("draining: admission closed to waiting requests");
                     self.scheduler.close_admission();
                     self.draining = Some(reply);
                 }
@@ -348,9 +348,11 @@ impl Engine {
         self.in_flight = Some(scheduled);
     }
 
-    /// Reports the drain once nothing runs and no step is in flight.
+    /// Reports the drain once every live request is over: nothing running, nothing preempted
+    /// waiting to re-enter, and no step in flight.
     fn answer_drain(&mut self) {
-        if self.in_flight.is_some() || !self.scheduler.running().is_empty() {
+        let live = !self.scheduler.running().is_empty() || !self.scheduler.preempted().is_empty();
+        if self.in_flight.is_some() || live {
             return;
         }
         if let Some(reply) = self.draining.take() {
