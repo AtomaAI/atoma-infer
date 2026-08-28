@@ -87,17 +87,26 @@ impl HashAlgorithm {
     }
 }
 
+/// Domain string opening every `sha256_v1` digest, separating this encoding from any other use
+/// of SHA-256 over similar bytes. Part of the frozen encoding: changing it orphans every
+/// written cache.
+const SHA256_V1_DOMAIN: &[u8] = b"atoma-kv-sha256-v1";
+/// Presence byte preceding an optional field that is absent.
+const FIELD_ABSENT: [u8; 1] = [0];
+/// Presence byte preceding an optional field that follows.
+const FIELD_PRESENT: [u8; 1] = [1];
+
 fn sha256_v1_run(
     parent: Option<BlockHash>,
     token_ids: &[u32],
     extra_keys: ExtraKeys<'_>,
 ) -> BlockHash {
     let mut hasher = Sha256::new();
-    hasher.update(b"atoma-kv-sha256-v1");
+    hasher.update(SHA256_V1_DOMAIN);
     match parent {
-        None => hasher.update([0u8]),
+        None => hasher.update(FIELD_ABSENT),
         Some(parent) => {
-            hasher.update([1u8]);
+            hasher.update(FIELD_PRESENT);
             hasher.update(parent.as_bytes());
         }
     }
@@ -106,17 +115,17 @@ fn sha256_v1_run(
         hasher.update(token.to_le_bytes());
     }
     match extra_keys.cache_salt {
-        None => hasher.update([0u8]),
+        None => hasher.update(FIELD_ABSENT),
         Some(salt) => {
-            hasher.update([1u8]);
+            hasher.update(FIELD_PRESENT);
             hasher.update((salt.len() as u64).to_le_bytes());
             hasher.update(salt);
         }
     }
     match extra_keys.adapter_slot {
-        None => hasher.update([0u8]),
+        None => hasher.update(FIELD_ABSENT),
         Some(slot) => {
-            hasher.update([1u8]);
+            hasher.update(FIELD_PRESENT);
             hasher.update(slot.to_le_bytes());
         }
     }
