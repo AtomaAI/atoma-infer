@@ -29,7 +29,7 @@ pub enum Tier {
 #[serde(rename_all = "snake_case")]
 pub enum KvEvent {
     /// `hash`'s bytes became resident in `tier`. `parent` lets a consumer rebuild the prefix
-    /// tree without ever seeing a token.
+    /// index without ever seeing a token.
     BlockStored {
         hash: BlockHash,
         parent: Option<BlockHash>,
