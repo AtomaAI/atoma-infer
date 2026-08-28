@@ -10,6 +10,15 @@ use sha2::{Digest, Sha256};
 
 use crate::protocol::{BlockHash, TokenCount};
 
+/// Domain string opening every `sha256_v1` digest, separating this encoding from any other use
+/// of SHA-256 over similar bytes. Part of the frozen encoding: changing it orphans every
+/// written cache.
+const SHA256_V1_DOMAIN: &[u8] = b"atoma-kv-sha256-v1";
+/// Presence byte preceding an optional field that is absent.
+const FIELD_ABSENT: [u8; 1] = [0];
+/// Presence byte preceding an optional field that follows.
+const FIELD_PRESENT: [u8; 1] = [1];
+
 /// The fields beyond the token run that namespace a block's identity.
 ///
 /// Both fields are carried in the digest from day one so populating them later never changes the
@@ -86,15 +95,6 @@ impl HashAlgorithm {
             .collect()
     }
 }
-
-/// Domain string opening every `sha256_v1` digest, separating this encoding from any other use
-/// of SHA-256 over similar bytes. Part of the frozen encoding: changing it orphans every
-/// written cache.
-const SHA256_V1_DOMAIN: &[u8] = b"atoma-kv-sha256-v1";
-/// Presence byte preceding an optional field that is absent.
-const FIELD_ABSENT: [u8; 1] = [0];
-/// Presence byte preceding an optional field that follows.
-const FIELD_PRESENT: [u8; 1] = [1];
 
 fn sha256_v1_run(
     parent: Option<BlockHash>,
