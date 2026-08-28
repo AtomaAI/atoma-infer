@@ -57,12 +57,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{KvEvent, KvEventBatch, Tier};
-    use crate::kv::{ExtraKeys, HashAlgorithm};
-    use crate::types::BlockHash;
-
-    fn hash_of(tokens: &[u32]) -> BlockHash {
-        HashAlgorithm::Sha256V1.hash_run(None, tokens, ExtraKeys::none())
-    }
+    use crate::kv::test_support::hash_of;
+    use crate::kv::HashAlgorithm;
 
     fn every_event() -> Vec<KvEvent> {
         let hash = hash_of(&[1, 2, 3, 4]);

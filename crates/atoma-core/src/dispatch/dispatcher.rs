@@ -110,8 +110,9 @@ mod tests {
     use tracing::Level;
 
     use super::{CaptureKind, DispatchConfig, DispatchDecision, Dispatcher, EagerFallbackCounters};
-    use crate::dispatch::test_support::{batch, requests, tokens};
+    use crate::dispatch::test_support::batch;
     use crate::dispatch::{BucketLadder, Platform, RejectionReason, SupportLevel};
+    use crate::test_support::{requests, tokens};
 
     /// Log output collected behind the process-global subscriber.
     ///

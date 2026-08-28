@@ -22,15 +22,7 @@ pub use lookup::PaddingLookup;
 #[cfg(test)]
 pub(crate) mod test_support {
     use crate::dispatch::LiveBatch;
-    use crate::types::{RequestCount, TokenCount};
-
-    pub(crate) fn tokens(value: usize) -> TokenCount {
-        TokenCount::new(value).expect("test token counts are nonzero")
-    }
-
-    pub(crate) fn requests(value: usize) -> RequestCount {
-        RequestCount::new(value).expect("test request counts are nonzero")
-    }
+    use crate::test_support::{requests, tokens};
 
     pub(crate) fn batch(
         token_count: usize,

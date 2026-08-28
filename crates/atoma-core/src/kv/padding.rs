@@ -86,33 +86,11 @@ pub enum PaddingError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::num::NonZeroUsize;
 
     use super::{PaddingError, PaddingReservation};
-    use crate::kv::{BlockLayout, BlockPool, CacheKind, KvCacheSpec, KvSource, LayerGroup};
-    use crate::types::{LayerGroupId, RequestCount, TokenCount};
-
-    fn max_batch(requests: usize) -> RequestCount {
-        RequestCount::new(requests).expect("test batches are nonzero")
-    }
-
-    /// One full-attention group whose blocks cost exactly 2 MiB each.
-    fn two_mib_spec() -> KvCacheSpec {
-        let nonzero = |value| NonZeroUsize::new(value).expect("test values are nonzero");
-        KvCacheSpec::new(vec![LayerGroup {
-            id: LayerGroupId::new(0),
-            layer_count: nonzero(32),
-            kind: CacheKind::Full,
-            layout: BlockLayout {
-                block_size: TokenCount::new(16).expect("nonzero"),
-                kv_head_count: nonzero(8),
-                head_width: nonzero(128),
-                element_bytes: nonzero(2),
-            },
-            kv_source: KvSource::Own,
-        }])
-        .expect("one owning group is a valid spec")
-    }
+    use crate::kv::test_support::full_attention_group;
+    use crate::kv::{BlockPool, KvCacheSpec};
+    use crate::test_support::requests as max_batch;
 
     #[test]
     fn the_reservation_holds_one_distinct_block_per_dummy() {
@@ -173,7 +151,7 @@ mod tests {
 
     #[test]
     fn padding_cost_is_reported_at_configuration_time() {
-        let spec = two_mib_spec();
+        let spec = KvCacheSpec::new(vec![full_attention_group(0)]).unwrap();
         assert_eq!(
             PaddingReservation::cost_bytes(&spec, max_batch(4)),
             3 * 2 * 1024 * 1024

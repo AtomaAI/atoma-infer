@@ -69,8 +69,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::PaddingLookup;
-    use crate::dispatch::test_support::tokens;
     use crate::dispatch::{BucketLadder, Platform};
+    use crate::test_support::tokens;
     use crate::types::TokenCount;
 
     /// Test-side oracle, independent of the table's filter-and-min: sort a copy of the ladder

@@ -159,35 +159,14 @@ pub enum LayerGroupError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-
-    use super::{BlockLayout, CacheKind, KvCacheSpec, KvSource, LayerGroup, LayerGroupError};
-    use crate::types::{LayerGroupId, TokenCount};
-
-    fn nonzero(value: usize) -> NonZeroUsize {
-        NonZeroUsize::new(value).expect("test values are nonzero")
-    }
-
-    /// A Llama-8B-shaped full-attention group: 32 layers, 8 KV heads of width 128, bf16.
-    fn full_group(id: u16) -> LayerGroup {
-        LayerGroup {
-            id: LayerGroupId::new(id),
-            layer_count: nonzero(32),
-            kind: CacheKind::Full,
-            layout: BlockLayout {
-                block_size: TokenCount::new(16).expect("nonzero"),
-                kv_head_count: nonzero(8),
-                head_width: nonzero(128),
-                element_bytes: nonzero(2),
-            },
-            kv_source: KvSource::Own,
-        }
-    }
+    use super::{CacheKind, KvCacheSpec, KvSource, LayerGroup, LayerGroupError};
+    use crate::kv::test_support::full_attention_group;
+    use crate::types::LayerGroupId;
 
     #[test]
     fn block_bytes_multiply_out_the_declared_geometry() {
         // 2 (K and V) x 32 layers x 16 tokens x 8 heads x 128 wide x 2 bytes = 2 MiB.
-        assert_eq!(full_group(0).block_bytes(), 2 * 1024 * 1024);
+        assert_eq!(full_attention_group(0).block_bytes(), 2 * 1024 * 1024);
     }
 
     #[test]
@@ -195,11 +174,11 @@ mod tests {
         let shared = LayerGroup {
             id: LayerGroupId::new(1),
             kv_source: KvSource::SharedFrom(LayerGroupId::new(0)),
-            ..full_group(1)
+            ..full_attention_group(1)
         };
         assert_eq!(shared.block_bytes(), 0);
 
-        let spec = KvCacheSpec::new(vec![full_group(0), shared]).unwrap();
+        let spec = KvCacheSpec::new(vec![full_attention_group(0), shared]).unwrap();
         assert_eq!(
             spec.bytes_per_block(),
             2 * 1024 * 1024,
@@ -228,7 +207,7 @@ mod tests {
     #[test]
     fn duplicate_group_ids_are_rejected() {
         assert_eq!(
-            KvCacheSpec::new(vec![full_group(0), full_group(0)]),
+            KvCacheSpec::new(vec![full_attention_group(0), full_attention_group(0)]),
             Err(LayerGroupError::DuplicateId {
                 id: LayerGroupId::new(0)
             })
@@ -239,10 +218,10 @@ mod tests {
     fn a_missing_shared_source_is_rejected() {
         let dangling = LayerGroup {
             kv_source: KvSource::SharedFrom(LayerGroupId::new(7)),
-            ..full_group(1)
+            ..full_attention_group(1)
         };
         assert_eq!(
-            KvCacheSpec::new(vec![full_group(0), dangling]),
+            KvCacheSpec::new(vec![full_attention_group(0), dangling]),
             Err(LayerGroupError::SharedSourceMissing {
                 id: LayerGroupId::new(1),
                 shared_from: LayerGroupId::new(7),
@@ -254,14 +233,14 @@ mod tests {
     fn sharing_from_a_sharing_group_is_rejected() {
         let first_sharer = LayerGroup {
             kv_source: KvSource::SharedFrom(LayerGroupId::new(0)),
-            ..full_group(1)
+            ..full_attention_group(1)
         };
         let chained = LayerGroup {
             kv_source: KvSource::SharedFrom(LayerGroupId::new(1)),
-            ..full_group(2)
+            ..full_attention_group(2)
         };
         assert_eq!(
-            KvCacheSpec::new(vec![full_group(0), first_sharer, chained]),
+            KvCacheSpec::new(vec![full_attention_group(0), first_sharer, chained]),
             Err(LayerGroupError::SharedSourceNotOwn {
                 id: LayerGroupId::new(2),
                 shared_from: LayerGroupId::new(1),

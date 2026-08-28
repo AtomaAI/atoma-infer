@@ -212,8 +212,9 @@ fn required_support(batch: LiveBatch) -> SupportLevel {
 #[cfg(test)]
 mod tests {
     use super::{admit, RejectionReason, SupportLevel};
-    use crate::dispatch::test_support::{batch, requests, tokens};
+    use crate::dispatch::test_support::batch;
     use crate::dispatch::{BucketLadder, PaddingLookup, Platform};
+    use crate::test_support::{requests, tokens};
 
     fn hopper_lookup() -> PaddingLookup {
         PaddingLookup::new(&BucketLadder::default_for(Platform::Hopper))

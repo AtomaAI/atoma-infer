@@ -253,12 +253,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{BlockLease, BlockPool};
-    use crate::kv::{ExtraKeys, HashAlgorithm};
-    use crate::types::BlockHash;
-
-    fn hash_of(tokens: &[u32]) -> BlockHash {
-        HashAlgorithm::Sha256V1.hash_run(None, tokens, ExtraKeys::none())
-    }
+    use crate::kv::test_support::hash_of;
 
     fn release_all(pool: &mut BlockPool, leases: Vec<BlockLease>) {
         for lease in leases {

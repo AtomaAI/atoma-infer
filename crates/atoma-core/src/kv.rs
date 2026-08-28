@@ -20,16 +20,52 @@ pub use pool::{BlockLease, BlockPool};
 pub use prefix_index::PrefixIndex;
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::num::NonZeroUsize;
+
+    use crate::kv::{BlockLayout, CacheKind, ExtraKeys, HashAlgorithm, KvSource, LayerGroup};
+    use crate::test_support::tokens;
+    use crate::types::{BlockHash, LayerGroupId};
+
+    /// The `sha256_v1` digest of `tokens` as a root run under the empty namespace.
+    pub(crate) fn hash_of(tokens: &[u32]) -> BlockHash {
+        HashAlgorithm::Sha256V1.hash_run(None, tokens, ExtraKeys::none())
+    }
+
+    fn nonzero(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).expect("test values are nonzero")
+    }
+
+    /// A Llama-8B-shaped full-attention group — 32 layers, 8 KV heads of width 128, bf16,
+    /// 16-token blocks — so one block costs exactly 2 MiB.
+    pub(crate) fn full_attention_group(id: u16) -> LayerGroup {
+        LayerGroup {
+            id: LayerGroupId::new(id),
+            layer_count: nonzero(32),
+            kind: CacheKind::Full,
+            layout: BlockLayout {
+                block_size: tokens(16),
+                kv_head_count: nonzero(8),
+                head_width: nonzero(128),
+                element_bytes: nonzero(2),
+            },
+            kv_source: KvSource::Own,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::kv::{BlockPool, ExtraKeys, HashAlgorithm, PrefixIndex};
-    use crate::types::{BlockHash, TokenCount};
+    use crate::test_support::tokens;
+    use crate::types::BlockHash;
 
     /// One admission-to-eviction cycle across the pool and the index together, as the engine
     /// will drive them: hashes looked up and inserted at admission, blocks leased per run,
     /// releases leaving cache behind, and eviction restoring the pool to baseline.
     #[test]
     fn free_count_returns_to_baseline_across_a_pool_and_index_cycle() {
-        let block_size = TokenCount::new(4).expect("test block size is nonzero");
+        let block_size = tokens(4);
         let algorithm = HashAlgorithm::Sha256V1;
         let mut pool = BlockPool::new(8);
         let mut index = PrefixIndex::new();

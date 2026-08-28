@@ -134,10 +134,9 @@ fn sha256_v1_run(
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
-
     use super::{ExtraKeys, HashAlgorithm};
-    use crate::types::{BlockHash, TokenCount};
+    use crate::test_support::tokens;
+    use crate::types::BlockHash;
 
     /// Golden digests computed by an independent Python hashlib implementation of the documented
     /// encoding. They pin both the encoding and cross-restart reproducibility: a digest that
@@ -150,48 +149,41 @@ mod tests {
     const RUN_1234_ADAPTER_3: &str =
         "38d200e2b532f9a9ce1d158cffabc9aa0428d8be1457dc42183b38c39b8c0911";
 
-    fn hex(hash: BlockHash) -> String {
-        hash.as_bytes().iter().fold(String::new(), |mut out, byte| {
-            // Writing into a String cannot fail.
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
-    }
-
-    fn block_size(tokens: usize) -> TokenCount {
-        TokenCount::new(tokens).expect("test block sizes are nonzero")
+    /// Compares `hash` against a golden hex digest through `BlockHash`'s hex `Debug` form.
+    fn assert_hex(hash: BlockHash, expected: &str) {
+        assert_eq!(format!("{hash:?}"), format!("BlockHash({expected})"));
     }
 
     #[test]
     fn digests_match_the_independent_oracle() {
         let algorithm = HashAlgorithm::Sha256V1;
         let root = algorithm.hash_run(None, &[1, 2, 3, 4], ExtraKeys::none());
-        assert_eq!(hex(root), RUN_1234);
-        assert_eq!(
-            hex(algorithm.hash_run(Some(root), &[5, 6, 7, 8], ExtraKeys::none())),
-            RUN_5678_UNDER_1234
+        assert_hex(root, RUN_1234);
+        assert_hex(
+            algorithm.hash_run(Some(root), &[5, 6, 7, 8], ExtraKeys::none()),
+            RUN_5678_UNDER_1234,
         );
-        assert_eq!(
-            hex(algorithm.hash_run(
+        assert_hex(
+            algorithm.hash_run(
                 None,
                 &[1, 2, 3, 4],
                 ExtraKeys {
                     cache_salt: Some(b"tenant-a"),
                     adapter_slot: None,
-                }
-            )),
-            RUN_1234_SALTED
+                },
+            ),
+            RUN_1234_SALTED,
         );
-        assert_eq!(
-            hex(algorithm.hash_run(
+        assert_hex(
+            algorithm.hash_run(
                 None,
                 &[1, 2, 3, 4],
                 ExtraKeys {
                     cache_salt: None,
                     adapter_slot: Some(3),
-                }
-            )),
-            RUN_1234_ADAPTER_3
+                },
+            ),
+            RUN_1234_ADAPTER_3,
         );
     }
 
@@ -228,36 +220,32 @@ mod tests {
     #[test]
     fn chain_hashes_full_runs_and_excludes_the_partial_tail() {
         let algorithm = HashAlgorithm::Sha256V1;
-        let chained = algorithm.chain(
-            block_size(4),
-            &[1, 2, 3, 4, 5, 6, 7, 8, 9],
-            ExtraKeys::none(),
-        );
+        let chained = algorithm.chain(tokens(4), &[1, 2, 3, 4, 5, 6, 7, 8, 9], ExtraKeys::none());
         assert_eq!(
             chained.len(),
             2,
             "the trailing run of one token has no identity"
         );
-        assert_eq!(hex(chained[0]), RUN_1234);
-        assert_eq!(hex(chained[1]), RUN_5678_UNDER_1234);
+        assert_hex(chained[0], RUN_1234);
+        assert_hex(chained[1], RUN_5678_UNDER_1234);
     }
 
     #[test]
     fn chain_of_an_exact_multiple_has_no_excluded_tail() {
         let algorithm = HashAlgorithm::Sha256V1;
-        let chained = algorithm.chain(block_size(4), &[1, 2, 3, 4, 5, 6, 7, 8], ExtraKeys::none());
+        let chained = algorithm.chain(tokens(4), &[1, 2, 3, 4, 5, 6, 7, 8], ExtraKeys::none());
         assert_eq!(chained.len(), 2);
-        assert_eq!(hex(chained[1]), RUN_5678_UNDER_1234);
+        assert_hex(chained[1], RUN_5678_UNDER_1234);
     }
 
     #[test]
     fn chains_over_empty_or_sub_block_tokens_are_empty() {
         let algorithm = HashAlgorithm::Sha256V1;
         assert!(algorithm
-            .chain(block_size(4), &[], ExtraKeys::none())
+            .chain(tokens(4), &[], ExtraKeys::none())
             .is_empty());
         assert!(algorithm
-            .chain(block_size(4), &[1, 2, 3], ExtraKeys::none())
+            .chain(tokens(4), &[1, 2, 3], ExtraKeys::none())
             .is_empty());
     }
 
