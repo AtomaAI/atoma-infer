@@ -3,6 +3,7 @@
 //! is woken by any of them, or by its idle deadline.
 
 mod command;
+mod config;
 mod control;
 mod heartbeat;
 mod ingress;
@@ -14,10 +15,11 @@ mod tests;
 mod thread;
 
 pub use command::build_command;
+pub use config::EngineConfig;
 pub use control::{
     control, Control, ControlReceiver, ControlSender, EngineState, CONTROL_CAPACITY,
 };
 pub use heartbeat::{heartbeat, Heartbeat, HeartbeatPublisher, HeartbeatReader};
 pub use ingress::{ingress, IngressReceiver, IngressRefused, IngressSender};
 pub use rings::{rings, EngineRings, ExecutorRings, RING_CAPACITY};
-pub use thread::{Engine, EngineConfig, EngineError, EngineHandle, EngineThread, Pass};
+pub use thread::{Engine, EngineError, EngineHandle, EngineThread, Pass};
