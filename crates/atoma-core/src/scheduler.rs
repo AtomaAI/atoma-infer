@@ -417,8 +417,8 @@ impl Scheduler {
     }
 
     /// Records the tokens step `scheduled` computed, appending each sampling entry's token from
-    /// `sampled` in entry order, telling every client what it got, and finishing the requests
-    /// that reached a stop criterion.
+    /// `sampled` in entry order, telling every client what it got, and retiring every request
+    /// that reached a stop criterion — each of them once, however many of its sequences stopped.
     ///
     /// # Panics
     ///
@@ -452,7 +452,12 @@ impl Scheduler {
                 token,
             });
             if let Some(reason) = self.stop_reason(entry.slot, entry.sequence, token) {
-                finished.push((entry.slot, reason));
+                // A request finishes once, for the first of its sequences to reach a stop
+                // criterion: retiring frees the slot, so a second entry for the same request
+                // would retire a slot that is no longer there.
+                if !finished.iter().any(|(finished, _)| *finished == entry.slot) {
+                    finished.push((entry.slot, reason));
+                }
             }
         }
         assert!(
