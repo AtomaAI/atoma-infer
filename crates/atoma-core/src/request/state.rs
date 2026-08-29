@@ -1,9 +1,10 @@
 //! Request and sequence state as the engine thread holds it: host-native, one owner, no locks.
 
+use crate::kv::{BlockLease, ExtraKeys, HashAlgorithm};
 use crate::request::{
     Egress, EgressSender, RequestEvent, RequestPhase, SamplingParams, StopCriteria, Usage, Waiting,
 };
-use crate::types::{BlockId, RequestId, StepId, TokenCount};
+use crate::types::{BlockHash, BlockId, RequestId, StepId, TokenCount};
 
 /// The one token a padding dummy computes every step it is inserted into.
 pub const PADDING_TOKEN: u32 = 0;
@@ -31,6 +32,16 @@ pub struct Sequence {
     /// The ordered block ids the sequence's KV occupies. Host-native: a step command is built
     /// from it with no device read.
     pub(crate) block_table: Vec<BlockId>,
+    /// The leases behind the blocks this sequence obtained fresh from the pool. Lease `i`
+    /// backs `block_table[hits + i]`.
+    pub(crate) leases: Vec<BlockLease>,
+    /// Leading block-table entries found in the prefix index at admission rather than leased.
+    pub(crate) hits: usize,
+    /// The chain hash of every full block of `tokens`, in block order. Identity only: it
+    /// survives preemption, since the tokens do.
+    pub(crate) chain: Vec<BlockHash>,
+    /// How many leading entries of `chain` this sequence pins in the prefix index.
+    pub(crate) pinned: usize,
 }
 
 impl Sequence {
@@ -41,7 +52,31 @@ impl Sequence {
             prompt_len,
             computed: 0,
             block_table: Vec::new(),
+            leases: Vec::new(),
+            hits: 0,
+            chain: Vec::new(),
+            pinned: 0,
         }
+    }
+
+    /// Extends the chain with the hash of every full block of `tokens` not yet hashed.
+    pub(crate) fn extend_chain(&mut self, algorithm: HashAlgorithm, block_size: TokenCount) {
+        let block_size = block_size.get();
+        let full_blocks = self.tokens.len() / block_size;
+        for block in self.chain.len()..full_blocks {
+            let run = &self.tokens[block * block_size..(block + 1) * block_size];
+            let parent = block.checked_sub(1).map(|parent| self.chain[parent]);
+            self.chain
+                .push(algorithm.hash_run(parent, run, ExtraKeys::none()));
+        }
+    }
+
+    /// The chain hashes a prefix lookup may claim: every full block except the one holding the
+    /// last token, so at least one token is always computed and a logit exists to sample from.
+    #[must_use]
+    pub(crate) fn hashable_prefix(&self, block_size: TokenCount) -> &[BlockHash] {
+        let blocks = (self.tokens.len().saturating_sub(1) / block_size.get()).min(self.chain.len());
+        &self.chain[..blocks]
     }
 
     /// The ordered block ids the sequence's KV occupies.
@@ -189,6 +224,12 @@ impl Request {
     #[must_use]
     pub fn phase(&self) -> RequestPhase {
         self.phase
+    }
+
+    /// Moves the request into `phase`. Only a value a legal transition produced can be passed,
+    /// and only the scheduler that owns the request can pass one.
+    pub(crate) fn set_phase(&mut self, phase: RequestPhase) {
+        self.phase = phase;
     }
 
     #[must_use]
