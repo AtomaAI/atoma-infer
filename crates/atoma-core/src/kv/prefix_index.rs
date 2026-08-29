@@ -105,8 +105,8 @@ impl PrefixIndex {
     ///
     /// This is how a live sequence extends its pinned path one block at a time as blocks fill:
     /// each call pins exactly the new node, so the path as a whole still unpins with one
-    /// [`PrefixIndex::unpin`]. A chain hash commits to its parent, so an already-stored `hash`
-    /// necessarily sits under `parent` already.
+    /// [`PrefixIndex::unpin`]. A chain hash commits to its parent, so a `hash` the index already
+    /// holds necessarily sits under `parent`.
     ///
     /// # Panics
     ///
