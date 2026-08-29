@@ -187,6 +187,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-utils",
  "flume",
+ "hdrhistogram",
  "proptest",
  "rtrb",
  "serde",
