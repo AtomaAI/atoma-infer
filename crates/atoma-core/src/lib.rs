@@ -5,9 +5,11 @@
 //! driver, and every test runs without a GPU.
 
 pub mod dispatch;
+pub mod engine;
 pub mod kv;
 pub mod request;
 pub mod scheduler;
+pub mod step;
 pub mod types;
 
 #[cfg(test)]
