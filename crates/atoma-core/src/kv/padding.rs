@@ -22,6 +22,13 @@ pub struct PaddingReservation {
 }
 
 impl PaddingReservation {
+    /// Dummies a maximum batch of `max_batch` entries can ever need: one fewer than the batch,
+    /// since a batch that is padded at all holds at least one live entry.
+    #[must_use]
+    pub fn dummies_for(max_batch: RequestCount) -> usize {
+        max_batch.get() - 1
+    }
+
     /// Reserves one block per dummy from `pool`, permanently.
     ///
     /// # Errors
@@ -29,7 +36,7 @@ impl PaddingReservation {
     /// Returns [`PaddingError::NotEnoughFreeBlocks`] when the pool cannot cover the reservation;
     /// nothing is reserved in that case.
     pub fn reserve(pool: &mut BlockPool, max_batch: RequestCount) -> Result<Self, PaddingError> {
-        let dummy_count = max_batch.get() - 1;
+        let dummy_count = Self::dummies_for(max_batch);
         let mut leases = Vec::with_capacity(dummy_count);
         for _ in 0..dummy_count {
             let Some(lease) = pool.lease() else {
@@ -51,7 +58,7 @@ impl PaddingReservation {
     /// pool exists.
     #[must_use]
     pub fn cost_bytes(spec: &KvCacheSpec, max_batch: RequestCount) -> usize {
-        (max_batch.get() - 1) * spec.bytes_per_block()
+        Self::dummies_for(max_batch) * spec.bytes_per_block()
     }
 
     /// Dummies reserved: the configured maximum batch minus one.

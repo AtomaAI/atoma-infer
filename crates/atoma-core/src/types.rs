@@ -43,6 +43,22 @@ impl RequestSlot {
     }
 }
 
+/// One sequence inside a request: its position in the request's sequence list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SequenceIndex(u16);
+
+impl SequenceIndex {
+    #[must_use]
+    pub const fn new(index: u16) -> Self {
+        Self(index)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
 /// One engine step, monotonically increasing over the process lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StepId(u64);
@@ -133,6 +149,9 @@ impl LayerGroupId {
 pub struct TokenCount(NonZeroUsize);
 
 impl TokenCount {
+    /// One token.
+    pub const ONE: Self = Self(NonZeroUsize::MIN);
+
     #[must_use]
     pub const fn new(count: usize) -> Option<Self> {
         match NonZeroUsize::new(count) {
@@ -193,7 +212,8 @@ impl fmt::Display for RequestCount {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockHash, BlockId, LayerGroupId, RequestCount, RequestId, RequestSlot, StepId, TokenCount,
+        BlockHash, BlockId, LayerGroupId, RequestCount, RequestId, RequestSlot, SequenceIndex,
+        StepId, TokenCount,
     };
 
     #[test]
@@ -203,12 +223,19 @@ mod tests {
         let step = StepId::new(11);
         let block = BlockId::new(42);
         let group = LayerGroupId::new(1);
+        let sequence = SequenceIndex::new(2);
 
-        let json = serde_json::to_string(&(request, slot, step, block, group)).unwrap();
-        let back: (RequestId, RequestSlot, StepId, BlockId, LayerGroupId) =
-            serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&(request, slot, step, block, group, sequence)).unwrap();
+        let back: (
+            RequestId,
+            RequestSlot,
+            StepId,
+            BlockId,
+            LayerGroupId,
+            SequenceIndex,
+        ) = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(back, (request, slot, step, block, group));
+        assert_eq!(back, (request, slot, step, block, group, sequence));
     }
 
     #[test]
@@ -220,6 +247,11 @@ mod tests {
         assert_eq!(serde_json::to_string(&requests).unwrap(), "2");
         assert_eq!(serde_json::from_str::<TokenCount>("8").unwrap(), tokens);
         assert_eq!(serde_json::from_str::<RequestCount>("2").unwrap(), requests);
+    }
+
+    #[test]
+    fn one_token_is_a_constant() {
+        assert_eq!(TokenCount::ONE, TokenCount::new(1).unwrap());
     }
 
     #[test]
