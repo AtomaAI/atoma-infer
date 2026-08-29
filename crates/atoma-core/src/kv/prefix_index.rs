@@ -100,6 +100,44 @@ impl PrefixIndex {
         }
     }
 
+    /// Stores `hash` as a child of `parent` — a root when `parent` is `None` — creating the node
+    /// if it is missing, and pins that one node.
+    ///
+    /// This is how a live sequence extends its pinned path one block at a time as blocks fill:
+    /// each call pins exactly the new node, so the path as a whole still unpins with one
+    /// [`PrefixIndex::unpin`]. A chain hash commits to its parent, so an already-stored `hash`
+    /// necessarily sits under `parent` already.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `parent` is not stored: a child whose parent the index never saw would be
+    /// a root with a chained hash, and the bug surfaces here instead of as a wrong match later.
+    pub fn insert_child(&mut self, parent: Option<BlockHash>, hash: BlockHash) {
+        self.clock += 1;
+        let clock = self.clock;
+        let parent_slot = parent.map(|parent| {
+            *self
+                .node_by_hash
+                .get(&parent)
+                .unwrap_or_else(|| panic!("insert_child under a parent never inserted: {parent:?}"))
+        });
+        let slot = match self.node_by_hash.get(&hash) {
+            Some(&slot) => {
+                debug_assert_eq!(
+                    self.node(slot).parent,
+                    parent_slot,
+                    "a chain hash commits to its parent"
+                );
+                slot
+            }
+            None => self.create_node(hash, parent_slot),
+        };
+        self.update_node(slot, |node| {
+            node.pins += 1;
+            node.last_touch = clock;
+        });
+    }
+
     /// Releases one pin on every node of `hashes`, the exact path a prior
     /// [`PrefixIndex::insert`] stored; the nodes cannot have been removed while pinned.
     ///
@@ -391,6 +429,70 @@ mod tests {
         assert_eq!(index.lookup(&path), 2);
         assert_eq!(index.len(), 2);
         index.unpin(&path);
+    }
+
+    #[test]
+    fn a_path_grown_child_by_child_matches_a_whole_path_insert() {
+        let path = chain(&[1, 2, 3, 4, 5, 6]);
+        let mut grown = PrefixIndex::new();
+        let mut parent = None;
+        for &hash in &path {
+            grown.insert_child(parent, hash);
+            parent = Some(hash);
+        }
+        let mut whole = PrefixIndex::new();
+        whole.insert(&path);
+
+        assert_eq!(grown.len(), whole.len());
+        assert_eq!(grown.lookup(&path), 3, "the grown path matches in full");
+        assert_eq!(grown.evict_lru(), None, "every grown node is pinned");
+
+        grown.unpin(&path);
+        assert_eq!(
+            grown.evict_lru(),
+            Some(path[2]),
+            "unpinned, it evicts leaf-first"
+        );
+        assert_eq!(grown.evict_lru(), Some(path[1]));
+        assert_eq!(grown.evict_lru(), Some(path[0]));
+        assert!(grown.is_empty());
+        whole.unpin(&path);
+    }
+
+    #[test]
+    fn insert_child_pins_only_the_child() {
+        let mut index = PrefixIndex::new();
+        let path = chain(&[1, 2, 3, 4]);
+        index.insert(&path);
+        index.insert_child(Some(path[0]), path[1]);
+
+        index.unpin(&path);
+        assert_eq!(
+            index.evict_lru(),
+            None,
+            "the child keeps its extra pin; the parent is interior"
+        );
+        index.unpin(&path[1..]);
+        assert_eq!(index.evict_lru(), Some(path[1]));
+        assert_eq!(index.evict_lru(), Some(path[0]));
+    }
+
+    #[test]
+    fn insert_child_without_a_parent_creates_a_root() {
+        let mut index = PrefixIndex::new();
+        let root = hash_of(&[7, 7]);
+        index.insert_child(None, root);
+        assert!(index.contains(root));
+        assert_eq!(index.lookup(&[root]), 1);
+        index.unpin(&[root]);
+        assert_eq!(index.evict_lru(), Some(root));
+    }
+
+    #[test]
+    #[should_panic(expected = "never inserted")]
+    fn inserting_a_child_under_an_unknown_parent_is_a_caller_bug() {
+        let mut index = PrefixIndex::new();
+        index.insert_child(Some(hash_of(&[1, 2])), hash_of(&[3, 4]));
     }
 
     #[test]
