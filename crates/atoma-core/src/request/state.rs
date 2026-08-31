@@ -276,6 +276,15 @@ impl Request {
         }
     }
 
+    /// Events the client has not read yet. A dummy has no client, so none.
+    #[must_use]
+    pub fn backlog(&self) -> usize {
+        match &self.egress {
+            Egress::Client(client) => client.backlog(),
+            Egress::Dummy => 0,
+        }
+    }
+
     /// Token accounting over every sequence.
     #[must_use]
     pub fn usage(&self) -> Usage {

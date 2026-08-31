@@ -55,6 +55,10 @@ pub struct SchedulerConfig {
     /// ingress is refused. Where `max_batch` bounds one step, this bounds the whole population
     /// a step is drawn from.
     pub max_requests: RequestCount,
+    /// Generated tokens a client may leave unread on its egress channel before its request is
+    /// retired. A client that keeps up leaves none, so this is what one stalled client costs the
+    /// host: at most this many events, plus the one pass that runs before the next sweep sees it.
+    pub max_client_backlog: TokenCount,
     /// The model's end-of-sequence token ids; sampling one finishes a request that does not
     /// ignore it.
     pub eos_token_ids: Vec<u32>,
@@ -405,7 +409,7 @@ impl Scheduler {
     pub fn schedule(&mut self) -> Scheduled {
         self.step = StepId::new(self.step.get() + 1);
         self.budget.reset();
-        self.retire_cancelled();
+        self.retire_lost_clients();
         let mut entries = Vec::with_capacity(self.budget.max_requests().get());
         let preempted = self.schedule_running(&mut entries);
         self.admit(&mut entries);
@@ -531,23 +535,41 @@ impl Scheduler {
         debug!(request = request.id().get(), reason = ?finished.reason(), "request finished");
     }
 
-    /// Retires every request whose client hung up, before any budget is spent on it: the whole
-    /// running batch and preempted stack, and the waiting requests admission would examine. It
-    /// runs at the head of every pass, so a drain that admits nothing still lets cancels through.
-    fn retire_cancelled(&mut self) {
-        let mut cancelled = Vec::new();
+    /// Retires every request whose client hung up or stopped reading, before any budget is spent
+    /// on it: the whole running batch and preempted stack, and the waiting requests admission
+    /// would examine. It runs at the head of every pass, so a drain that admits nothing still
+    /// lets cancels through.
+    ///
+    /// A backlogged client is retired rather than throttled, so its blocks return to the pool
+    /// instead of being held for a reader that may never come back. It keeps every event already
+    /// queued for it, since the finish is appended behind them.
+    fn retire_lost_clients(&mut self) {
+        let max_backlog = self.config.max_client_backlog.get();
+        let mut lost = Vec::new();
         let examined = self
             .running
             .iter()
             .chain(&self.preempted)
             .chain(self.waiting.iter().take(self.config.window.get()));
         for &slot in examined {
-            if self.requests.get(slot).is_some_and(Request::is_cancelled) {
-                cancelled.push(slot);
+            let Some(request) = self.requests.get(slot) else {
+                continue;
+            };
+            let queued = request.backlog();
+            if request.is_cancelled() {
+                lost.push((slot, FinishReason::Cancelled));
+            } else if queued > max_backlog {
+                lost.push((
+                    slot,
+                    FinishReason::ClientBacklogged {
+                        queued,
+                        max_backlog,
+                    },
+                ));
             }
         }
-        for slot in cancelled {
-            self.retire(slot, FinishReason::Cancelled);
+        for (slot, reason) in lost {
+            self.retire(slot, reason);
         }
     }
 
@@ -741,8 +763,8 @@ fn give_back(kv: &mut Kv<'_>, sequence: &mut Sequence) -> Admitted {
 impl Scheduler {
     /// The next admission candidate: the preempted stack top, or — while admission is open —
     /// the waiting request the policy picks from the window. A closed admission still offers the
-    /// preempted stack, since those are running requests on their way to finishing. Cancelled
-    /// candidates are gone already: the pass sweeps them before it spends anything.
+    /// preempted stack, since those are running requests on their way to finishing. Candidates
+    /// whose clients are gone are gone already: the pass sweeps them before it spends anything.
     fn next_candidate(&mut self) -> Option<(RequestSlot, Candidate)> {
         if let Some(&slot) = self.preempted.last() {
             return Some((slot, Candidate::Preempted));

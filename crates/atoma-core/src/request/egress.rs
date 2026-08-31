@@ -3,6 +3,10 @@
 //! The engine's side sends and gets nothing back: there is no error to ignore, so a client hanging
 //! up can never unwind the engine. The client's side is the receiver, and dropping it is the
 //! request's cancel, observed by the engine through [`EgressSender::is_cancelled`].
+//!
+//! A send is never refused, so a client's token stream can never gain a hole: it ends where
+//! generation ended, always with a finish. A client that stops reading is bounded instead by the
+//! scheduler, which retires a request whose [`EgressSender::backlog`] runs past its limit.
 
 use flume::{Receiver, SendError, Sender};
 
@@ -25,9 +29,9 @@ pub(crate) enum Egress {
 
 /// The engine's end of one request's egress channel.
 ///
-/// The channel is unbounded on purpose: the engine must never block on a client, and what bounds
-/// it is the request's own generation length — at most one event per sampled token plus the
-/// finish.
+/// The channel is unbounded on purpose: the engine must never block on a client, and a refused
+/// send would leave a hole in the token stream. What bounds it is [`EgressSender::backlog`],
+/// which the scheduler reads to retire a client that has stopped reading.
 #[derive(Debug, Clone)]
 pub struct EgressSender {
     sender: Sender<RequestEvent>,
@@ -47,6 +51,12 @@ impl EgressSender {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.sender.is_disconnected()
+    }
+
+    /// Events the client has not read yet. A client that keeps up holds none.
+    #[must_use]
+    pub fn backlog(&self) -> usize {
+        self.sender.len()
     }
 }
 

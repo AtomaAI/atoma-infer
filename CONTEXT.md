@@ -255,6 +255,12 @@ The per-request channel that carries a request's output to its client. Its recei
 the one and only cancel; a failed send returns nothing to ignore.
 _Avoid_: response channel, output stream, sink (for the channel)
 
+**Backlog**:
+Events a client has left unread on its egress channel. A client that keeps up leaves none; one
+that leaves more than the scheduler allows has its request retired, keeping every event already
+queued behind it. What bounds an unbounded channel.
+_Avoid_: lag, buffer depth, backpressure (which is what the channel does not apply)
+
 **Ring**:
 One of the two single-producer single-consumer rings between the engine thread and the
 executor thread: step commands one way, step results the other. Rings are not channels.

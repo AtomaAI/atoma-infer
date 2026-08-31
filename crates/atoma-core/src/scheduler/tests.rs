@@ -34,6 +34,8 @@ use crate::types::{RequestSlot, StepId};
 const BLOCK_SIZE: usize = 4;
 const WINDOW: usize = 8;
 const MAX_REQUESTS: usize = 64;
+/// High enough that no test trips the backlog sweep unless it sets its own limit.
+const MAX_CLIENT_BACKLOG: usize = 1024;
 /// The end-of-sequence token; prompts count up from one and never reach it.
 const EOS: u32 = 99;
 
@@ -55,9 +57,22 @@ fn config(blocks: u32, token_budget: usize, max_batch: usize) -> SchedulerConfig
         window: requests(WINDOW),
         admission: AdmissionPolicy::Fcfs,
         max_requests: requests(MAX_REQUESTS),
+        max_client_backlog: tokens(MAX_CLIENT_BACKLOG),
         eos_token_ids: vec![EOS],
         hash_algorithm: HashAlgorithm::Sha256V1,
     }
+}
+
+/// A scheduler that retires a client leaving more than `max_backlog` events unread.
+fn backlog_scheduler(blocks: u32, max_backlog: usize) -> Scheduler {
+    Scheduler::new(
+        SchedulerConfig {
+            max_client_backlog: tokens(max_backlog),
+            ..config(blocks, 100, 4)
+        },
+        BlockPool::new(blocks),
+    )
+    .expect("the pool holds one maximum-length request")
 }
 
 /// A scheduler admitting by longest prefix match over a window of `window` candidates.
@@ -596,6 +611,107 @@ fn every_client_hanging_up_empties_the_scheduler() {
     assert!(scheduled.is_empty());
     assert_eq!(scheduler.live_request_count(), 0);
     assert_eq!(scheduler.pool().available(), 8);
+}
+
+/// The backlog sweep truncates a stalled client's stream; it never punctures it. Every token
+/// generated before the retire is still queued, in order, with the finish behind them.
+#[test]
+fn a_stalled_client_keeps_every_token_generated_before_its_retire() {
+    let mut scheduler = backlog_scheduler(8, 3);
+    let mut clients = Clients::default();
+    let baseline = scheduler.pool().available();
+    let stalled = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+
+    // The client reads nothing, so one sampled token a pass piles up behind it.
+    for token in 1..=4 {
+        assert_eq!(slots(&step_sampling(&mut scheduler, token)), [stalled]);
+    }
+    assert!(
+        step_sampling(&mut scheduler, 5).is_empty(),
+        "the sweep retires it before the pass spends anything"
+    );
+    assert!(scheduler.running().is_empty());
+    assert_eq!(
+        scheduler.pool().available(),
+        baseline,
+        "its blocks came back"
+    );
+
+    let received = events(&clients.receivers[0]);
+    let (sampled, finish) = received.split_at(received.len() - 1);
+    let tokens: Vec<u32> = sampled
+        .iter()
+        .map(|event| match event {
+            RequestEvent::Token { token, .. } => *token,
+            RequestEvent::Finished { .. } => unreachable!("the finish is the last event"),
+        })
+        .collect();
+    assert_eq!(tokens, [1, 2, 3, 4], "in order, with no gap");
+    assert!(matches!(
+        finish,
+        [RequestEvent::Finished {
+            reason: FinishReason::ClientBacklogged {
+                queued: 4,
+                max_backlog: 3
+            },
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn a_client_exactly_at_the_backlog_limit_keeps_running() {
+    let mut scheduler = backlog_scheduler(8, 3);
+    let mut clients = Clients::default();
+    let slot = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    for token in 1..=3 {
+        assert_eq!(slots(&step_sampling(&mut scheduler, token)), [slot]);
+    }
+
+    assert_eq!(
+        scheduler.request(slot).unwrap().backlog(),
+        3,
+        "at the limit"
+    );
+    assert_eq!(
+        slots(&step_sampling(&mut scheduler, 4)),
+        [slot],
+        "the limit is what a client may leave unread, not what retires it"
+    );
+    assert!(finish_reason(&clients.receivers[0]).is_none());
+}
+
+#[test]
+fn a_client_that_reads_every_pass_never_backlogs() {
+    let mut scheduler = backlog_scheduler(8, 3);
+    let mut clients = Clients::default();
+    let slot = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    for token in 1..=8 {
+        assert_eq!(slots(&step_sampling(&mut scheduler, token)), [slot]);
+        assert_eq!(events(&clients.receivers[0]).len(), 1, "one token a pass");
+    }
+    assert_eq!(scheduler.running(), [slot]);
+}
+
+#[test]
+fn a_client_that_backlogs_and_then_hangs_up_retires_once() {
+    let mut scheduler = backlog_scheduler(8, 3);
+    let mut clients = Clients::default();
+    let baseline = scheduler.pool().available();
+    let slot = clients.submit(&mut scheduler, BLOCK_SIZE, 16);
+    for token in 1..=4 {
+        step_sampling(&mut scheduler, token);
+    }
+
+    drop(clients.receivers.remove(0));
+    assert!(step(&mut scheduler).is_empty());
+    assert!(scheduler.running().is_empty());
+    assert_eq!(scheduler.live_request_count(), 0);
+    assert_eq!(scheduler.pool().available(), baseline);
+    assert!(
+        !scheduler.waiting().contains(&slot),
+        "the slot is gone from every queue"
+    );
 }
 
 #[test]
