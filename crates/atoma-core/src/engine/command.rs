@@ -134,6 +134,7 @@ mod tests {
                 window: requests(8),
                 admission: AdmissionPolicy::Fcfs,
                 max_requests: requests(8),
+                max_client_backlog: tokens(1024),
                 eos_token_ids: Vec::new(),
                 hash_algorithm: HashAlgorithm::Sha256V1,
             },
