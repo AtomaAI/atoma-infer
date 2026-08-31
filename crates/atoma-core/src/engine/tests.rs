@@ -39,6 +39,7 @@ fn config(max_requests: usize, ingress_capacity: usize) -> EngineConfig {
             window: requests(8),
             admission: AdmissionPolicy::Fcfs,
             max_requests: requests(max_requests),
+            max_client_backlog: tokens(1024),
             eos_token_ids: vec![EOS],
             hash_algorithm: HashAlgorithm::Sha256V1,
         },
