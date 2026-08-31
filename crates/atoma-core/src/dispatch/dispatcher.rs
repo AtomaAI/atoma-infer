@@ -205,22 +205,23 @@ mod tests {
     #[test]
     fn eager_fallback_logs_once_with_its_reason() {
         let log = captured_log();
-        // 3 and 601 appear in no other test, so the captured lines below are this test's own.
+        // The global capture sees every test in the crate, so the batch sizes here are ones no
+        // other test dispatches: 509 keys (it pads to 512), 8191 falls back.
         let mut dispatcher = dispatcher(SupportLevel::Always, CaptureKind::Full);
-        dispatcher.dispatch(batch(3, 3, true));
-        dispatcher.dispatch(batch(601, 601, true));
+        dispatcher.dispatch(batch(509, 509, true));
+        dispatcher.dispatch(batch(8191, 8191, true));
         let output = log.contents();
         let fallback_lines: Vec<&str> = output
             .lines()
-            .filter(|line| line.contains("token count 601"))
+            .filter(|line| line.contains("token count 8191"))
             .collect();
         assert_eq!(fallback_lines.len(), 1, "one fallback, one log line");
         assert!(fallback_lines[0].contains("eager fallback"));
         assert!(fallback_lines[0].contains(
-            "token count 601 exceeds every captured bucket; the bucket-ladder maximum is 512"
+            "token count 8191 exceeds every captured bucket; the bucket-ladder maximum is 512"
         ));
         assert!(
-            !output.contains("token count 3 "),
+            !output.contains("token count 509"),
             "keyed batches log nothing"
         );
     }
