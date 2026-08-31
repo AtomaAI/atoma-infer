@@ -162,11 +162,18 @@ _Avoid_: seq len (in prose), total (in a step command)
 The longest sequence the model serves. The only meaning "context window" carries here.
 _Avoid_: context length (for the maximum), max context
 
+**Intake**:
+Taking a submitted request off ingress into Waiting: minting its request id, giving it a slab
+slot and queueing it — or finishing it on the spot when its prompt can never run. The one
+transition into Waiting, and never a word for admission.
+_Avoid_: enqueue, accept, submit (for this transition), admission (for this)
+
 **Admission**:
 Moving a request from Waiting or Preempted into Running under the admission policy, which
 examines a bounded window of candidates per pass and offers preempted requests first, last-in
 first-out. The one transition into Running; nothing else is called admission.
-_Avoid_: scheduling (for this transition), pickup, intake, resume
+_Avoid_: scheduling (for this transition), pickup, intake (which is the transition into
+Waiting), resume
 
 **Preemption**:
 Releasing a running request's KV and returning it to run again from whatever the prefix index
@@ -194,8 +201,10 @@ comes back. Numbered by step id.
 _Avoid_: iteration, tick, cycle
 
 **Scheduled**:
-The output of one scheduling pass: the entries this step runs, the slots it preempted, and the
-block deltas the executor must see. Indices and counts, never copied request state.
+The output of one scheduling pass: the step it is for, the entries this step runs and the slots
+it preempted. Indices and counts, never copied request state. There are no block deltas: a step
+command carries each entry's whole block table, since preemption releases KV rather than moving
+it.
 _Avoid_: schedule, scheduler output, scheduler step, plan
 
 **Entry**:
@@ -245,6 +254,12 @@ _Avoid_: command channel, admin channel
 The per-request channel that carries a request's output to its client. Its receiver dropping is
 the one and only cancel; a failed send returns nothing to ignore.
 _Avoid_: response channel, output stream, sink (for the channel)
+
+**Backlog**:
+Events a client has left unread on its egress channel. A client that keeps up leaves none; one
+that leaves more than the scheduler allows has its request retired, keeping every event already
+queued behind it. What bounds an unbounded channel.
+_Avoid_: lag, buffer depth, backpressure (which is what the channel does not apply)
 
 **Ring**:
 One of the two single-producer single-consumer rings between the engine thread and the
