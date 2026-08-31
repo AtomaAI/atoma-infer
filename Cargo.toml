@@ -32,6 +32,7 @@ candle-transformers = "0.11.0"
 chrono = "0.4.45"
 clap = "4.5.18"
 config = "0.15.25"
+crossbeam-utils = "0.8.22"
 cuda-runtime-sys = "0.3.0-alpha.1"
 cudarc = { version = "0.19.8", features = [
     "cublas",
@@ -56,6 +57,7 @@ models = { path = "crates/models" }
 proptest = "1.11.0"
 rand = "0.9.0"
 reqwest = "0.12.15" # hf-hub already pulls the 0.12 line; keep one copy
+rtrb = "0.4.0"
 serde = "1.0.204"
 serde_json = "1.0.120"
 serial_test = "4.0.1"
