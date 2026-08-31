@@ -65,6 +65,18 @@ pub fn build_command(
     }
 }
 
+/// A live request's entry: the `query_len` tokens it computes this step, over the sequence's own
+/// blocks.
+///
+/// The input tokens are the slice from `context_len` to the length the sequence reaches after the
+/// step, so a decode carries one token and a prefill chunk carries only that chunk. Sampling
+/// parameters are attached only when the entry samples this step.
+///
+/// # Panics
+///
+/// Panics when the slot is not live, or when its block table does not cover the length the
+/// sequence reaches this step. Both are scheduler bugs, not runtime states: a slot stays live
+/// until its result is applied, and the scheduler grows every table before it schedules an entry.
 fn live_entry(scheduler: &Scheduler, entry: &Entry, block_size: usize) -> CommandEntry {
     let request = scheduler
         .request(entry.slot)
