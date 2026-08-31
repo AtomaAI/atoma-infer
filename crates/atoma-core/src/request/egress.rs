@@ -11,6 +11,18 @@ use crate::request::RequestEvent;
 /// The client's end of one request's egress channel. Dropping it cancels the request.
 pub type EgressReceiver = Receiver<RequestEvent>;
 
+/// Where a request's output goes.
+///
+/// A padding dummy is the one request with no client, so a request without a channel has exactly
+/// one meaning and this names it rather than leaving it as an absence to explain.
+#[derive(Debug)]
+pub(crate) enum Egress {
+    /// The channel to the client that submitted the request.
+    Client(EgressSender),
+    /// A padding dummy: no client to send to, to lose, or to fall behind.
+    Dummy,
+}
+
 /// The engine's end of one request's egress channel.
 ///
 /// The channel is unbounded on purpose: the engine must never block on a client, and what bounds

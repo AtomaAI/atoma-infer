@@ -14,6 +14,7 @@ mod phase;
 mod slab;
 mod state;
 
+pub(crate) use egress::Egress;
 pub use egress::{egress, EgressReceiver, EgressSender};
 pub use event::{FinishReason, RequestEvent, Usage};
 pub use params::{SamplingParams, StopCriteria};

@@ -1,7 +1,7 @@
 //! Request and sequence state as the engine thread holds it: host-native, one owner, no locks.
 
 use crate::request::{
-    EgressSender, RequestEvent, RequestPhase, SamplingParams, StopCriteria, Usage, Waiting,
+    Egress, EgressSender, RequestEvent, RequestPhase, SamplingParams, StopCriteria, Usage, Waiting,
 };
 use crate::types::{BlockId, RequestId, StepId, TokenCount};
 
@@ -130,9 +130,8 @@ pub struct Request {
     phase: RequestPhase,
     sampling: SamplingParams,
     stop: StopCriteria,
-    /// The client's channel. Absent for exactly one kind of request: a padding dummy, which has
-    /// no client.
-    egress: Option<EgressSender>,
+    /// Where this request's output goes: to its client, or nowhere at all for a padding dummy.
+    egress: Egress,
     /// Born with one; forking adds more.
     sequences: Vec<Sequence>,
 }
@@ -152,7 +151,7 @@ impl Request {
             phase: RequestPhase::Waiting(Waiting::new(arrived_at)),
             sampling,
             stop,
-            egress: Some(egress),
+            egress: Egress::Client(egress),
             sequences: vec![Sequence::from_prompt(prompt)],
         }
     }
@@ -171,7 +170,7 @@ impl Request {
                 max_new_tokens: TokenCount::ONE,
                 ignore_eos: true,
             },
-            egress: None,
+            egress: Egress::Dummy,
             sequences: vec![sequence],
         }
     }
@@ -210,12 +209,11 @@ impl Request {
     /// never finishes and its one token is nobody's, so an event reaching it is a bug in the
     /// caller rather than something to drop quietly.
     pub fn send(&self, event: RequestEvent) {
-        debug_assert!(
-            !self.is_padding(),
-            "a padding dummy has no client to send {event:?} to"
-        );
-        if let Some(egress) = &self.egress {
-            egress.send(event);
+        match &self.egress {
+            Egress::Client(client) => client.send(event),
+            Egress::Dummy => {
+                debug_assert!(false, "a padding dummy has no client to send {event:?} to");
+            }
         }
     }
 
@@ -231,7 +229,10 @@ impl Request {
     /// Whether the client dropped its egress receiver. A dummy has no client to lose.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.egress.as_ref().is_some_and(EgressSender::is_cancelled)
+        match &self.egress {
+            Egress::Client(client) => client.is_cancelled(),
+            Egress::Dummy => false,
+        }
     }
 
     /// Token accounting over every sequence.
@@ -248,10 +249,10 @@ impl Request {
 mod tests {
     use super::{NewRequest, Request, PADDING_TOKEN};
     use crate::request::{
-        egress, EgressReceiver, RequestPhase, SamplingParams, StopCriteria, Usage,
+        egress, EgressReceiver, RequestEvent, RequestPhase, SamplingParams, StopCriteria, Usage,
     };
     use crate::test_support::tokens;
-    use crate::types::{BlockId, RequestId, StepId};
+    use crate::types::{BlockId, RequestId, SequenceIndex, StepId};
 
     /// A request over `prompt` with its client's receiver, which the caller keeps alive.
     fn request(prompt: &[u32]) -> (Request, EgressReceiver) {
@@ -348,6 +349,18 @@ mod tests {
         assert_eq!(sequence.tokens(), &[PADDING_TOKEN]);
         assert_eq!(sequence.block_table(), &[BlockId::new(4)]);
         assert_eq!(sequence.computed(), 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no client to send")]
+    fn sending_an_event_to_a_padding_dummy_is_a_caller_bug() {
+        let dummy = Request::padding(RequestId::new(9), BlockId::new(4));
+        dummy.send(RequestEvent::Token {
+            request: RequestId::new(9),
+            sequence: SequenceIndex::new(0),
+            token: 1,
+        });
     }
 
     #[test]
