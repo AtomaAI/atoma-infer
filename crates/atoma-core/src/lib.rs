@@ -7,6 +7,7 @@
 pub mod dispatch;
 pub mod kv;
 pub mod request;
+pub mod scheduler;
 pub mod types;
 
 #[cfg(test)]

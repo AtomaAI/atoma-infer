@@ -41,6 +41,9 @@ pub enum FinishReason {
     EmptyPrompt,
     /// The client dropped its egress receiver.
     Cancelled,
+    /// The client left more events unread on its egress channel than the scheduler allows, so
+    /// generation stopped rather than buffering for a reader that is not keeping up.
+    ClientBacklogged { queued: usize, max_backlog: usize },
     /// The engine shut down with the request live.
     Shutdown,
     /// The executor went away with the request live.
