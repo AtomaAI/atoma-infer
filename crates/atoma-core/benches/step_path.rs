@@ -30,6 +30,8 @@ const BLOCK_SIZE: usize = 16;
 const WARMUP_PASSES: usize = 200;
 const MEASURED_PASSES: usize = 2000;
 const P99_LIMIT_MICROS: u64 = 200;
+/// Both scenarios drain their clients every pass, so no backlog ever approaches this.
+const MAX_CLIENT_BACKLOG: usize = 1024;
 
 const DECODE_BATCH: usize = 64;
 const DECODE_CONTEXT_TOKENS: usize = 1024;
@@ -73,6 +75,7 @@ fn decode_config() -> EngineConfig {
             window: requests(DECODE_WAITING),
             admission: AdmissionPolicy::LongestPrefixMatch,
             max_requests: requests(live),
+            max_client_backlog: tokens(MAX_CLIENT_BACKLOG),
             eos_token_ids: Vec::new(),
             hash_algorithm: HashAlgorithm::Sha256V1,
         },
@@ -99,6 +102,7 @@ fn churn_config() -> EngineConfig {
             window: requests(CHURN_WAITING),
             admission: AdmissionPolicy::LongestPrefixMatch,
             max_requests: requests(live),
+            max_client_backlog: tokens(MAX_CLIENT_BACKLOG),
             eos_token_ids: Vec::new(),
             hash_algorithm: HashAlgorithm::Sha256V1,
         },
