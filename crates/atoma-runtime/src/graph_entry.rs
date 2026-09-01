@@ -53,6 +53,13 @@ impl GraphEntry {
         self
     }
 
+    /// Attaches the communicator the captured collectives run on to an already-stored entry; it
+    /// outlives the graph and is torn down after it.
+    #[cfg(feature = "nccl")]
+    pub(crate) fn attach_comm(&mut self, comm: cudarc::nccl::Comm) {
+        self.comm = Some(comm);
+    }
+
     /// The communicator the captured collectives run on, for eager (non-replay) steps that must
     /// issue the same collective outside the graph.
     #[cfg(feature = "nccl")]
@@ -66,6 +73,11 @@ impl GraphEntry {
     }
 
     /// Input buffers, written before each replay.
+    pub fn inputs(&self) -> &[CudaSlice<u8>] {
+        &self.inputs
+    }
+
+    /// Input buffers, written before each replay.
     pub fn inputs_mut(&mut self) -> &mut [CudaSlice<u8>] {
         &mut self.inputs
     }
@@ -73,6 +85,11 @@ impl GraphEntry {
     /// Output buffers, read after each replay.
     pub fn outputs(&self) -> &[CudaSlice<u8>] {
         &self.outputs
+    }
+
+    /// Kernel workspaces, handed to kernels that declare a workspace requirement.
+    pub fn workspaces(&self) -> &[CudaSlice<u8>] {
+        &self.workspaces
     }
 
     /// Kernel workspaces, handed to kernels that declare a workspace requirement.

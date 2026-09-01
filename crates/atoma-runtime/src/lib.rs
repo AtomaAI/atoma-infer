@@ -26,6 +26,7 @@
 //! | [`stream`] | The dedicated capture stream, whose surface has no synchronize and no allocate |
 //! | [`capture`] | Capture lifecycle, end-capture instantiate/discard, raw-sys graph wrappers |
 //! | [`graph_entry`] | Graph-lifetime ownership with load-bearing teardown order |
+//! | [`session`] | The capture session: phase-typed Allocation, Capture and Replay of one graph set |
 //! | [`arena`] | Activation addresses as a pure function of (bucket, layer, role) |
 //! | [`error`] | Driver statuses classified into named errors with remediation text |
 
@@ -34,4 +35,5 @@ pub mod capture;
 pub mod context;
 pub mod error;
 pub mod graph_entry;
+pub mod session;
 pub mod stream;

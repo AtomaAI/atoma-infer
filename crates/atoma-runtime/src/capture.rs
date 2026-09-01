@@ -96,6 +96,18 @@ impl CapturedGraph {
         Ok(())
     }
 
+    /// The count of recorded nodes, for asserting a capture's shape without a raw handle.
+    pub fn node_count(&self) -> Result<usize, RuntimeError> {
+        // SAFETY: this type owns a live graph handle.
+        Ok(unsafe { graph_nodes(self.cu_graph) }?.len())
+    }
+
+    /// Writes the recorded topology to `path` as Graphviz dot; see [`debug_dot_print`].
+    pub fn write_debug_dot(&self, path: &std::path::Path, flags: u32) -> Result<(), RuntimeError> {
+        // SAFETY: this type owns a live graph handle.
+        unsafe { debug_dot_print(self.cu_graph, path, flags) }
+    }
+
     /// Raw graph handle for the diagnostic wrappers. Do not destroy it; this type owns it.
     pub fn cu_graph(&self) -> sys::CUgraph {
         self.cu_graph

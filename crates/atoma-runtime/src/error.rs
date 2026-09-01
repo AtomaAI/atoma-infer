@@ -14,6 +14,8 @@ use cudarc::driver::sys::CUresult;
 use cudarc::driver::DriverError;
 use thiserror::Error;
 
+use crate::capture::CaptureState;
+
 /// Errors from the capture substrate, classified per driver status.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -115,6 +117,19 @@ pub enum RuntimeError {
 
     #[error("end_capture_discard on a stream with no capture in progress; nothing to discard")]
     DiscardWithoutCapture,
+
+    #[error(
+        "record with no warmup pass since the session's last recording; run the exact step at \
+         the graph's exact shape eagerly (Capture::warm_up) immediately before each record, so \
+         every lazy backend allocation lands outside the recording"
+    )]
+    RecordWithoutWarmup,
+
+    #[error(
+        "synchronize while the stream capture state is {0:?}: a synchronize would invalidate an \
+         active recording; end or discard the capture first"
+    )]
+    SyncWhileCapturing(CaptureState),
 
     #[error(
         "dot-print path contains an interior NUL byte and cannot be passed to the driver; \
