@@ -5,16 +5,20 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use validator::{Validate, ValidationError};
 
 use crate::dispatch::DispatchConfig;
 use crate::scheduler::SchedulerConfig;
 use crate::types::RequestCount;
 
 /// Everything the engine is built from, fixed for the process lifetime.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
+#[validate(schema(function = "every_full_batch_has_a_captured_graph"))]
 pub struct EngineConfig {
+    #[validate(nested)]
     pub scheduler: SchedulerConfig,
+    #[validate(nested)]
     pub dispatch: DispatchConfig,
     /// Blocks in the pool, before the padding reservation.
     pub block_count: u32,
@@ -25,6 +29,27 @@ pub struct EngineConfig {
     /// empty schedule can never wedge it. Written in milliseconds wherever configuration is.
     #[serde(rename = "idle_deadline_millis", with = "millis")]
     pub idle_deadline: Duration,
+}
+
+/// Dispatch falls back to eager execution for any batch holding more requests than the captured
+/// graphs serve, so a `max_batch` above `captured_max_requests` would send every full batch down
+/// the eager path.
+fn every_full_batch_has_a_captured_graph(config: &EngineConfig) -> Result<(), ValidationError> {
+    if config.scheduler.max_batch <= config.dispatch.captured_max_requests {
+        return Ok(());
+    }
+    let mut error = ValidationError::new("max_batch_over_captured_max_requests");
+    error.message = Some(
+        format!(
+            "scheduler.max_batch is {} but the captured graphs serve at most {} requests, so \
+             every full batch would fall back to eager execution; capture a larger bucket or \
+             lower scheduler.max_batch",
+            config.scheduler.max_batch.get(),
+            config.dispatch.captured_max_requests.get()
+        )
+        .into(),
+    );
+    Err(error)
 }
 
 /// A duration in memory, milliseconds on the wire: a deadline is a duration, and configuration

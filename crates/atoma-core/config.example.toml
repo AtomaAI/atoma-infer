@@ -1,0 +1,50 @@
+# Everything the engine is built from, fixed for the process lifetime.
+#
+# Every field here can be overridden by an environment variable under `ATOMA_`, nesting with
+# `__`: `ATOMA_SCHEDULER__TOKEN_BUDGET=4096` sets `token_budget` in the `[scheduler]` table, and
+# `ATOMA_BLOCK_COUNT=8192` sets the top-level `block_count`.
+
+# Blocks in the pool, before the padding reservation.
+block_count = 4096
+# Requests ingress holds beyond what the slab has room for; the burst buffer behind the overload
+# signal.
+ingress_capacity = 256
+# How long the thread parks with nothing to do before re-examining its queues.
+idle_deadline_millis = 5
+
+[scheduler]
+# Query tokens one step may compute, summed over entries.
+token_budget = 8192
+# Entries one step may hold. Never above `dispatch.captured_max_requests`, or every full batch
+# falls back to eager execution, and never above `max_requests`, which is the population a batch
+# is drawn from.
+max_batch = 32
+# The longest sequence the model serves.
+max_model_len = 4096
+# Tokens per KV block.
+block_size = 16
+# Admission candidates one pass examines.
+window = 32
+# How admission orders the window: "fcfs" or "longest_prefix_match".
+admission = "longest_prefix_match"
+# Requests the slab holds at once — running, waiting and preempted together — before ingress is
+# refused.
+max_requests = 256
+# Generated tokens a client may leave unread on its egress channel before its request is retired.
+max_client_backlog = 1024
+# The model's end-of-sequence token ids.
+eos_token_ids = [ 2 ]
+# The chain-hash algorithm block identity is minted under.
+hash_algorithm = "sha256_v1"
+
+[dispatch]
+# The token buckets the engine captured graphs for. Written order carries no meaning: a batch is
+# padded to the smallest bucket that holds it, whatever order the buckets appear in here.
+bucket_ladder = [ 1, 1024, 128, 16, 2, 2048, 256, 32, 4, 4096, 512, 64, 8, 8192 ]
+# The largest request count any captured graph serves.
+captured_max_requests = 32
+# The minimum support level across the active backends: "never", "uniform_single_token_decode",
+# "uniform_batch" or "always".
+support_level = "uniform_single_token_decode"
+# How the captured set was recorded: "full" or "segmented".
+capture_kind = "full"

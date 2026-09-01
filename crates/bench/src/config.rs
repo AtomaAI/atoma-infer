@@ -7,6 +7,8 @@
 
 use std::{path::PathBuf, time::Duration};
 
+use figment::providers::{Env, Format, Toml};
+use figment::Figment;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -38,17 +40,26 @@ pub struct BenchConfig {
 }
 
 impl BenchConfig {
-    /// Reads a configuration from a TOML file.
+    /// Reads a configuration from a TOML file, applying any `ATOMA_BENCH_` environment overrides.
+    ///
+    /// A variable names the field it sets, nesting with `__`, so
+    /// `ATOMA_BENCH_RUN__RUNS=5` sets `runs` under `[run]`. It lets one checked-in file describe
+    /// the comparison while a single setting is changed per invocation.
     ///
     /// # Errors
     ///
-    /// Returns [`BenchError::ConfigFile`] if the file cannot be read or does not describe a
-    /// benchmark, and [`BenchError::Config`] if what it describes cannot be run.
+    /// Returns [`BenchError::ConfigMissing`] if `path` names no file,
+    /// [`BenchError::ConfigFile`] if what it holds does not describe a benchmark, and
+    /// [`BenchError::Config`] if what it describes cannot be run.
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let config: Self = config::Config::builder()
-            .add_source(config::File::from(path))
-            .build()?
-            .try_deserialize()?;
+        if !path.is_file() {
+            return Err(BenchError::ConfigMissing(path.to_path_buf()));
+        }
+        let config: Self = Figment::new()
+            .merge(Toml::file(path))
+            .merge(Env::prefixed("ATOMA_BENCH_").split("__"))
+            .extract()
+            .map_err(|error| BenchError::ConfigFile(Box::new(error)))?;
 
         config.validate()?;
         Ok(config)

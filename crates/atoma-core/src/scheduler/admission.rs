@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::RequestCount;
+
 /// How admission orders the bounded window of waiting requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -14,6 +16,19 @@ pub enum AdmissionPolicy {
     Fcfs,
     /// The request with the most cached prefix blocks in the window; ties go to arrival.
     LongestPrefixMatch,
+}
+
+/// The bounded window admission examines in one pass: how many candidates, how the policy
+/// orders them, and whether it is open to waiting requests at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdmissionWindow {
+    /// Candidates the pass examines.
+    pub size: RequestCount,
+    /// How the window is ordered.
+    pub policy: AdmissionPolicy,
+    /// Whether waiting requests may enter Running; preempted requests are offered either way,
+    /// since they have already run.
+    pub open: bool,
 }
 
 #[cfg(test)]
