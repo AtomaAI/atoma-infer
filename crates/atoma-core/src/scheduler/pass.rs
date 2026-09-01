@@ -1,7 +1,17 @@
-//! One scheduling pass: running requests spend the token budget first, preempting the most
-//! recently admitted request when the pool cannot grow one; admission then offers the remainder
-//! to the preempted stack and the waiting queue over a bounded window. The pass works on the
-//! scheduler's borrowed [`Parts`], never on the scheduler itself.
+//! The body of one scheduling pass.
+//!
+//! Running requests are budgeted first, in batch order, so a step's tokens go to work already
+//! under way before anything new is admitted. A running request the pool cannot grow preempts the
+//! most recently admitted request — itself, when it is the newest — and retries. Admission never
+//! preempts: it claims each candidate's cached prefix and stops at the first request the budget or
+//! the pool cannot serve, putting that one back untouched.
+//!
+//! The pass neither sweeps nor finishes requests. Requests whose clients are gone are retired
+//! before it runs, and requests that reach a stop criterion are retired once their results are
+//! applied; what the pass returns is the entries the step computes and the requests it displaced.
+//!
+//! The scheduler's state reaches the pass as [`Parts`], borrowed field by field, with the settings
+//! admission reads beside it as an [`AdmissionWindow`].
 
 use tracing::debug;
 
