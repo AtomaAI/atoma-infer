@@ -68,7 +68,8 @@ pub enum CaptureOp {
     Discard,
 }
 
-/// A recorded graph and its instantiated executable, replayed with [`CapturedGraph::replay`].
+/// A recorded graph and its instantiated executable, replayed through the session's
+/// [`Replay`](crate::session::Replay) phase.
 ///
 /// `!Send` and `!Sync` by construction (raw driver handles): NVIDIA documents graph objects as
 /// not internally synchronized, so warmup, capture, and replay all run on the executor thread
@@ -80,8 +81,9 @@ pub struct CapturedGraph {
 }
 
 impl CapturedGraph {
-    /// Replays the graph on the stream it was captured from.
-    pub fn replay(&self) -> Result<(), RuntimeError> {
+    /// Replays the graph on the stream it was captured from; reachable through the session's
+    /// Replay phase alone.
+    pub(crate) fn replay(&self) -> Result<(), RuntimeError> {
         let ctx = self.stream.context();
         ctx.bind_to_thread()?;
         unsafe { result::graph::launch(self.cu_graph_exec, self.stream.cu_stream()) }?;
@@ -89,7 +91,7 @@ impl CapturedGraph {
     }
 
     /// Pre-uploads the executable's device state so the first replay pays no setup cost.
-    pub fn upload(&self) -> Result<(), RuntimeError> {
+    pub(crate) fn upload(&self) -> Result<(), RuntimeError> {
         let ctx = self.stream.context();
         ctx.bind_to_thread()?;
         unsafe { result::graph::upload(self.cu_graph_exec, self.stream.cu_stream()) }?;
@@ -145,7 +147,9 @@ impl Drop for CapturedGraph {
 /// [`end_capture_discard`], as its error directs. Past the pre-checks, an end-capture failure
 /// leaves no graph behind (the driver drains the capture even when it reports it invalidated),
 /// and an instantiate failure destroys the drained graph before returning.
-pub fn end_capture_instantiate(stream: &CaptureStream) -> Result<CapturedGraph, RuntimeError> {
+pub(crate) fn end_capture_instantiate(
+    stream: &CaptureStream,
+) -> Result<CapturedGraph, RuntimeError> {
     stream.state()?.apply(CaptureOp::EndInstantiate)?;
     let cudarc_stream = stream.cudarc_stream();
     let ctx = cudarc_stream.context();
@@ -174,7 +178,7 @@ pub fn end_capture_instantiate(stream: &CaptureStream) -> Result<CapturedGraph, 
 /// Ends the capture on `stream` and destroys whatever was recorded without instantiating it —
 /// the path an invalidated capture must take, which cudarc's always-instantiating `end_capture`
 /// cannot express. Discarding costs nothing and leaks nothing.
-pub fn end_capture_discard(stream: &CaptureStream) -> Result<(), RuntimeError> {
+pub(crate) fn end_capture_discard(stream: &CaptureStream) -> Result<(), RuntimeError> {
     stream.state()?.apply(CaptureOp::Discard)?;
     let cudarc_stream = stream.cudarc_stream();
     cudarc_stream.context().bind_to_thread()?;

@@ -22,8 +22,9 @@ pub struct CaptureStream {
 }
 
 impl CaptureStream {
-    /// Creates the dedicated side stream on `ctx`'s device.
-    pub fn new(ctx: &RuntimeContext) -> Result<Self, RuntimeError> {
+    /// Creates the dedicated side stream on `ctx`'s device. Only the session's Allocation phase
+    /// constructs one, so every capture stream lives inside a session.
+    pub(crate) fn new(ctx: &RuntimeContext) -> Result<Self, RuntimeError> {
         Ok(Self {
             stream: ctx.cuda().new_stream()?,
         })
@@ -42,15 +43,17 @@ impl CaptureStream {
     }
 
     /// The capture state the driver reports for this stream.
-    pub fn state(&self) -> Result<CaptureState, RuntimeError> {
+    pub(crate) fn state(&self) -> Result<CaptureState, RuntimeError> {
         Ok(CaptureState::from_status(self.stream.capture_status()?))
     }
 
     /// Raw handle for launching kernels and FFI work onto the captured stream.
     ///
     /// The handle exists because kernel launches need it; using it to synchronize, allocate, or
-    /// destroy the stream reintroduces exactly the failures this type's surface removes.
-    pub fn cu_stream(&self) -> sys::CUstream {
+    /// destroy the stream reintroduces exactly the failures this type's surface removes. Only the
+    /// session hands it out, and only into [`Descriptor::enqueue`](crate::session::Descriptor)
+    /// implementations.
+    pub(crate) fn cu_stream(&self) -> sys::CUstream {
         self.stream.cu_stream()
     }
 

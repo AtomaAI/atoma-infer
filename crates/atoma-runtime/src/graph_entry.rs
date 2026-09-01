@@ -28,8 +28,9 @@ pub struct GraphEntry {
 }
 
 impl GraphEntry {
-    /// Takes ownership of the graph and every buffer it baked.
-    pub fn new(
+    /// Takes ownership of the graph and every buffer it baked. Entries are minted by the
+    /// session's record path alone.
+    pub(crate) fn new(
         inputs: Vec<CudaSlice<u8>>,
         outputs: Vec<CudaSlice<u8>>,
         workspaces: Vec<CudaSlice<u8>>,
@@ -47,14 +48,6 @@ impl GraphEntry {
 
     /// Attaches the communicator the captured collectives run on; it outlives the graph and is
     /// torn down after it.
-    #[cfg(feature = "nccl")]
-    pub fn with_comm(mut self, comm: cudarc::nccl::Comm) -> Self {
-        self.comm = Some(comm);
-        self
-    }
-
-    /// Attaches the communicator the captured collectives run on to an already-stored entry; it
-    /// outlives the graph and is torn down after it.
     #[cfg(feature = "nccl")]
     pub(crate) fn attach_comm(&mut self, comm: cudarc::nccl::Comm) {
         self.comm = Some(comm);
@@ -77,11 +70,6 @@ impl GraphEntry {
         &self.inputs
     }
 
-    /// Input buffers, written before each replay.
-    pub fn inputs_mut(&mut self) -> &mut [CudaSlice<u8>] {
-        &mut self.inputs
-    }
-
     /// Output buffers, read after each replay.
     pub fn outputs(&self) -> &[CudaSlice<u8>] {
         &self.outputs
@@ -90,10 +78,5 @@ impl GraphEntry {
     /// Kernel workspaces, handed to kernels that declare a workspace requirement.
     pub fn workspaces(&self) -> &[CudaSlice<u8>] {
         &self.workspaces
-    }
-
-    /// Kernel workspaces, handed to kernels that declare a workspace requirement.
-    pub fn workspaces_mut(&mut self) -> &mut [CudaSlice<u8>] {
-        &mut self.workspaces
     }
 }
