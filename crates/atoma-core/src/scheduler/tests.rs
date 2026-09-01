@@ -143,6 +143,7 @@ impl Clients {
         self.intake(scheduler, prompt, max_new_tokens, Priority::default())
     }
 
+    /// Takes `prompt` in at `priority`, keeping its client's receiver alive.
     fn intake(
         &mut self,
         scheduler: &mut Scheduler,
@@ -1231,19 +1232,25 @@ fn priority_admits_the_highest_in_the_window_first() {
     assert_eq!(slots(&step(&mut scheduler)), [none]);
 }
 
-/// Equal priorities admit in arrival order, which is what leaves unprioritised traffic — every
-/// request at the default — first-come-first-served under this policy.
+/// Equal priorities admit in arrival order, behind everything that outranks them. The two
+/// unprioritised requests arrive first and admit last, so the pass is ordered by priority and not
+/// by arrival — and they admit between themselves in arrival order, which is what leaves traffic
+/// at the default first-come-first-served.
 #[test]
 fn priority_breaks_ties_by_arrival() {
     let mut scheduler = priority_scheduler(32, 1, 8);
     let mut clients = Clients::default();
-    let earlier = clients.submit_at_priority(&mut scheduler, BLOCK_SIZE, 1, Priority::new(5));
-    let later = clients.submit_at_priority(&mut scheduler, BLOCK_SIZE, 1, Priority::new(5));
     let first = clients.submit(&mut scheduler, BLOCK_SIZE, 1);
     let second = clients.submit(&mut scheduler, BLOCK_SIZE, 1);
+    let earlier = clients.submit_at_priority(&mut scheduler, BLOCK_SIZE, 1, Priority::new(5));
+    let later = clients.submit_at_priority(&mut scheduler, BLOCK_SIZE, 1, Priority::new(5));
 
-    assert_eq!(slots(&step(&mut scheduler)), [earlier]);
-    assert_eq!(slots(&step(&mut scheduler)), [later]);
+    assert_eq!(slots(&step(&mut scheduler)), [earlier], "priority first");
+    assert_eq!(
+        slots(&step(&mut scheduler)),
+        [later],
+        "then its tie, by arrival"
+    );
     assert_eq!(slots(&step(&mut scheduler)), [first]);
     assert_eq!(slots(&step(&mut scheduler)), [second]);
 }
@@ -1294,7 +1301,11 @@ fn preempted_requests_re_enter_before_priority_orders_the_window() {
 
     drop(clients.receivers.remove(0));
     let readmit = step(&mut scheduler);
-    assert_eq!(slots(&readmit)[0], c, "`c` re-enters first");
+    assert_eq!(
+        slots(&readmit),
+        [c, urgent],
+        "`c` re-enters ahead of the request that outranks it"
+    );
 }
 
 #[test]
