@@ -13,9 +13,15 @@ pub enum BenchError {
     #[error("Invalid benchmark configuration: {0}")]
     Config(String),
 
+    /// The path given for the configuration names no file. Reported apart from
+    /// [`BenchError::ConfigFile`] because an absent TOML source contributes nothing silently,
+    /// which would otherwise surface as every field being missing.
+    #[error("No benchmark configuration at {}", .0.display())]
+    ConfigMissing(std::path::PathBuf),
+
     /// The configuration file could not be read or deserialized.
     #[error("Failed to load the benchmark configuration: {0}")]
-    ConfigFile(#[from] config::ConfigError),
+    ConfigFile(Box<figment::Error>),
 
     /// A workload could not be built from its source data.
     #[error("Failed to build the workload: {0}")]

@@ -4,6 +4,7 @@
 //! batch, and the shared id and count types those decisions are written in. The crate links no
 //! driver, and every test runs without a GPU.
 
+pub mod config;
 pub mod dispatch;
 pub mod engine;
 pub mod kv;
