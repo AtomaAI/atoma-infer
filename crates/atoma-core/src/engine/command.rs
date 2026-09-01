@@ -23,7 +23,7 @@ use crate::types::{RequestSlot, SequenceIndex};
 /// scheduler grows every table before it schedules an entry, and the engine refuses a bucket
 /// ladder its reservation cannot pad to.
 #[must_use]
-pub fn build_command(
+pub(crate) fn build_command(
     scheduler: &Scheduler,
     scheduled: &Scheduled,
     dispatcher: &mut Dispatcher,

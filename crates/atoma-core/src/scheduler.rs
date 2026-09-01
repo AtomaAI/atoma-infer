@@ -34,7 +34,7 @@ use crate::types::{RequestId, RequestSlot, StepId};
 pub use admission::AdmissionPolicy;
 pub use budget::TokenBudget;
 pub use config::{SchedulerConfig, SchedulerError};
-pub use scheduled::{Entry, Scheduled};
+pub(crate) use scheduled::{Entry, Scheduled};
 
 /// The token-budget scheduler: request slab, block pool and queues, owned by one thread.
 #[derive(Debug)]
@@ -158,8 +158,8 @@ impl Scheduler {
         self.requests.get(slot)
     }
 
-    /// Live requests, in every phase; padding dummies are not counted. Not the batch's request
-    /// count, which is a [`Scheduled`]'s own.
+    /// Live requests, in every phase; padding dummies are not counted. Not the request count of
+    /// one step's batch, which each pass answers for itself.
     #[must_use]
     pub fn live_request_count(&self) -> usize {
         self.requests.len() - self.padding.len()
@@ -276,7 +276,7 @@ impl Scheduler {
     /// spend the budget first — preempting the most recently admitted when the pool cannot grow
     /// them — then admission offers the remainder to the preempted stack and the waiting queue
     /// over the configured window.
-    pub fn schedule(&mut self) -> Scheduled {
+    pub(crate) fn schedule(&mut self) -> Scheduled {
         self.step = StepId::new(self.step.get() + 1);
         self.budget.reset();
         let window = AdmissionWindow {

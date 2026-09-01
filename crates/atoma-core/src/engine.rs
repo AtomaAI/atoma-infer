@@ -14,7 +14,7 @@ mod rings;
 mod tests;
 mod thread;
 
-pub use command::build_command;
+pub(crate) use command::build_command;
 pub use config::EngineConfig;
 pub use control::{
     control, Control, ControlReceiver, ControlSender, EngineState, CONTROL_CAPACITY,
