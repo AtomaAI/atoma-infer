@@ -15,6 +15,7 @@ mod budget;
 mod config;
 mod kv;
 mod pass;
+mod retire;
 mod scheduled;
 #[cfg(test)]
 mod tests;
@@ -24,17 +25,16 @@ use std::collections::VecDeque;
 use tracing::debug;
 
 use crate::kv::{BlockPool, PaddingReservation, PrefixIndex};
-use crate::request::{
-    FinishReason, Finished, NewRequest, Request, RequestEvent, RequestPhase, RequestSlab, Usage,
-};
+use crate::request::{FinishReason, NewRequest, Request, RequestEvent, RequestSlab, Usage};
 use crate::scheduler::admission::AdmissionWindow;
 use crate::scheduler::kv::Kv;
-use crate::types::{RequestId, RequestSlot, SequenceIndex, StepId};
+use crate::scheduler::retire::Retirement;
+use crate::types::{RequestId, RequestSlot, StepId};
 
 pub use admission::AdmissionPolicy;
 pub use budget::TokenBudget;
 pub use config::{SchedulerConfig, SchedulerError};
-pub use scheduled::{Entry, Scheduled};
+pub(crate) use scheduled::{Entry, Scheduled};
 
 /// The token-budget scheduler: request slab, block pool and queues, owned by one thread.
 #[derive(Debug)]
@@ -107,8 +107,8 @@ impl Scheduler {
     }
 
     /// The scheduler borrowed apart, so a sequence, the KV substrate, the queues and the budget
-    /// can change together in one pass.
-    fn parts(&mut self) -> Parts<'_> {
+    /// can change together in one pass, with the settings a retirement reads beside them.
+    fn borrow_apart(&mut self) -> (Parts<'_>, Retirement<'_>) {
         let Scheduler {
             config,
             requests,
@@ -124,7 +124,7 @@ impl Scheduler {
             step,
             next_request_id: _,
         } = self;
-        Parts {
+        let parts = Parts {
             kv: Kv {
                 pool,
                 index,
@@ -137,7 +137,14 @@ impl Scheduler {
             preempted,
             budget,
             step: *step,
-        }
+        };
+        let retirement = Retirement {
+            eos_token_ids: &config.eos_token_ids,
+            max_model_len: config.max_model_len,
+            max_client_backlog: config.max_client_backlog,
+            window: config.window,
+        };
+        (parts, retirement)
     }
 
     /// The step the last pass scheduled.
@@ -151,8 +158,8 @@ impl Scheduler {
         self.requests.get(slot)
     }
 
-    /// Live requests, in every phase; padding dummies are not counted. Not the batch's request
-    /// count, which is a [`Scheduled`]'s own.
+    /// Live requests, in every phase; padding dummies are not counted. Not the request count of
+    /// one step's batch, which each pass answers for itself.
     #[must_use]
     pub fn live_request_count(&self) -> usize {
         self.requests.len() - self.padding.len()
@@ -205,20 +212,6 @@ impl Scheduler {
     #[must_use]
     pub fn is_admission_open(&self) -> bool {
         self.admission_open
-    }
-
-    /// Retires every live request for `reason` — waiting, running and preempted alike —
-    /// returning its KV and telling its client. The padding dummies stay.
-    pub fn retire_all(&mut self, reason: FinishReason) {
-        let live: Vec<RequestSlot> = self
-            .requests
-            .iter()
-            .filter(|(_, request)| !request.is_padding())
-            .map(|(slot, _)| slot)
-            .collect();
-        for slot in live {
-            self.retire(slot, reason);
-        }
     }
 
     #[must_use]
@@ -283,16 +276,17 @@ impl Scheduler {
     /// spend the budget first — preempting the most recently admitted when the pool cannot grow
     /// them — then admission offers the remainder to the preempted stack and the waiting queue
     /// over the configured window.
-    pub fn schedule(&mut self) -> Scheduled {
+    pub(crate) fn schedule(&mut self) -> Scheduled {
         self.step = StepId::new(self.step.get() + 1);
         self.budget.reset();
-        self.retire_lost_clients();
         let window = AdmissionWindow {
             size: self.config.window,
             policy: self.config.admission,
             open: self.admission_open,
         };
-        pass::schedule(self.parts(), window)
+        let (mut parts, retirement) = self.borrow_apart();
+        retire::retire_lost_clients(&mut parts, retirement);
+        pass::schedule(parts, window)
     }
 
     /// Records the tokens step `scheduled` computed, appending each sampling entry's token from
@@ -305,12 +299,13 @@ impl Scheduler {
     /// # Panics
     ///
     /// Panics when `sampled` does not hold exactly one token per sampling entry: the executor
-    /// broke the step protocol, and the caller validates before applying.
-    pub fn apply(&mut self, scheduled: &Scheduled, sampled: &[u32]) {
+    /// broke the step protocol, and the engine thread validates before applying. Nothing outside
+    /// this crate can apply a result, so that validation is the only way in.
+    pub(crate) fn apply(&mut self, scheduled: &Scheduled, sampled: &[u32]) {
         let mut sampled = sampled.iter().copied();
         let mut finished = Vec::new();
+        let (mut parts, retirement) = self.borrow_apart();
         for entry in &scheduled.entries {
-            let mut parts = self.parts();
             let request = parts
                 .requests
                 .get_mut(entry.slot)
@@ -333,7 +328,9 @@ impl Scheduler {
                 sequence: entry.sequence,
                 token,
             });
-            if let Some(reason) = self.stop_reason(entry.slot, entry.sequence, token) {
+            if let Some(reason) =
+                retire::stop_reason(&parts, retirement, entry.slot, entry.sequence, token)
+            {
                 // A request finishes once, for the first of its sequences to reach a stop
                 // criterion: retiring frees the slot, so a second entry for the same request
                 // would retire a slot that is no longer there.
@@ -347,107 +344,7 @@ impl Scheduler {
             "more sampled tokens than sampling entries"
         );
         for (slot, reason) in finished {
-            self.retire(slot, reason);
-        }
-    }
-
-    /// Why the request at `slot` stops after sampling `token`, if it does.
-    fn stop_reason(
-        &self,
-        slot: RequestSlot,
-        sequence: SequenceIndex,
-        token: u32,
-    ) -> Option<FinishReason> {
-        let request = self
-            .requests
-            .get(slot)
-            .expect("a scheduled slot stays live until its result is applied");
-        let sequence = &request.sequences()[sequence.get() as usize];
-        let stop = request.stop();
-        if self.config.eos_token_ids.contains(&token) && !stop.ignore_eos {
-            Some(FinishReason::EndOfSequence)
-        } else if sequence.generated_count() >= stop.max_new_tokens.get() {
-            Some(FinishReason::MaxNewTokens)
-        } else if sequence.total() >= self.config.max_model_len.get() {
-            Some(FinishReason::MaxModelLength)
-        } else {
-            None
-        }
-    }
-
-    /// Finishes the request at `slot` for `reason`: its KV returns to the pool, its client hears
-    /// the finish, and its slot is freed. Works from any live phase.
-    fn retire(&mut self, slot: RequestSlot, reason: FinishReason) {
-        let mut request = self.requests.remove(slot);
-        let finished: Finished = match request.phase() {
-            RequestPhase::Waiting(waiting) => {
-                if self.waiting.front() == Some(&slot) {
-                    self.waiting.pop_front();
-                } else {
-                    self.waiting.retain(|waiting| *waiting != slot);
-                }
-                waiting.finish(reason)
-            }
-            RequestPhase::Running(running) => {
-                self.running.retain(|running| *running != slot);
-                running.finish(reason)
-            }
-            RequestPhase::Preempted(preempted) => {
-                self.preempted.retain(|preempted| *preempted != slot);
-                preempted.finish(reason)
-            }
-            RequestPhase::Finished(_) | RequestPhase::Padding => {
-                unreachable!("only live requests retire")
-            }
-        };
-        let mut parts = self.parts();
-        for sequence in request.sequences_mut() {
-            parts.kv.release(sequence);
-        }
-        request.set_phase(RequestPhase::Finished(finished));
-        request.send(RequestEvent::Finished {
-            request: request.id(),
-            reason: finished.reason(),
-            usage: request.usage(),
-        });
-        debug!(request = request.id().get(), reason = ?finished.reason(), "request finished");
-    }
-
-    /// Retires every request whose client hung up or stopped reading, before any budget is spent
-    /// on it: the whole running batch and preempted stack, and the waiting requests admission
-    /// would examine. It runs at the head of every pass, so a drain that admits nothing still
-    /// lets cancels through.
-    ///
-    /// A backlogged client is retired rather than throttled, so its blocks return to the pool
-    /// instead of being held for a reader that may never come back. It keeps every event already
-    /// queued for it, since the finish is appended behind them.
-    fn retire_lost_clients(&mut self) {
-        let max_backlog = self.config.max_client_backlog.get();
-        let mut lost = Vec::new();
-        let examined = self
-            .running
-            .iter()
-            .chain(&self.preempted)
-            .chain(self.waiting.iter().take(self.config.window.get()));
-        for &slot in examined {
-            let Some(request) = self.requests.get(slot) else {
-                continue;
-            };
-            let queued = request.backlog();
-            if request.is_cancelled() {
-                lost.push((slot, FinishReason::Cancelled));
-            } else if queued > max_backlog {
-                lost.push((
-                    slot,
-                    FinishReason::ClientBacklogged {
-                        queued,
-                        max_backlog,
-                    },
-                ));
-            }
-        }
-        for (slot, reason) in lost {
-            self.retire(slot, reason);
+            retire::retire(&mut parts, slot, reason);
         }
     }
 }
@@ -468,7 +365,7 @@ struct Parts<'a> {
 impl Drop for Scheduler {
     /// Returns every block to the pool so no lease outlives the scheduler unreleased.
     fn drop(&mut self) {
-        let mut parts = self.parts();
+        let (mut parts, _) = self.borrow_apart();
         for (_, request) in parts.requests.iter_mut() {
             for sequence in request.sequences_mut() {
                 parts.kv.release(sequence);

@@ -25,9 +25,18 @@ const MAX_BATCH: usize = 4;
 const BLOCKS: usize = 16;
 const EOS: u32 = 99;
 
-/// Long enough that a test finishing in time proves a wake, not the deadline.
-const LONG_DEADLINE: Duration = Duration::from_secs(10);
-const WAIT: Duration = Duration::from_secs(5);
+/// The idle deadline a spawned engine parks under. Longer than every wait a test can spend, so a
+/// test that finishes proves the thread was woken rather than that it passed at its deadline.
+/// Bounded rather than endless, so a lost wake fails a test instead of hanging the suite.
+const LONG_DEADLINE: Duration = Duration::from_mins(5);
+
+/// How long a test waits on the engine thread before calling it wedged. Generous on purpose: a
+/// loaded runner is slow, not broken, and nothing here measures how quickly a wake arrives — only
+/// that it arrives. Every wait a single test can spend still fits inside [`LONG_DEADLINE`].
+const WAIT: Duration = Duration::from_secs(30);
+
+/// How often a wait re-examines what it is waiting for.
+const POLL: Duration = Duration::from_millis(1);
 
 fn config(max_requests: usize, ingress_capacity: usize) -> EngineConfig {
     EngineConfig {
@@ -100,6 +109,16 @@ fn assert_engine_gone(handle: &EngineHandle) {
         handle.ingress.try_send(request),
         Err(IngressRefused::EngineGone(_))
     ));
+}
+
+/// Polls `ready` until it holds, failing once the waiting budget is spent. What is being waited
+/// for is named, so a failure says which wake never came rather than which line ran out of time.
+fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !ready() {
+        assert!(Instant::now() < deadline, "waited {WAIT:?} for {what}");
+        thread::sleep(POLL);
+    }
 }
 
 /// One engine pass followed by the executor serving whatever it issued.
@@ -445,11 +464,9 @@ fn the_thread_wakes_on_ingress_and_on_the_executor() {
 #[test]
 fn the_thread_never_wedges_on_an_empty_schedule() {
     let (handle, engine) = spawn_with_executor(Duration::from_millis(1));
-    let deadline = Instant::now() + WAIT;
-    while handle.heartbeat.read().pass < 5 {
-        assert!(Instant::now() < deadline, "the heartbeat stopped");
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait_until("five passes with nothing to do", || {
+        handle.heartbeat.read().pass >= 5
+    });
     let beat = handle.heartbeat.read();
     assert!(SystemTime::now().duration_since(beat.at).unwrap() < WAIT);
 
@@ -501,22 +518,16 @@ fn a_dead_executor_fails_every_pending_request_and_returns_the_thread() {
     let (handle, rings, engine) = Engine::spawn(&config).unwrap();
     let client = submit(&handle, 3, 16);
     let mut executor = MockExecutor::constant(rings, 1);
-    let deadline = Instant::now() + WAIT;
-    while !executor.serve_one() {
-        assert!(Instant::now() < deadline, "the step was never issued");
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait_until("the first step to be issued", || executor.serve_one());
     assert!(matches!(
         client.recv_timeout(WAIT).unwrap(),
         RequestEvent::Token { .. }
     ));
 
     drop(executor);
-    let deadline = Instant::now() + WAIT;
-    while !engine.is_finished() {
-        assert!(Instant::now() < deadline, "the thread never noticed");
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait_until("the thread to notice its executor is gone", || {
+        engine.is_finished()
+    });
     engine.join();
     assert_eq!(finish_reason(&client), Some(FinishReason::ExecutorLost));
 }

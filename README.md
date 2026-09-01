@@ -84,10 +84,11 @@ have been taken yet.
 
 ## Configuration and running
 
-Copy the example configuration and provide the Hugging Face API key, model, cache path, and GPU device IDs for your environment:
+The server runs on the vLLM backend, whose example configuration sits beside it. Copy it and
+provide the Hugging Face API key, model, cache path, and GPU device IDs for your environment:
 
 ```shell
-cp config.example.toml config.toml
+cp crates/backends/vllm/config.example.toml config.toml
 ```
 
 `config.toml` is ignored by Git. The server requires the opt-in `cuda` feature and accepts the configuration path through `--config-path`:
