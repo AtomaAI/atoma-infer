@@ -2,14 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use validator::{Validate, ValidationError};
 
 use crate::kv::HashAlgorithm;
 use crate::scheduler::AdmissionPolicy;
 use crate::types::{RequestCount, TokenCount};
 
 /// What the scheduler is built from, fixed for the process lifetime.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
+#[validate(schema(function = "a_batch_is_drawn_from_the_slab"))]
 pub struct SchedulerConfig {
     /// Query tokens one step may compute, summed over entries.
     pub token_budget: TokenCount,
@@ -37,6 +39,25 @@ pub struct SchedulerConfig {
     pub eos_token_ids: Vec<u32>,
     /// The chain-hash algorithm block identity is minted under.
     pub hash_algorithm: HashAlgorithm,
+}
+
+/// One step's batch is drawn from the requests the slab holds, so a `max_batch` above
+/// `max_requests` names a batch that could never be filled.
+fn a_batch_is_drawn_from_the_slab(config: &SchedulerConfig) -> Result<(), ValidationError> {
+    if config.max_batch <= config.max_requests {
+        return Ok(());
+    }
+    let mut error = ValidationError::new("max_batch_over_max_requests");
+    error.message = Some(
+        format!(
+            "max_batch is {} but the slab holds only {} requests, so a full batch could never be \
+             drawn from it; raise max_requests or lower max_batch",
+            config.max_batch.get(),
+            config.max_requests.get()
+        )
+        .into(),
+    );
+    Err(error)
 }
 
 /// A configuration the scheduler refuses to start under.

@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
+use validator::Validate;
 
 use crate::dispatch::{
     decide, BucketLadder, EagerFallbackCounters, EagerReason, GraphKey, LiveBatch, PaddingLookup,
@@ -20,7 +21,7 @@ pub enum CaptureKind {
 }
 
 /// Everything the dispatcher is built from, fixed for the process lifetime.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct DispatchConfig {
     /// The buckets the engine captured.
