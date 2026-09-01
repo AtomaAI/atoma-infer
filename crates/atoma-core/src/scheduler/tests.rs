@@ -88,6 +88,19 @@ fn lpm_scheduler(blocks: u32, max_batch: usize, window: usize) -> Scheduler {
     .expect("the pool holds one maximum-length request")
 }
 
+/// A scheduler admitting by priority over a window of `window` candidates.
+fn priority_scheduler(blocks: u32, max_batch: usize, window: usize) -> Scheduler {
+    Scheduler::new(
+        SchedulerConfig {
+            admission: AdmissionPolicy::Priority,
+            window: requests(window),
+            ..config(blocks, 1000, max_batch)
+        },
+        BlockPool::new(blocks),
+    )
+    .expect("the pool holds one maximum-length request")
+}
+
 /// The requests a test submits, with their clients' receivers kept alive.
 #[derive(Default)]
 struct Clients {
@@ -95,18 +108,29 @@ struct Clients {
 }
 
 impl Clients {
-    /// Submits a `prompt_len`-token prompt allowed `max_new_tokens` generated tokens. Each
-    /// submission gets its own token range, so requests never share a prefix unless a test
-    /// submits an explicit prompt through [`Clients::submit_prompt`].
+    /// Submits a `prompt_len`-token prompt allowed `max_new_tokens` generated tokens, asking for
+    /// no priority. Each submission gets its own token range, so requests never share a prefix
+    /// unless a test submits an explicit prompt through [`Clients::submit_prompt`].
     fn submit(
         &mut self,
         scheduler: &mut Scheduler,
         prompt_len: usize,
         max_new_tokens: usize,
     ) -> RequestSlot {
+        self.submit_at_priority(scheduler, prompt_len, max_new_tokens, Priority::default())
+    }
+
+    /// The same, submitted at `priority`.
+    fn submit_at_priority(
+        &mut self,
+        scheduler: &mut Scheduler,
+        prompt_len: usize,
+        max_new_tokens: usize,
+        priority: Priority,
+    ) -> RequestSlot {
         let base = u32::try_from(1000 * (self.receivers.len() + 1)).unwrap();
         let prompt = (base + 1..=base + u32::try_from(prompt_len).unwrap()).collect();
-        self.submit_prompt(scheduler, prompt, max_new_tokens)
+        self.intake(scheduler, prompt, max_new_tokens, priority)
     }
 
     /// Submits `prompt` exactly, for tests about shared prefixes.
@@ -116,11 +140,22 @@ impl Clients {
         prompt: Vec<u32>,
         max_new_tokens: usize,
     ) -> RequestSlot {
+        self.intake(scheduler, prompt, max_new_tokens, Priority::default())
+    }
+
+    fn intake(
+        &mut self,
+        scheduler: &mut Scheduler,
+        prompt: Vec<u32>,
+        max_new_tokens: usize,
+        priority: Priority,
+    ) -> RequestSlot {
         let (sender, receiver) = egress();
         self.receivers.push(receiver);
         scheduler
             .intake(NewRequest {
                 prompt,
+                priority,
                 ..new_request(1, max_new_tokens, sender)
             })
             .expect("the prompt fits the model")
@@ -1179,6 +1214,87 @@ fn a_cancelled_request_inside_the_window_retires_even_when_never_the_best_match(
     assert_eq!(slots(&step(&mut scheduler)), [hit]);
     assert!(scheduler.request(cancelled).is_none());
     assert!(scheduler.waiting().is_empty());
+}
+
+/// Three prompts submitted lowest priority first: admission takes the highest in the window each
+/// pass, and the unprioritised one last.
+#[test]
+fn priority_admits_the_highest_in_the_window_first() {
+    let mut scheduler = priority_scheduler(32, 1, 8);
+    let mut clients = Clients::default();
+    let none = clients.submit(&mut scheduler, BLOCK_SIZE, 1);
+    let low = clients.submit_at_priority(&mut scheduler, BLOCK_SIZE, 1, Priority::new(1));
+    let high = clients.submit_at_priority(&mut scheduler, BLOCK_SIZE, 1, Priority::new(9));
+
+    assert_eq!(slots(&step(&mut scheduler)), [high]);
+    assert_eq!(slots(&step(&mut scheduler)), [low]);
+    assert_eq!(slots(&step(&mut scheduler)), [none]);
+}
+
+/// Equal priorities admit in arrival order, which is what leaves unprioritised traffic — every
+/// request at the default — first-come-first-served under this policy.
+#[test]
+fn priority_breaks_ties_by_arrival() {
+    let mut scheduler = priority_scheduler(32, 1, 8);
+    let mut clients = Clients::default();
+    let earlier = clients.submit_at_priority(&mut scheduler, BLOCK_SIZE, 1, Priority::new(5));
+    let later = clients.submit_at_priority(&mut scheduler, BLOCK_SIZE, 1, Priority::new(5));
+    let first = clients.submit(&mut scheduler, BLOCK_SIZE, 1);
+    let second = clients.submit(&mut scheduler, BLOCK_SIZE, 1);
+
+    assert_eq!(slots(&step(&mut scheduler)), [earlier]);
+    assert_eq!(slots(&step(&mut scheduler)), [later]);
+    assert_eq!(slots(&step(&mut scheduler)), [first]);
+    assert_eq!(slots(&step(&mut scheduler)), [second]);
+}
+
+/// The policy sees only the window: a higher priority behind it waits until it enters.
+#[test]
+fn priority_examines_only_the_window() {
+    let mut scheduler = priority_scheduler(32, 1, 2);
+    let mut clients = Clients::default();
+    let first = clients.submit(&mut scheduler, BLOCK_SIZE, 1);
+    let second = clients.submit(&mut scheduler, BLOCK_SIZE, 1);
+    let urgent = clients.submit_at_priority(&mut scheduler, BLOCK_SIZE, 1, Priority::new(9));
+
+    assert_eq!(
+        slots(&step(&mut scheduler)),
+        [first],
+        "the urgent request is outside the window"
+    );
+    assert_eq!(slots(&step(&mut scheduler)), [urgent], "now it is inside");
+    assert_eq!(slots(&step(&mut scheduler)), [second]);
+}
+
+/// A preempted request re-enters before the policy orders the window, even when a waiting request
+/// outranks it: it is a running request the pool displaced, not a candidate to be ordered.
+#[test]
+fn preempted_requests_re_enter_before_priority_orders_the_window() {
+    let mut scheduler = priority_scheduler(4, 64, 8);
+    let mut clients = Clients::default();
+    let b = clients.submit(&mut scheduler, 2 * BLOCK_SIZE, 16);
+    let c = clients.submit(&mut scheduler, 2 * BLOCK_SIZE, 16);
+    assert_eq!(slots(&step(&mut scheduler)), [b, c]);
+
+    // `b` needs a third block; nothing is evictable, so `c` is displaced.
+    let decode = step(&mut scheduler);
+    assert_eq!(slots(&decode), [b]);
+    assert_eq!(decode.preempted, [c]);
+
+    // An urgent request arrives behind the displaced one; `c` is still ahead of it.
+    let urgent = clients.submit_at_priority(&mut scheduler, BLOCK_SIZE, 16, Priority::new(9));
+    let readmit = step(&mut scheduler);
+    assert_eq!(
+        slots(&readmit),
+        [b],
+        "`c` cannot fit yet, so nobody admits behind it"
+    );
+    assert_eq!(scheduler.preempted(), [c]);
+    assert_eq!(scheduler.waiting(), &VecDeque::from([urgent]));
+
+    drop(clients.receivers.remove(0));
+    let readmit = step(&mut scheduler);
+    assert_eq!(slots(&readmit)[0], c, "`c` re-enters first");
 }
 
 #[test]

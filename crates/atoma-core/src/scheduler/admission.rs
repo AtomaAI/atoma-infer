@@ -16,6 +16,9 @@ pub enum AdmissionPolicy {
     Fcfs,
     /// The request with the most cached prefix blocks in the window; ties go to arrival.
     LongestPrefixMatch,
+    /// The highest-priority request in the window; ties go to arrival. Traffic that asks for no
+    /// priority shares the default and so admits first-come-first-served.
+    Priority,
 }
 
 /// The bounded window admission examines in one pass: how many candidates, how the policy
@@ -44,6 +47,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AdmissionPolicy>("\"fcfs\"").unwrap(),
             AdmissionPolicy::Fcfs
+        );
+        assert_eq!(
+            serde_json::to_string(&AdmissionPolicy::Priority).unwrap(),
+            "\"priority\""
         );
     }
 }

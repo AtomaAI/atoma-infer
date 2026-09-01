@@ -175,6 +175,13 @@ first-out. The one transition into Running; nothing else is called admission.
 _Avoid_: scheduling (for this transition), pickup, intake (which is the transition into
 Waiting), resume
 
+**Priority**:
+How urgently a request admits, as its client submits it. Higher admits first, and the default is
+the lowest there is, so traffic that asks for nothing shares one priority and is ordered by
+arrival alone. An input to admission, never to preemption: the victim is always the newest
+running request.
+_Avoid_: weight, rank, nice, urgency (as the field)
+
 **Preemption**:
 Releasing a running request's KV and returning it to run again from whatever the prefix index
 still holds. Never a swap: nothing is written out to bring back.
