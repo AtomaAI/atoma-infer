@@ -68,11 +68,6 @@ impl Priority {
     pub const fn new(priority: u32) -> Self {
         Self(priority)
     }
-
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
 }
 
 #[cfg(test)]
@@ -132,7 +127,6 @@ mod tests {
         assert_eq!(Priority::default(), Priority::new(0));
         assert!(Priority::new(1) > Priority::default());
         assert!(Priority::new(7) > Priority::new(1));
-        assert_eq!(Priority::new(3).get(), 3);
     }
 
     #[test]
