@@ -118,16 +118,16 @@ fn padding_entry(scheduler: &Scheduler, slot: RequestSlot) -> CommandEntry {
 #[cfg(test)]
 mod tests {
     use super::build_command;
+    use crate::attention::SupportLevel;
     use crate::dispatch::{
-        BucketLadder, CaptureKind, DispatchConfig, DispatchDecision, Dispatcher, EagerReason,
-        SupportLevel,
+        BucketLadder, DispatchConfig, DispatchDecision, Dispatcher, EagerReason,
     };
     use crate::kv::{BlockPool, HashAlgorithm, PaddingReservation};
     use crate::request::{
         egress, EgressReceiver, NewRequest, Priority, SamplingParams, StopCriteria,
     };
     use crate::scheduler::{AdmissionPolicy, Scheduled, Scheduler, SchedulerConfig};
-    use crate::test_support::{requests, tokens};
+    use crate::test_support::{contract, requests, tokens};
     use crate::types::{BlockId, RequestSlot, StepId};
 
     const BLOCK_SIZE: usize = 4;
@@ -160,21 +160,23 @@ mod tests {
     }
 
     fn eager_dispatcher() -> Dispatcher {
-        Dispatcher::new(&DispatchConfig {
-            bucket_ladder: BucketLadder::new(Vec::new()).unwrap(),
-            captured_max_requests: requests(MAX_BATCH),
-            support_level: SupportLevel::Never,
-            capture_kind: CaptureKind::Full,
-        })
+        Dispatcher::new(
+            &DispatchConfig {
+                bucket_ladder: BucketLadder::new(Vec::new()).unwrap(),
+                captured_max_requests: requests(MAX_BATCH),
+            },
+            &contract(SupportLevel::Never, &[]),
+        )
     }
 
     fn replay_dispatcher() -> Dispatcher {
-        Dispatcher::new(&DispatchConfig {
-            bucket_ladder: BucketLadder::new(vec![1, 2, 4, 8]).unwrap(),
-            captured_max_requests: requests(MAX_BATCH),
-            support_level: SupportLevel::Always,
-            capture_kind: CaptureKind::Full,
-        })
+        Dispatcher::new(
+            &DispatchConfig {
+                bucket_ladder: BucketLadder::new(vec![1, 2, 4, 8]).unwrap(),
+                captured_max_requests: requests(MAX_BATCH),
+            },
+            &contract(SupportLevel::Always, &[]),
+        )
     }
 
     fn submit(

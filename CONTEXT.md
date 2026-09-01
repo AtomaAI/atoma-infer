@@ -79,9 +79,33 @@ _Avoid_: piece, partial graph
 The place in a forward pass where one segment ends and the next begins.
 _Avoid_: split, boundary, cut
 
+**Declarer**:
+The backend or the model that states a break point. A backend states a capability — an op it
+cannot capture, or one that is rank-coupled. A model states a policy — where its eager region
+lies. The two are independent and the dispatcher takes their union.
+_Avoid_: owner, source, author
+
 **Bridge buffer**:
 A fixed-address buffer through which an eager operation passes data between two segments.
 _Avoid_: intermediate buffer, staging buffer
+
+**Support level**:
+What a backend declares its captured routine stays valid for: always, any uniform batch, uniform
+single-token decode, or never. A statement about the recorded routine, never about what the
+kernels can compute — which is why a backend's break points, which are capability statements, are
+a separate declaration.
+_Avoid_: capability (as a name for the level), kernel support, capture support
+
+**Graph mode**:
+The support level every captured routine runs under: the minimum across the active backends,
+settled once at startup and never raised. Always written qualified: "mode" alone is ambiguous with
+the driver's capture-interaction mode.
+_Avoid_: capture mode, graph level
+
+**Workspace**:
+Caller-owned bytes a kernel is handed because it may not allocate its own. Captured and eager
+execution each own one; they are never the same bytes.
+_Avoid_: scratch buffer, temp buffer, kernel arena
 
 **Lease**:
 The value that holds one pool block for exactly one owner. While it exists the block cannot be

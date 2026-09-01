@@ -1,9 +1,9 @@
 //! The dispatch decision: exactly one graph key for a live batch, or exactly one named reason
 //! it runs eagerly.
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::attention::{GraphMode, SupportLevel};
 use crate::dispatch::{GraphKey, PaddingLookup};
 use crate::types::{RequestCount, TokenCount};
 
@@ -16,20 +16,6 @@ pub struct LiveBatch {
     pub request_count: RequestCount,
     /// Whether every request in the batch is decoding.
     pub uniform_decode: bool,
-}
-
-/// The live batches a backend's captured routine is valid for, weakest to strongest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SupportLevel {
-    /// The captured routine is never valid.
-    Never,
-    /// Valid only when every request decodes exactly one token.
-    UniformSingleTokenDecode,
-    /// Valid for any uniform batch.
-    UniformBatch,
-    /// Valid for any live batch.
-    Always,
 }
 
 /// Why a batch fell back to eager execution, carrying the numbers that caused it.
@@ -135,8 +121,11 @@ impl EagerFallbackCounters {
 ///
 /// Checks run in a fixed order, so a batch failing several lands on the first: token count
 /// against the bucket ladder, request count against the captured maximum, uniform decode,
-/// then backend support level against the live batch. Uniform decode comes before support so a
+/// then the graph mode against the live batch. Uniform decode comes before support so a
 /// reason never names a support gap that closing would not actually fix.
+///
+/// The graph mode arrives as [`GraphMode`] rather than a bare level: what admission judges
+/// against is what the active backends settled at startup, not a level a call site chose.
 ///
 /// The uniform-decode check trusts no flag alone: a token count that does not divide evenly
 /// among the requests cannot be uniform decode, so such a batch runs eagerly whatever it claims.
@@ -147,7 +136,7 @@ impl EagerFallbackCounters {
 /// caused it.
 pub(crate) fn decide(
     batch: LiveBatch,
-    support_level: SupportLevel,
+    graph_mode: GraphMode,
     captured_max_requests: RequestCount,
     lookup: &PaddingLookup,
 ) -> Result<GraphKey, EagerReason> {
@@ -175,9 +164,9 @@ pub(crate) fn decide(
         });
     }
     let required = required_support(batch);
-    if support_level < required {
+    if graph_mode.support_level() < required {
         return Err(EagerReason::SupportLevelInsufficient {
-            support_level,
+            support_level: graph_mode.support_level(),
             required,
             token_count: batch.token_count,
             request_count: batch.request_count,
@@ -213,6 +202,7 @@ fn required_support(batch: LiveBatch) -> SupportLevel {
 #[cfg(test)]
 mod tests {
     use super::{decide, EagerReason, SupportLevel};
+    use crate::attention::GraphMode;
     use crate::dispatch::test_support::batch;
     use crate::dispatch::{BucketLadder, PaddingLookup, Platform};
     use crate::test_support::{requests, tokens};
@@ -221,11 +211,16 @@ mod tests {
         PaddingLookup::new(&BucketLadder::default_for(Platform::Hopper))
     }
 
+    /// The mode a single backend declaring `level` settles.
+    fn mode(level: SupportLevel) -> GraphMode {
+        GraphMode::resolve([level])
+    }
+
     #[test]
     fn keyed_batch_pads_to_its_bucket_and_binds_its_request_count() {
         let key = decide(
             batch(5, 5, true),
-            SupportLevel::Always,
+            mode(SupportLevel::Always),
             requests(512),
             &hopper_lookup(),
         )
@@ -240,14 +235,14 @@ mod tests {
         let lookup = hopper_lookup();
         let five = decide(
             batch(5, 5, true),
-            SupportLevel::Always,
+            mode(SupportLevel::Always),
             requests(512),
             &lookup,
         )
         .unwrap();
         let six = decide(
             batch(6, 6, true),
-            SupportLevel::Always,
+            mode(SupportLevel::Always),
             requests(512),
             &lookup,
         )
@@ -261,7 +256,7 @@ mod tests {
         let lookup = hopper_lookup();
         let at_max = decide(
             batch(512, 512, true),
-            SupportLevel::Always,
+            mode(SupportLevel::Always),
             requests(512),
             &lookup,
         )
@@ -270,7 +265,7 @@ mod tests {
         assert_eq!(
             decide(
                 batch(513, 513, true),
-                SupportLevel::Always,
+                mode(SupportLevel::Always),
                 requests(1024),
                 &lookup
             ),
@@ -286,7 +281,7 @@ mod tests {
         assert_eq!(
             decide(
                 batch(8, 8, true),
-                SupportLevel::Always,
+                mode(SupportLevel::Always),
                 requests(4),
                 &hopper_lookup()
             ),
@@ -301,7 +296,7 @@ mod tests {
     fn captured_maximum_boundary_keys_exactly() {
         assert!(decide(
             batch(4, 4, true),
-            SupportLevel::Always,
+            mode(SupportLevel::Always),
             requests(4),
             &hopper_lookup()
         )
@@ -313,7 +308,7 @@ mod tests {
         let lookup = hopper_lookup();
         assert!(decide(
             batch(8, 8, true),
-            SupportLevel::UniformSingleTokenDecode,
+            mode(SupportLevel::UniformSingleTokenDecode),
             requests(512),
             &lookup
         )
@@ -321,7 +316,7 @@ mod tests {
         assert_eq!(
             decide(
                 batch(8, 8, true),
-                SupportLevel::Never,
+                mode(SupportLevel::Never),
                 requests(512),
                 &lookup
             ),
@@ -341,7 +336,7 @@ mod tests {
         assert_eq!(
             decide(
                 batch(16, 4, true),
-                SupportLevel::UniformSingleTokenDecode,
+                mode(SupportLevel::UniformSingleTokenDecode),
                 requests(512),
                 &lookup
             ),
@@ -354,7 +349,7 @@ mod tests {
         );
         assert!(decide(
             batch(16, 4, true),
-            SupportLevel::UniformBatch,
+            mode(SupportLevel::UniformBatch),
             requests(512),
             &lookup
         )
@@ -366,7 +361,7 @@ mod tests {
         assert_eq!(
             decide(
                 batch(16, 4, false),
-                SupportLevel::Always,
+                mode(SupportLevel::Always),
                 requests(512),
                 &hopper_lookup()
             ),
@@ -384,7 +379,7 @@ mod tests {
         assert_eq!(
             decide(
                 batch(16, 4, false),
-                SupportLevel::UniformBatch,
+                mode(SupportLevel::UniformBatch),
                 requests(512),
                 &hopper_lookup()
             ),
@@ -404,7 +399,7 @@ mod tests {
             assert_eq!(
                 decide(
                     batch(token_count, request_count, true),
-                    SupportLevel::Always,
+                    mode(SupportLevel::Always),
                     requests(512),
                     &lookup
                 ),
@@ -422,7 +417,7 @@ mod tests {
         assert_eq!(
             decide(
                 batch(600, 600, false),
-                SupportLevel::Never,
+                mode(SupportLevel::Never),
                 requests(4),
                 &hopper_lookup()
             ),
@@ -439,7 +434,7 @@ mod tests {
         assert_eq!(
             decide(
                 batch(1, 1, true),
-                SupportLevel::Always,
+                mode(SupportLevel::Always),
                 requests(512),
                 &lookup
             ),
@@ -454,7 +449,7 @@ mod tests {
     fn eager_reasons_render_their_numbers() {
         let reason = decide(
             batch(600, 600, true),
-            SupportLevel::Always,
+            mode(SupportLevel::Always),
             requests(512),
             &hopper_lookup(),
         )
@@ -470,7 +465,7 @@ mod tests {
         let lookup = PaddingLookup::new(&BucketLadder::new(Vec::new()).unwrap());
         let reason = decide(
             batch(1, 1, true),
-            SupportLevel::Always,
+            mode(SupportLevel::Always),
             requests(512),
             &lookup,
         )
@@ -479,12 +474,5 @@ mod tests {
             reason.to_string(),
             "token count 1 exceeds every captured bucket; the bucket ladder is empty"
         );
-    }
-
-    #[test]
-    fn support_levels_order_weakest_to_strongest() {
-        assert!(SupportLevel::Never < SupportLevel::UniformSingleTokenDecode);
-        assert!(SupportLevel::UniformSingleTokenDecode < SupportLevel::UniformBatch);
-        assert!(SupportLevel::UniformBatch < SupportLevel::Always);
     }
 }

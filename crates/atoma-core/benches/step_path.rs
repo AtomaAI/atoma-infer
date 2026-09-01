@@ -14,7 +14,8 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use atoma_core::dispatch::{BucketLadder, CaptureKind, DispatchConfig, SupportLevel};
+use atoma_core::attention::{BackendDeclaration, CaptureContract, ModelDeclaration, SupportLevel};
+use atoma_core::dispatch::{BucketLadder, DispatchConfig};
 use atoma_core::engine::{Engine, EngineConfig, EngineHandle, ExecutorRings, Pass};
 use atoma_core::kv::HashAlgorithm;
 use atoma_core::request::{
@@ -120,9 +121,19 @@ fn dispatch_config(max_batch: usize) -> DispatchConfig {
     DispatchConfig {
         bucket_ladder: BucketLadder::new(vec![1, 2, 4, 8, 16, 32, 64]).expect("nonzero"),
         captured_max_requests: requests(max_batch),
-        support_level: SupportLevel::Always,
-        capture_kind: CaptureKind::Full,
     }
+}
+
+/// One backend that captures anything, breaking nothing: the bench measures the step path, not
+/// what the backends can capture.
+fn contract() -> CaptureContract {
+    CaptureContract::resolve(
+        &[BackendDeclaration::new(
+            "bench-backend",
+            SupportLevel::Always,
+        )],
+        &ModelDeclaration::new("bench-model"),
+    )
 }
 
 fn new_request(prompt: Vec<u32>, max_new_tokens: usize) -> (NewRequest, EgressReceiver) {
@@ -204,7 +215,7 @@ fn submit(handle: &EngineHandle, request: NewRequest) {
 /// Sixty-four requests decoding at a long context, with a full admission window behind them.
 fn measure_decode() -> Histogram<u64> {
     let (mut engine, handle, mut rings) =
-        Engine::new(&decode_config()).expect("the bench configuration is valid");
+        Engine::new(&decode_config(), &contract()).expect("the bench configuration is valid");
     let mut clients = Vec::with_capacity(DECODE_BATCH + DECODE_WAITING);
     for index in 0..DECODE_BATCH {
         let index = u32::try_from(index).expect("fits u32");
@@ -251,7 +262,7 @@ fn measure_decode() -> Histogram<u64> {
 /// every pass admits over prefix hits, evicts to lease, and retires what finished.
 fn measure_churn() -> Histogram<u64> {
     let (mut engine, handle, mut rings) =
-        Engine::new(&churn_config()).expect("the bench configuration is valid");
+        Engine::new(&churn_config(), &contract()).expect("the bench configuration is valid");
     let mut clients = Vec::with_capacity(CHURN_BATCH + CHURN_WAITING);
     let mut next: u32 = 0;
     let mut finished = 0;

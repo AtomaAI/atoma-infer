@@ -14,6 +14,7 @@ use flume::{SendError, Sender};
 use thiserror::Error;
 use tracing::{debug, error, info};
 
+use crate::attention::CaptureContract;
 use crate::dispatch::{Dispatcher, PaddingLookup};
 use crate::engine::{
     build_command, control, heartbeat, ingress, rings, Control, ControlReceiver, ControlSender,
@@ -111,12 +112,19 @@ pub struct Engine {
 impl Engine {
     /// Builds the engine, its clients' handle and the executor's ends of the rings.
     ///
+    /// `contract` is what the active backends and the model settled before anything was
+    /// captured: the level every captured routine is valid at, and the sites the pass leaves the
+    /// graph. The dispatcher is built from it, so nothing at runtime can raise either.
+    ///
     /// # Errors
     ///
     /// Returns [`EngineError`] when the pool cannot cover the padding reservation, what it
     /// leaves cannot hold one maximum-length request, or the bucket ladder pads the maximum
     /// batch above itself.
-    pub fn new(config: &EngineConfig) -> Result<(Self, EngineHandle, ExecutorRings), EngineError> {
+    pub fn new(
+        config: &EngineConfig,
+        contract: &CaptureContract,
+    ) -> Result<(Self, EngineHandle, ExecutorRings), EngineError> {
         let max_batch = config.scheduler.max_batch;
         let reserved = PaddingReservation::dummies_for(max_batch);
         let lookup = PaddingLookup::new(&config.dispatch.bucket_ladder);
@@ -143,7 +151,7 @@ impl Engine {
         let (engine_rings, executor_rings) = rings(parker.unparker().clone());
         let engine = Self {
             scheduler,
-            dispatcher: Dispatcher::new(&config.dispatch),
+            dispatcher: Dispatcher::new(&config.dispatch, contract),
             rings: engine_rings,
             ingress: ingress_receiver,
             control: control_receiver,
@@ -170,8 +178,9 @@ impl Engine {
     /// thread cannot be spawned.
     pub fn spawn(
         config: &EngineConfig,
+        contract: &CaptureContract,
     ) -> Result<(EngineHandle, ExecutorRings, EngineThread), EngineError> {
-        let (engine, handle, executor_rings) = Self::new(config)?;
+        let (engine, handle, executor_rings) = Self::new(config, contract)?;
         let join = thread::Builder::new()
             .name("atoma-engine".to_owned())
             .spawn(move || engine.run())

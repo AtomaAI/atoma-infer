@@ -5,7 +5,8 @@
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::dispatch::{BucketLadder, CaptureKind, DispatchConfig, SupportLevel};
+use crate::attention::{CaptureContract, SupportLevel};
+use crate::dispatch::{BucketLadder, DispatchConfig};
 use crate::engine::mock::MockExecutor;
 use crate::engine::{
     Control, Engine, EngineConfig, EngineError, EngineHandle, EngineThread, IngressRefused, Pass,
@@ -17,7 +18,7 @@ use crate::request::{
 };
 use crate::scheduler::{AdmissionPolicy, SchedulerConfig};
 use crate::step::StepResult;
-use crate::test_support::{requests, tokens};
+use crate::test_support::{contract as capture_contract, requests, tokens};
 use crate::types::RequestId;
 
 const BLOCK_SIZE: usize = 4;
@@ -55,8 +56,6 @@ fn config(max_requests: usize, ingress_capacity: usize) -> EngineConfig {
         dispatch: DispatchConfig {
             bucket_ladder: BucketLadder::new(vec![1, 2, 4]).unwrap(),
             captured_max_requests: requests(MAX_BATCH),
-            support_level: SupportLevel::Always,
-            capture_kind: CaptureKind::Full,
         },
         block_count: u32::try_from(BLOCKS).unwrap(),
         ingress_capacity: requests(ingress_capacity),
@@ -64,8 +63,15 @@ fn config(max_requests: usize, ingress_capacity: usize) -> EngineConfig {
     }
 }
 
+/// One backend that captures anything, and a model that breaks nothing: the engine tests are
+/// about the pass, not about what the backends can capture.
+fn contract() -> CaptureContract {
+    capture_contract(SupportLevel::Always, &[])
+}
+
 fn engine(max_requests: usize, ingress_capacity: usize) -> (Engine, EngineHandle, MockExecutor) {
-    let (engine, handle, rings) = Engine::new(&config(max_requests, ingress_capacity)).unwrap();
+    let (engine, handle, rings) =
+        Engine::new(&config(max_requests, ingress_capacity), &contract()).unwrap();
     (engine, handle, MockExecutor::constant(rings, 1))
 }
 
@@ -271,7 +277,7 @@ fn a_drain_waits_for_a_preempted_request_to_finish() {
     let mut config = config(8, 8);
     config.scheduler.max_model_len = tokens(2 * BLOCK_SIZE);
     config.block_count = u32::try_from(MAX_BATCH - 1 + 2).unwrap();
-    let (mut engine, handle, rings) = Engine::new(&config).unwrap();
+    let (mut engine, handle, rings) = Engine::new(&config, &contract()).unwrap();
     let mut executor = MockExecutor::constant(rings, 1);
     let first = submit(&handle, BLOCK_SIZE, 16);
     let second = submit(&handle, BLOCK_SIZE, 16);
@@ -404,7 +410,7 @@ fn a_bucket_ladder_the_reservation_cannot_pad_to_is_refused() {
     let mut unpaddable = config(8, 8);
     unpaddable.dispatch.bucket_ladder = BucketLadder::new(vec![8]).unwrap();
     assert_eq!(
-        Engine::new(&unpaddable).unwrap_err(),
+        Engine::new(&unpaddable, &contract()).unwrap_err(),
         EngineError::PaddingCannotCoverBucket {
             max_batch: requests(MAX_BATCH),
             bucket: tokens(8),
@@ -415,7 +421,7 @@ fn a_bucket_ladder_the_reservation_cannot_pad_to_is_refused() {
     let mut too_small = config(8, 8);
     too_small.block_count = 2;
     assert!(matches!(
-        Engine::new(&too_small).unwrap_err(),
+        Engine::new(&too_small, &contract()).unwrap_err(),
         EngineError::Padding(_)
     ));
 }
@@ -424,7 +430,7 @@ fn a_bucket_ladder_the_reservation_cannot_pad_to_is_refused() {
 fn spawn_with_executor(idle_deadline: Duration) -> (EngineHandle, EngineThread) {
     let mut config = config(8, 8);
     config.idle_deadline = idle_deadline;
-    let (handle, rings, engine) = Engine::spawn(&config).unwrap();
+    let (handle, rings, engine) = Engine::spawn(&config, &contract()).unwrap();
     let executor = MockExecutor::constant(rings, 1);
     thread::spawn(move || executor.run_until_engine_gone());
     (handle, engine)
@@ -515,7 +521,7 @@ fn a_drain_is_answered_from_the_thread_and_shutdown_returns_it() {
 fn a_dead_executor_fails_every_pending_request_and_returns_the_thread() {
     let mut config = config(8, 8);
     config.idle_deadline = LONG_DEADLINE;
-    let (handle, rings, engine) = Engine::spawn(&config).unwrap();
+    let (handle, rings, engine) = Engine::spawn(&config, &contract()).unwrap();
     let client = submit(&handle, 3, 16);
     let mut executor = MockExecutor::constant(rings, 1);
     wait_until("the first step to be issued", || executor.serve_one());

@@ -26,7 +26,7 @@
 //! | [`stream`] | The dedicated capture stream, whose surface has no synchronize and no allocate |
 //! | [`capture`] | Capture lifecycle, end-capture instantiate/discard, raw-sys graph wrappers |
 //! | [`graph_entry`] | Graph-lifetime ownership with load-bearing teardown order |
-//! | [`arena`] | Activation addresses as a pure function of (bucket, layer, role); workspace contract |
+//! | [`arena`] | Activation addresses as a pure function of (bucket, layer, role) |
 //! | [`error`] | Driver statuses classified into named errors with remediation text |
 
 pub mod arena;
