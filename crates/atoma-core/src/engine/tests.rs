@@ -12,8 +12,8 @@ use crate::engine::{
 };
 use crate::kv::HashAlgorithm;
 use crate::request::{
-    egress, EgressReceiver, FinishReason, NewRequest, RequestEvent, SamplingParams, StopCriteria,
-    Usage,
+    egress, EgressReceiver, FinishReason, NewRequest, Priority, RequestEvent, SamplingParams,
+    StopCriteria, Usage,
 };
 use crate::scheduler::{AdmissionPolicy, SchedulerConfig};
 use crate::step::StepResult;
@@ -69,6 +69,7 @@ fn new_request(prompt_len: usize, max_new_tokens: usize) -> (NewRequest, EgressR
             max_new_tokens: tokens(max_new_tokens),
             ignore_eos: false,
         },
+        priority: Priority::default(),
         egress: sender,
     };
     (request, receiver)

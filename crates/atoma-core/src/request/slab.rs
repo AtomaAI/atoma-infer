@@ -86,7 +86,7 @@ fn slot_of(key: usize) -> RequestSlot {
 mod tests {
     use super::RequestSlab;
     use crate::request::{
-        egress, EgressReceiver, NewRequest, Request, SamplingParams, StopCriteria,
+        egress, EgressReceiver, NewRequest, Priority, Request, SamplingParams, StopCriteria,
     };
     use crate::test_support::tokens;
     use crate::types::{RequestId, StepId};
@@ -104,6 +104,7 @@ mod tests {
                     max_new_tokens: tokens(1),
                     ignore_eos: false,
                 },
+                priority: Priority::default(),
                 egress: sender,
             },
             StepId::new(0),

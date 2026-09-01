@@ -123,7 +123,9 @@ mod tests {
         SupportLevel,
     };
     use crate::kv::{BlockPool, HashAlgorithm, PaddingReservation};
-    use crate::request::{egress, EgressReceiver, NewRequest, SamplingParams, StopCriteria};
+    use crate::request::{
+        egress, EgressReceiver, NewRequest, Priority, SamplingParams, StopCriteria,
+    };
     use crate::scheduler::{AdmissionPolicy, Scheduled, Scheduler, SchedulerConfig};
     use crate::test_support::{requests, tokens};
     use crate::types::{BlockId, RequestSlot, StepId};
@@ -192,6 +194,7 @@ mod tests {
                     max_new_tokens: tokens(8),
                     ignore_eos: false,
                 },
+                priority: Priority::default(),
                 egress: sender,
             })
             .unwrap();

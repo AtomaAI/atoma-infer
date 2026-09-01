@@ -18,7 +18,7 @@ use atoma_core::dispatch::{BucketLadder, CaptureKind, DispatchConfig, SupportLev
 use atoma_core::engine::{Engine, EngineConfig, EngineHandle, ExecutorRings, Pass};
 use atoma_core::kv::HashAlgorithm;
 use atoma_core::request::{
-    egress, EgressReceiver, NewRequest, RequestEvent, SamplingParams, StopCriteria,
+    egress, EgressReceiver, NewRequest, Priority, RequestEvent, SamplingParams, StopCriteria,
 };
 use atoma_core::scheduler::{AdmissionPolicy, SchedulerConfig};
 use atoma_core::step::StepResult;
@@ -134,6 +134,7 @@ fn new_request(prompt: Vec<u32>, max_new_tokens: usize) -> (NewRequest, EgressRe
             max_new_tokens: tokens(max_new_tokens),
             ignore_eos: true,
         },
+        priority: Priority::default(),
         egress: sender,
     };
     (request, receiver)
