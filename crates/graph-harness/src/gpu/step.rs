@@ -69,7 +69,6 @@ pub struct StepContext<'a> {
     pub num_splits: u32,
     pub rope_theta: f32,
     pub rms_eps: f32,
-    pub stream: sys::CUstream,
 }
 
 impl StepContext<'_> {
@@ -116,8 +115,10 @@ pub unsafe fn copy_inputs(
 /// and [`Role::lifetime`] indexes. Anyone reordering ops here must update those declarations.
 ///
 /// # Safety
-/// Every address in `ptrs` must be live and match the shapes implied by `ctx`.
+/// `stream` must be a live stream on the step's device, and every address in `ptrs` must be live
+/// and match the shapes implied by `ctx`.
 pub unsafe fn run_step(
+    stream: sys::CUstream,
     ctx: &StepContext<'_>,
     ptrs: &StepPtrs,
     mut hook: Option<&mut LayerHook<'_>>,
@@ -127,7 +128,7 @@ pub unsafe fn run_step(
 
     unsafe {
         ctx.kernels.embedding_gather(
-            ctx.stream,
+            stream,
             ptrs.embedding,
             ptrs.token_ids,
             ctx.slot(ptrs, 0, Role::Hidden),
@@ -135,15 +136,15 @@ pub unsafe fn run_step(
             bs,
         )?;
         for layer in 0..dims.num_layers {
-            attention_block(ctx, ptrs, layer, hook.as_deref_mut())?;
-            mlp_block(ctx, ptrs, layer)?;
+            attention_block(stream, ctx, ptrs, layer, hook.as_deref_mut())?;
+            mlp_block(stream, ctx, ptrs, layer)?;
         }
 
         // Final norm reads the last residual (the extra arena row) and reuses its Normed slot.
         let final_hidden = ctx.slot(ptrs, dims.num_layers, Role::Hidden);
         let final_normed = ctx.slot(ptrs, dims.num_layers, Role::Normed);
         ctx.kernels.rmsnorm_bf16(
-            ctx.stream,
+            stream,
             final_hidden,
             ptrs.final_norm,
             final_normed,
@@ -152,6 +153,7 @@ pub unsafe fn run_step(
             ctx.rms_eps,
         )?;
         ctx.blas.gemm_xwt(
+            stream,
             ptrs.lm_head,
             final_normed,
             ptrs.logits,
@@ -160,7 +162,7 @@ pub unsafe fn run_step(
             dims.hidden,
         )?;
         ctx.kernels
-            .argmax_bf16(ctx.stream, ptrs.logits, ptrs.argmax, dims.vocab, bs)?;
+            .argmax_bf16(stream, ptrs.logits, ptrs.argmax, dims.vocab, bs)?;
     }
     Ok(())
 }
@@ -168,6 +170,7 @@ pub unsafe fn run_step(
 /// # Safety
 /// See [`run_step`].
 unsafe fn attention_block(
+    stream: sys::CUstream,
     ctx: &StepContext<'_>,
     ptrs: &StepPtrs,
     layer: usize,
@@ -185,7 +188,7 @@ unsafe fn attention_block(
 
     unsafe {
         ctx.kernels.rmsnorm_bf16(
-            ctx.stream,
+            stream,
             hidden,
             weights.rms1,
             normed,
@@ -193,10 +196,17 @@ unsafe fn attention_block(
             bs,
             ctx.rms_eps,
         )?;
-        ctx.blas
-            .gemm_xwt(weights.w_qkv, normed, qkv, dims.qkv_out(), bs, dims.hidden)?;
+        ctx.blas.gemm_xwt(
+            stream,
+            weights.w_qkv,
+            normed,
+            qkv,
+            dims.qkv_out(),
+            bs,
+            dims.hidden,
+        )?;
         ctx.kernels.rope_qk(
-            ctx.stream,
+            stream,
             qkv,
             ptrs.seqlens_k,
             bs,
@@ -213,7 +223,7 @@ unsafe fn attention_block(
                 slot_mapping: ptrs.slot_mapping,
                 batch_size: bs,
                 page_block: ctx.page_block,
-                stream: ctx.stream,
+                stream,
             },
             dims,
         )?;
@@ -233,24 +243,36 @@ unsafe fn attention_block(
                 page_block: ctx.page_block,
                 num_splits: ctx.num_splits,
                 softmax_scale: dims.softmax_scale(),
-                stream: ctx.stream,
+                stream,
             },
             dims,
         )?;
-        ctx.blas
-            .gemm_xwt(weights.w_o, attn_out, o_proj, dims.hidden, bs, dims.hidden)?;
+        ctx.blas.gemm_xwt(
+            stream,
+            weights.w_o,
+            attn_out,
+            o_proj,
+            dims.hidden,
+            bs,
+            dims.hidden,
+        )?;
         if let Some(hook) = hook {
             hook(o_proj, bs * dims.hidden)?;
         }
         ctx.kernels
-            .add_bf16(ctx.stream, hidden, o_proj, mid, bs * dims.hidden)?;
+            .add_bf16(stream, hidden, o_proj, mid, bs * dims.hidden)?;
     }
     Ok(())
 }
 
 /// # Safety
 /// See [`run_step`].
-unsafe fn mlp_block(ctx: &StepContext<'_>, ptrs: &StepPtrs, layer: usize) -> Result<()> {
+unsafe fn mlp_block(
+    stream: sys::CUstream,
+    ctx: &StepContext<'_>,
+    ptrs: &StepPtrs,
+    layer: usize,
+) -> Result<()> {
     let dims = ctx.dims;
     let bs = ctx.batch_size;
     let weights = &ptrs.layers[layer];
@@ -264,7 +286,7 @@ unsafe fn mlp_block(ctx: &StepContext<'_>, ptrs: &StepPtrs, layer: usize) -> Res
 
     unsafe {
         ctx.kernels.rmsnorm_bf16(
-            ctx.stream,
+            stream,
             mid,
             weights.rms2,
             normed,
@@ -272,16 +294,30 @@ unsafe fn mlp_block(ctx: &StepContext<'_>, ptrs: &StepPtrs, layer: usize) -> Res
             bs,
             ctx.rms_eps,
         )?;
+        ctx.blas.gemm_xwt(
+            stream,
+            weights.w_gate,
+            normed,
+            gate,
+            dims.ffn,
+            bs,
+            dims.hidden,
+        )?;
         ctx.blas
-            .gemm_xwt(weights.w_gate, normed, gate, dims.ffn, bs, dims.hidden)?;
-        ctx.blas
-            .gemm_xwt(weights.w_up, normed, up, dims.ffn, bs, dims.hidden)?;
+            .gemm_xwt(stream, weights.w_up, normed, up, dims.ffn, bs, dims.hidden)?;
         ctx.kernels
-            .silu_mul(ctx.stream, gate, up, ffn_act, bs * dims.ffn)?;
-        ctx.blas
-            .gemm_xwt(weights.w_down, ffn_act, ffn_down, dims.hidden, bs, dims.ffn)?;
+            .silu_mul(stream, gate, up, ffn_act, bs * dims.ffn)?;
+        ctx.blas.gemm_xwt(
+            stream,
+            weights.w_down,
+            ffn_act,
+            ffn_down,
+            dims.hidden,
+            bs,
+            dims.ffn,
+        )?;
         ctx.kernels
-            .add_bf16(ctx.stream, mid, ffn_down, next_hidden, bs * dims.hidden)?;
+            .add_bf16(stream, mid, ffn_down, next_hidden, bs * dims.hidden)?;
     }
     Ok(())
 }

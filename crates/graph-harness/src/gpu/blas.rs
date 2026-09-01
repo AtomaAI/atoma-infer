@@ -1,37 +1,41 @@
-//! cuBLAS GEMMs over the raw handle, bound to the capture stream.
+//! cuBLAS GEMMs over the raw handle, bound to the stream of each call.
 //!
-//! The handle is created and stream-bound at setup; the first eager warmup run lets cuBLAS
-//! allocate its workspace and select algorithms before any capture begins — a lazy workspace
-//! allocation inside a captured region is one of the predicted capture killers.
+//! The handle is created unbound and every GEMM binds it to the stream it was handed before
+//! enqueueing, so the raw capture stream reaches cuBLAS only through the descriptor seam. The
+//! first eager warmup run lets cuBLAS allocate its workspace and select algorithms before any
+//! capture begins — a lazy workspace allocation inside a captured region is one of the predicted
+//! capture killers.
 
 use std::ffi::c_void;
 
 use anyhow::{anyhow, Result};
 use cudarc::cublas::{result as cublas, sys};
 
-/// Raw cuBLAS handle whose GEMMs enqueue on the stream given at construction.
+/// Raw cuBLAS handle whose GEMMs enqueue on the stream given per call.
 pub struct StepBlas {
     handle: sys::cublasHandle_t,
 }
 
 impl StepBlas {
-    /// Creates the handle and binds it to `stream` (the capture stream's raw handle).
-    pub fn new(stream: cudarc::driver::sys::CUstream) -> Result<Self> {
+    /// Creates the handle, bound to no stream until the first GEMM.
+    pub fn new() -> Result<Self> {
         let handle = cublas::create_handle().map_err(|e| anyhow!("cublasCreate: {e:?}"))?;
-        unsafe { cublas::set_stream(handle, stream.cast()) }
-            .map_err(|e| anyhow!("cublasSetStream: {e:?}"))?;
         Ok(Self { handle })
     }
 
-    /// `y = x @ w^T` for row-major bf16 operands: `x` is `[n_tokens, in_features]`, `w` is
-    /// `[out_features, in_features]`, `y` is `[n_tokens, out_features]`, accumulated in f32.
+    /// `y = x @ w^T` for row-major bf16 operands, enqueued on `stream`: `x` is
+    /// `[n_tokens, in_features]`, `w` is `[out_features, in_features]`, `y` is
+    /// `[n_tokens, out_features]`, accumulated in f32.
     ///
     /// In cuBLAS column-major terms that is `Y(out×n) = W_col(in×out)^T · X_col(in×n)`.
     ///
     /// # Safety
-    /// All pointers must be live device addresses of the documented shapes.
+    /// `stream` must be a live stream on the handle's device, and all pointers must be live
+    /// device addresses of the documented shapes.
+    #[allow(clippy::too_many_arguments)] // three raw operands and three dims; a struct would only rename them
     pub unsafe fn gemm_xwt(
         &self,
+        stream: cudarc::driver::sys::CUstream,
         w: cudarc::driver::sys::CUdeviceptr,
         x: cudarc::driver::sys::CUdeviceptr,
         y: cudarc::driver::sys::CUdeviceptr,
@@ -39,6 +43,8 @@ impl StepBlas {
         n_tokens: usize,
         in_features: usize,
     ) -> Result<()> {
+        unsafe { cublas::set_stream(self.handle, stream.cast()) }
+            .map_err(|e| anyhow!("cublasSetStream: {e:?}"))?;
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
         let m = i32::try_from(out_features)?;

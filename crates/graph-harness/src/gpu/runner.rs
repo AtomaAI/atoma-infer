@@ -145,7 +145,7 @@ pub fn run(cfg: RunConfig) -> Result<Vec<CellReport>> {
     let stream = capture_stream.cu_stream();
     let setup_stream = ctx.cuda().default_stream();
     let kernels = StepKernels::compile_and_load(&ctx).context("compiling step kernels")?;
-    let blas = StepBlas::new(stream).context("creating the cuBLAS handle")?;
+    let blas = StepBlas::new().context("creating the cuBLAS handle")?;
 
     // Shared device state; declared before `states` so every graph drops first.
     let (model_slices, model) = alloc_model(&kernels, &setup_stream, &dims, cfg.seed)
@@ -515,7 +515,6 @@ fn run_cell(
         num_splits: prepared.num_splits,
         rope_theta: ROPE_THETA,
         rms_eps: RMS_EPS,
-        stream: deps.stream,
     };
 
     // Warmup: the same step, eagerly, so every lazy allocation (cuBLAS workspace, FA2 first
@@ -728,7 +727,7 @@ fn step_with_hook(
         #[cfg(feature = "nccl")]
         Some(parts) => {
             let kernels = deps.kernels;
-            let stream = ctx.stream;
+            let stream = deps.stream;
             let buffer_ptr = parts.buffer_ptr;
             let comm = parts.comm;
             let buffer = &mut *parts.buffer;
@@ -740,14 +739,11 @@ fn step_with_hook(
                 unsafe { kernels.f32_to_bf16(stream, buffer_ptr, o_proj, elements) }?;
                 Ok(())
             };
-            unsafe { step::run_step(ctx, ptrs, Some(&mut hook)) }
+            unsafe { step::run_step(stream, ctx, ptrs, Some(&mut hook)) }
         }
         #[cfg(not(feature = "nccl"))]
         Some(_) => bail!("all-reduce cell in a build without the nccl feature"),
-        None => {
-            let _ = deps;
-            unsafe { step::run_step(ctx, ptrs, None) }
-        }
+        None => unsafe { step::run_step(deps.stream, ctx, ptrs, None) },
     }
 }
 
