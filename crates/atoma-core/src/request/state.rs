@@ -2,20 +2,24 @@
 
 use crate::kv::{BlockLease, ExtraKeys, HashAlgorithm};
 use crate::request::{
-    Egress, EgressSender, RequestEvent, RequestPhase, SamplingParams, StopCriteria, Usage, Waiting,
+    Egress, EgressSender, Priority, RequestEvent, RequestPhase, SamplingParams, StopCriteria,
+    Usage, Waiting,
 };
 use crate::types::{BlockHash, BlockId, RequestId, StepId, TokenCount};
 
 /// The one token a padding dummy computes every step it is inserted into.
 pub const PADDING_TOKEN: u32 = 0;
 
-/// A request as its client submits it: one prompt, one set of sampling parameters, one egress
-/// sink. Everything the engine needs to give it a slot.
+/// A request as its client submits it: one prompt, one set of sampling parameters, one priority,
+/// one egress sink. Everything the engine needs to give it a slot.
 #[derive(Debug)]
 pub struct NewRequest {
     pub prompt: Vec<u32>,
     pub sampling: SamplingParams,
     pub stop: StopCriteria,
+    /// How urgently the request admits. [`Priority::default()`] is the lowest there is, and asks
+    /// for arrival order.
+    pub priority: Priority,
     pub egress: EgressSender,
 }
 
@@ -165,6 +169,9 @@ pub struct Request {
     phase: RequestPhase,
     sampling: SamplingParams,
     stop: StopCriteria,
+    /// How urgently the request admits; an admission policy that reads it offers the highest
+    /// first.
+    priority: Priority,
     /// Where this request's output goes: to its client, or nowhere at all for a padding dummy.
     egress: Egress,
     /// Born with one; forking adds more.
@@ -179,6 +186,7 @@ impl Request {
             prompt,
             sampling,
             stop,
+            priority,
             egress,
         } = new;
         Self {
@@ -186,6 +194,7 @@ impl Request {
             phase: RequestPhase::Waiting(Waiting::new(arrived_at)),
             sampling,
             stop,
+            priority,
             egress: Egress::Client(egress),
             sequences: vec![Sequence::from_prompt(prompt)],
         }
@@ -205,6 +214,7 @@ impl Request {
                 max_new_tokens: TokenCount::ONE,
                 ignore_eos: true,
             },
+            priority: Priority::default(),
             egress: Egress::Dummy,
             sequences: vec![sequence],
         }
@@ -240,6 +250,12 @@ impl Request {
     #[must_use]
     pub fn stop(&self) -> StopCriteria {
         self.stop
+    }
+
+    /// How urgently the request admits, as its client submitted it.
+    #[must_use]
+    pub fn priority(&self) -> Priority {
+        self.priority
     }
 
     /// Sends `event` to the client.
@@ -299,13 +315,19 @@ impl Request {
 mod tests {
     use super::{NewRequest, Request, PADDING_TOKEN};
     use crate::request::{
-        egress, EgressReceiver, RequestEvent, RequestPhase, SamplingParams, StopCriteria, Usage,
+        egress, EgressReceiver, Priority, RequestEvent, RequestPhase, SamplingParams, StopCriteria,
+        Usage,
     };
     use crate::test_support::tokens;
     use crate::types::{BlockId, RequestId, SequenceIndex, StepId};
 
     /// A request over `prompt` with its client's receiver, which the caller keeps alive.
     fn request(prompt: &[u32]) -> (Request, EgressReceiver) {
+        prioritised_request(prompt, Priority::default())
+    }
+
+    /// The same, submitted at `priority`.
+    fn prioritised_request(prompt: &[u32], priority: Priority) -> (Request, EgressReceiver) {
         let (sender, receiver) = egress();
         let request = Request::new(
             RequestId::new(1),
@@ -316,6 +338,7 @@ mod tests {
                     max_new_tokens: tokens(4),
                     ignore_eos: false,
                 },
+                priority,
                 egress: sender,
             },
             StepId::new(3),
@@ -342,6 +365,26 @@ mod tests {
                 prompt_tokens: 3,
                 generated_tokens: 0
             }
+        );
+    }
+
+    #[test]
+    fn a_request_carries_the_priority_its_client_submitted() {
+        let (submitted, _receiver) = prioritised_request(&[1, 2], Priority::new(4));
+        assert_eq!(submitted.priority(), Priority::new(4));
+
+        let (unprioritised, _receiver) = request(&[1, 2]);
+        assert_eq!(
+            unprioritised.priority(),
+            Priority::default(),
+            "asking for nothing leaves the request at the lowest priority"
+        );
+
+        let dummy = Request::padding(RequestId::new(9), BlockId::new(0));
+        assert_eq!(
+            dummy.priority(),
+            Priority::default(),
+            "a dummy never enters admission, so it outranks nobody"
         );
     }
 

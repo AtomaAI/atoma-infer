@@ -77,7 +77,9 @@ mod tests {
     use crossbeam_utils::sync::Parker;
 
     use super::{ingress, IngressRefused};
-    use crate::request::{egress, EgressReceiver, NewRequest, SamplingParams, StopCriteria};
+    use crate::request::{
+        egress, EgressReceiver, NewRequest, Priority, SamplingParams, StopCriteria,
+    };
     use crate::test_support::tokens;
 
     fn request(clients: &mut Vec<EgressReceiver>) -> NewRequest {
@@ -90,6 +92,7 @@ mod tests {
                 max_new_tokens: tokens(1),
                 ignore_eos: false,
             },
+            priority: Priority::default(),
             egress: sender,
         }
     }

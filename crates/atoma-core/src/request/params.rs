@@ -1,4 +1,5 @@
-//! What a request asks for beyond its prompt: how to sample, and when to stop.
+//! What a request asks for beyond its prompt: how to sample, when to stop, and how urgently it
+//! admits.
 
 use serde::{Deserialize, Serialize};
 
@@ -56,9 +57,22 @@ pub struct StopCriteria {
     pub ignore_eos: bool,
 }
 
+/// How urgently a request admits: the higher, the sooner an admission policy that reads it
+/// offers the request. The default is the lowest there is, so traffic that asks for nothing
+/// shares one priority and is ordered by arrival alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Priority(u32);
+
+impl Priority {
+    #[must_use]
+    pub const fn new(priority: u32) -> Self {
+        Self(priority)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SamplingParams, StopCriteria};
+    use super::{Priority, SamplingParams, StopCriteria};
     use crate::test_support::tokens;
 
     #[test]
@@ -105,6 +119,22 @@ mod tests {
             serde_json::from_str::<StopCriteria>(r#"{"max_new_tokens": 0, "ignore_eos": false}"#)
                 .is_err(),
             "a request must be allowed at least one token"
+        );
+    }
+
+    #[test]
+    fn the_default_priority_is_the_lowest_and_higher_values_outrank_it() {
+        assert_eq!(Priority::default(), Priority::new(0));
+        assert!(Priority::new(1) > Priority::default());
+        assert!(Priority::new(7) > Priority::new(1));
+    }
+
+    #[test]
+    fn priority_serializes_as_the_bare_integer() {
+        assert_eq!(serde_json::to_string(&Priority::new(5)).unwrap(), "5");
+        assert_eq!(
+            serde_json::from_str::<Priority>("5").unwrap(),
+            Priority::new(5)
         );
     }
 }

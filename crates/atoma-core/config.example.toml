@@ -25,7 +25,7 @@ max_model_len = 4096
 block_size = 16
 # Admission candidates one pass examines.
 window = 32
-# How admission orders the window: "fcfs" or "longest_prefix_match".
+# How admission orders the window: "fcfs", "longest_prefix_match" or "priority".
 admission = "longest_prefix_match"
 # Requests the slab holds at once — running, waiting and preempted together — before ingress is
 # refused.

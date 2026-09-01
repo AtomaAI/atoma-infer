@@ -15,7 +15,7 @@
 
 use tracing::debug;
 
-use crate::request::{RequestPhase, Sequence};
+use crate::request::{Priority, RequestPhase, Sequence};
 use crate::scheduler::admission::AdmissionWindow;
 use crate::scheduler::kv::{Kv, PoolExhausted};
 use crate::scheduler::{AdmissionPolicy, Entry, Parts, Scheduled};
@@ -240,6 +240,7 @@ fn next_candidate(
     let position = match window.policy {
         AdmissionPolicy::Fcfs => 0,
         AdmissionPolicy::LongestPrefixMatch => longest_prefix_position(parts, window)?,
+        AdmissionPolicy::Priority => priority_position(parts, window)?,
     };
     parts
         .waiting
@@ -261,6 +262,23 @@ fn longest_prefix_position(parts: &mut Parts<'_>, window: AdmissionWindow) -> Op
         let hits = parts.kv.index.lookup(sequence.hashable_prefix(block_size));
         if best.is_none_or(|(_, best_hits)| hits > best_hits) {
             best = Some((position, hits));
+        }
+    }
+    best.map(|(position, _)| position)
+}
+
+/// The position in the waiting queue, within the window, of the highest-priority request; ties
+/// go to the earliest arrival. A selection, never a sort.
+fn priority_position(parts: &Parts<'_>, window: AdmissionWindow) -> Option<usize> {
+    let mut best: Option<(usize, Priority)> = None;
+    for (position, &slot) in parts.waiting.iter().take(window.size.get()).enumerate() {
+        let priority = parts
+            .requests
+            .get(slot)
+            .expect("waiting slots are live")
+            .priority();
+        if best.is_none_or(|(_, best_priority)| priority > best_priority) {
+            best = Some((position, priority));
         }
     }
     best.map(|(position, _)| position)
