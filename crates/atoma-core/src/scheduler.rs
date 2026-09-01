@@ -358,7 +358,10 @@ impl Scheduler {
         sequence: SequenceIndex,
         token: u32,
     ) -> Option<FinishReason> {
-        let request = self.requests.get(slot).expect("checked live by the caller");
+        let request = self
+            .requests
+            .get(slot)
+            .expect("a scheduled slot stays live until its result is applied");
         let sequence = &request.sequences()[sequence.get() as usize];
         let stop = request.stop();
         if self.config.eos_token_ids.contains(&token) && !stop.ignore_eos {

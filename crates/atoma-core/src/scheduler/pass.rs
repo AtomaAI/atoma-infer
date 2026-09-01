@@ -58,7 +58,11 @@ fn budget_running(
         .sequences()
         .len();
     for index in 0..sequence_count {
-        let sequence = &parts.requests.get(slot).expect("live").sequences()[index];
+        let sequence = &parts
+            .requests
+            .get(slot)
+            .expect("running slots are live")
+            .sequences()[index];
         let Some(query_len) = parts.budget.offer(sequence.remaining()) else {
             return Budgeted::BudgetSpent;
         };
@@ -91,7 +95,11 @@ fn grow(
     preempted: &mut Vec<RequestSlot>,
 ) -> Grown {
     loop {
-        let sequence = &mut parts.requests.get_mut(slot).expect("live").sequences_mut()[index];
+        let sequence = &mut parts
+            .requests
+            .get_mut(slot)
+            .expect("running slots are live")
+            .sequences_mut()[index];
         if parts.kv.ensure_blocks(sequence, sequence_len) != Err(PoolExhausted) {
             return Grown::Fits;
         }
