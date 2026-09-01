@@ -227,6 +227,17 @@ mod tests {
     }
 
     #[test]
+    fn session_errors_direct_the_operator() {
+        let unwarmed = RuntimeError::RecordWithoutWarmup;
+        assert!(unwarmed.to_string().contains("warm_up"));
+        assert!(unwarmed.to_string().contains("exact shape"));
+
+        let mid_capture = RuntimeError::SyncWhileCapturing(CaptureState::Active);
+        assert!(mid_capture.to_string().contains("Active"));
+        assert!(mid_capture.to_string().contains("discard"));
+    }
+
+    #[test]
     fn messages_format_without_a_driver_present() {
         // DriverError's own Display and Debug ask libcuda for the error string; ours must not.
         let unclassified = classified(CUresult::CUDA_ERROR_UNKNOWN);

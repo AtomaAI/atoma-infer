@@ -10,6 +10,7 @@ use std::ffi::c_void;
 
 use anyhow::{anyhow, Result};
 use cudarc::cublas::{result as cublas, sys};
+use cudarc::driver::sys::{CUdeviceptr, CUstream};
 
 /// Raw cuBLAS handle whose GEMMs enqueue on the stream given per call.
 pub struct StepBlas {
@@ -35,10 +36,10 @@ impl StepBlas {
     #[allow(clippy::too_many_arguments)] // three raw operands and three dims; a struct would only rename them
     pub unsafe fn gemm_xwt(
         &self,
-        stream: cudarc::driver::sys::CUstream,
-        w: cudarc::driver::sys::CUdeviceptr,
-        x: cudarc::driver::sys::CUdeviceptr,
-        y: cudarc::driver::sys::CUdeviceptr,
+        stream: CUstream,
+        w: CUdeviceptr,
+        x: CUdeviceptr,
+        y: CUdeviceptr,
         out_features: usize,
         n_tokens: usize,
         in_features: usize,

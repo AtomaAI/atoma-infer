@@ -99,6 +99,8 @@
 use std::marker::PhantomData;
 
 use cudarc::driver::{sys, CudaSlice};
+#[cfg(feature = "nccl")]
+use cudarc::nccl::Comm;
 
 use crate::capture::{self, CaptureState};
 use crate::context::RuntimeContext;
@@ -257,7 +259,7 @@ impl Capture {
     /// # Panics
     /// Panics when `idx` was minted by a different session.
     #[cfg(feature = "nccl")]
-    pub fn attach_comm(&mut self, idx: GraphIdx, comm: cudarc::nccl::Comm) {
+    pub fn attach_comm(&mut self, idx: GraphIdx, comm: Comm) {
         self.entries[idx.0].attach_comm(comm);
     }
 

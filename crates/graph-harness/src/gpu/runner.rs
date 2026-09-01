@@ -426,6 +426,7 @@ fn capture_cell(
     } = buffers;
     #[cfg(not(feature = "nccl"))]
     let CellBuffers { statics, staging } = buffers;
+    // Statics order: the four copy-in destinations, then logits and argmax, then accumulators.
     let mut statics = statics.into_iter();
     let mut workspaces: Vec<CudaSlice<u8>> = statics.by_ref().take(4).collect();
     let outputs: Vec<CudaSlice<u8>> = statics.by_ref().take(2).collect();
