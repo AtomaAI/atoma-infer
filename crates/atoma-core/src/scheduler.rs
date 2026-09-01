@@ -303,8 +303,8 @@ impl Scheduler {
     pub fn apply(&mut self, scheduled: &Scheduled, sampled: &[u32]) {
         let mut sampled = sampled.iter().copied();
         let mut finished = Vec::new();
+        let (mut parts, retirement) = self.borrow_apart();
         for entry in &scheduled.entries {
-            let (mut parts, retirement) = self.borrow_apart();
             let request = parts
                 .requests
                 .get_mut(entry.slot)
@@ -342,7 +342,6 @@ impl Scheduler {
             sampled.next().is_none(),
             "more sampled tokens than sampling entries"
         );
-        let (mut parts, _) = self.borrow_apart();
         for (slot, reason) in finished {
             retire::retire(&mut parts, slot, reason);
         }
