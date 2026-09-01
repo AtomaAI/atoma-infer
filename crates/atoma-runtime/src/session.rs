@@ -40,6 +40,15 @@
 //! }
 //! ```
 //!
+//! Beginning a capture through the stream reference Allocation does expose:
+//!
+//! ```compile_fail
+//! use atoma_runtime::session::Allocation;
+//! fn begin_early(allocation: &Allocation) {
+//!     allocation.stream().begin_capture();
+//! }
+//! ```
+//!
 //! Forging a phase from outside:
 //!
 //! ```compile_fail

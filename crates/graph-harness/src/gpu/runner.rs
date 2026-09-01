@@ -90,9 +90,46 @@ struct CellBuffers {
     comm: Option<Comm>,
 }
 
-/// Runs the full capture matrix and writes `findings.md`, `measurements.json`, and per-cell
-/// graph topology dumps into `cfg.out_dir`.
-pub fn run(cfg: RunConfig) -> Result<Vec<CellReport>> {
+/// The all-reduce mirror: the f32 buffer every cell's collective reduces in, and its snapshotted
+/// address.
+struct Mirror<'a> {
+    buffer: &'a mut CudaSlice<f32>,
+    ptr: u64,
+}
+
+/// The run's derived shape: model dims, the cell matrix, the bucket ladder and the arena.
+struct RunPlan {
+    dims: ModelDims,
+    cells: Vec<CaptureCell>,
+    ladder: Vec<usize>,
+    arena: CaptureArena,
+    max_blocks_per_seq: usize,
+    total_blocks: usize,
+}
+
+impl RunPlan {
+    fn new(cfg: &RunConfig) -> Self {
+        let dims = ModelDims::llama_8b_shaped(cfg.layers);
+        let cells = capture_matrix(&cfg.buckets, cfg.include_all_reduce);
+        let mut ladder = cfg.buckets.clone();
+        ladder.sort_unstable_by(|a, b| b.cmp(a));
+        ladder.dedup();
+        let arena = build_arena(&dims, &ladder);
+        let max_blocks_per_seq = cfg.max_seqlen / cfg.page_block;
+        let total_blocks = ladder.first().copied().unwrap_or(1) * max_blocks_per_seq;
+        Self {
+            dims,
+            cells,
+            ladder,
+            arena,
+            max_blocks_per_seq,
+            total_blocks,
+        }
+    }
+}
+
+/// Rejects configurations the build or the kernels cannot honour, and creates the output dir.
+fn validate(cfg: &RunConfig) -> Result<()> {
     if cfg.include_all_reduce && !cfg!(feature = "nccl") {
         bail!("all-reduce cells need the nccl feature: rebuild with --features cuda,nccl");
     }
@@ -104,19 +141,14 @@ pub fn run(cfg: RunConfig) -> Result<Vec<CellReport>> {
         );
     }
     fs::create_dir_all(&cfg.out_dir)
-        .with_context(|| format!("creating out dir {}", cfg.out_dir.display()))?;
+        .with_context(|| format!("creating out dir {}", cfg.out_dir.display()))
+}
 
-    let dims = ModelDims::llama_8b_shaped(cfg.layers);
-    let cells = capture_matrix(&cfg.buckets, cfg.include_all_reduce);
-    let ladder: Vec<usize> = {
-        let mut buckets = cfg.buckets.clone();
-        buckets.sort_unstable_by(|a, b| b.cmp(a));
-        buckets.dedup();
-        buckets
-    };
-    let arena = build_arena(&dims, &ladder);
-    let max_blocks_per_seq = cfg.max_seqlen / cfg.page_block;
-    let total_blocks = ladder.first().copied().unwrap_or(1) * max_blocks_per_seq;
+/// Runs the full capture matrix and writes `findings.md`, `measurements.json`, and per-cell
+/// graph topology dumps into `cfg.out_dir`.
+pub fn run(cfg: RunConfig) -> Result<Vec<CellReport>> {
+    validate(&cfg)?;
+    let plan = RunPlan::new(&cfg);
 
     // Allocation phase. The context comes first — it disables cudarc's event tracking before
     // anything is allocated — then the session, then every buffer, handle and communicator.
@@ -131,50 +163,54 @@ pub fn run(cfg: RunConfig) -> Result<Vec<CellReport>> {
     let blas = StepBlas::new().context("creating the cuBLAS handle")?;
 
     // Shared device state; declared before the session's graph set exists so it outlives it.
-    let (model_slices, model) = alloc::model(&kernels, &setup_stream, &dims, cfg.seed)
+    let (model_slices, model) = alloc::model(&kernels, &setup_stream, &plan.dims, cfg.seed)
         .context("allocating and filling weights")?;
     let (kv_slices, kv_ptrs) = alloc::kv(
         &kernels,
         &setup_stream,
-        &dims,
-        total_blocks,
+        &plan.dims,
+        plan.total_blocks,
         cfg.page_block,
         cfg.seed,
     )
     .context("allocating and filling the KV pool")?;
-    let arena_buf = alloc::bytes(&setup_stream, arena.total_size().max(1))?;
+    let arena_buf = alloc::bytes(&setup_stream, plan.arena.total_size().max(1))?;
     let arena_base = alloc::addr(&arena_buf, &setup_stream);
-    let max_bucket = ladder.first().copied().unwrap_or(1);
+    let max_bucket = plan.ladder.first().copied().unwrap_or(1);
     let mut allreduce_buf: CudaSlice<f32> = setup_stream
-        .alloc_zeros(max_bucket * dims.hidden)
+        .alloc_zeros(max_bucket * plan.dims.hidden)
         .map_err(|e| anyhow!("allocating the all-reduce mirror: {:?}", e.0))?;
     let allreduce_ptr = {
         let (ptr, _guard) = allreduce_buf.device_ptr(&setup_stream);
         ptr
     };
+    let mut mirror = Mirror {
+        buffer: &mut allreduce_buf,
+        ptr: allreduce_ptr,
+    };
 
     let deps = Deps {
         cfg: &cfg,
-        dims: &dims,
-        arena: &arena,
+        dims: &plan.dims,
+        arena: &plan.arena,
         kernels: &kernels,
         blas: &blas,
         setup_stream: &setup_stream,
-        max_blocks_per_seq,
+        max_blocks_per_seq: plan.max_blocks_per_seq,
     };
     let mut prepared = Vec::new();
     let mut buffers = Vec::new();
-    for (index, cell) in cells.iter().enumerate() {
+    for (index, cell) in plan.cells.iter().enumerate() {
         let (cell_prepared, cell_buffers) = prepare_cell(
             &deps,
             &allocation,
             *cell,
             index,
-            &ladder,
+            &plan.ladder,
             &model,
             &kv_ptrs,
             arena_base,
-            total_blocks,
+            plan.total_blocks,
             sm_count,
         )?;
         prepared.push(cell_prepared);
@@ -185,60 +221,21 @@ pub fn run(cfg: RunConfig) -> Result<Vec<CellReport>> {
     // Capture phase: per cell, warmup at the exact shape, then the recording. No address moves
     // and no handle binds past the seal.
     let mut capture = allocation.seal();
-    let mut reports = Vec::new();
-    let mut recorded: Vec<Option<GraphIdx>> = Vec::new();
-    for (cell_prepared, cell_buffers) in prepared.iter_mut().zip(buffers) {
-        let mut report = CellReport::new(cell_prepared.cell.label());
-        match capture_cell(
-            &deps,
-            &mut capture,
-            cell_prepared,
-            cell_buffers,
-            &mut allreduce_buf,
-            allreduce_ptr,
-            &mut report,
-        ) {
-            Ok(idx) => recorded.push(Some(idx)),
-            Err(err) => {
-                report.failure = Some(format!("{err:#}"));
-                recorded.push(None);
-            }
-        }
-        reports.push(report);
-    }
+    let (mut reports, recorded) =
+        capture_cells(&deps, &mut capture, &mut prepared, buffers, &mut mirror);
 
     // Replay phase: the identity loop and the soak for every cell that recorded.
     let replay = capture.seal();
-    for ((cell_prepared, idx), report) in prepared.iter_mut().zip(&recorded).zip(&mut reports) {
-        let Some(idx) = idx else { continue };
-        if let Err(err) = exercise(
-            &deps,
-            &replay,
-            cell_prepared,
-            *idx,
-            &mut allreduce_buf,
-            allreduce_ptr,
-            report,
-        ) {
-            report.failure = Some(format!("{err:#}"));
-        }
-    }
+    exercise_cells(
+        &deps,
+        &replay,
+        &mut prepared,
+        &recorded,
+        &mut mirror,
+        &mut reports,
+    );
 
-    let header = vec![
-        format!("device ordinal {}, {} SMs", cfg.device_ordinal, sm_count),
-        format!(
-            "{} layers, buckets {:?}, {} identity steps, {} soak replays",
-            cfg.layers, ladder, cfg.identity_steps, cfg.soak_replays
-        ),
-        format!(
-            "page_block {}, max_seqlen {}, start_seqlen {}, seed {}",
-            cfg.page_block, cfg.max_seqlen, cfg.start_seqlen, cfg.seed
-        ),
-    ];
-    let markdown = render_markdown(&header, &reports);
-    fs::write(cfg.out_dir.join("findings.md"), markdown)?;
-    let json = serde_json::to_string_pretty(&reports)?;
-    fs::write(cfg.out_dir.join("measurements.json"), json)?;
+    write_findings(&cfg, sm_count, &plan.ladder, &reports)?;
 
     // The graph set dies before the shared device state whose addresses it baked.
     drop(replay);
@@ -248,7 +245,7 @@ pub fn run(cfg: RunConfig) -> Result<Vec<CellReport>> {
 }
 
 /// Builds one cell's plan, buffers, and address table (allocation only — no capture).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // one-call fan-in of the run's shared state; a struct would only rename it
 fn prepare_cell(
     deps: &Deps<'_>,
     allocation: &Allocation,
@@ -388,8 +385,7 @@ fn capture_cell(
     capture: &mut Capture,
     prepared: &mut PreparedCell,
     buffers: CellBuffers,
-    allreduce_buf: &mut CudaSlice<f32>,
-    allreduce_ptr: u64,
+    mirror: &mut Mirror<'_>,
     report: &mut CellReport,
 ) -> Result<GraphIdx> {
     let step_ctx = step_context(deps, prepared);
@@ -402,9 +398,9 @@ fn capture_cell(
         .context("warmup upload")?;
     {
         #[cfg(feature = "nccl")]
-        let all_reduce = make_all_reduce(buffers.comm.as_ref(), allreduce_buf, allreduce_ptr);
+        let all_reduce = make_all_reduce(buffers.comm.as_ref(), mirror);
         #[cfg(not(feature = "nccl"))]
-        let all_reduce = make_all_reduce(allreduce_buf, allreduce_ptr);
+        let all_reduce = make_all_reduce(mirror);
         capture
             .warm_up(&mut StepWork::Decode {
                 ctx: &step_ctx,
@@ -439,9 +435,9 @@ fn capture_cell(
 
     let idx = {
         #[cfg(feature = "nccl")]
-        let all_reduce = make_all_reduce(comm.as_ref(), allreduce_buf, allreduce_ptr);
+        let all_reduce = make_all_reduce(comm.as_ref(), mirror);
         #[cfg(not(feature = "nccl"))]
-        let all_reduce = make_all_reduce(allreduce_buf, allreduce_ptr);
+        let all_reduce = make_all_reduce(mirror);
         capture
             .record(
                 &mut StepWork::Decode {
@@ -481,8 +477,7 @@ fn exercise(
     replay: &Replay,
     prepared: &mut PreparedCell,
     idx: GraphIdx,
-    allreduce_buf: &mut CudaSlice<f32>,
-    allreduce_ptr: u64,
+    mirror: &mut Mirror<'_>,
     report: &mut CellReport,
 ) -> Result<()> {
     let step_ctx = step_context(deps, prepared);
@@ -518,10 +513,9 @@ fn exercise(
         let start = Instant::now();
         {
             #[cfg(feature = "nccl")]
-            let all_reduce =
-                make_all_reduce(replay.entry(idx).comm(), allreduce_buf, allreduce_ptr);
+            let all_reduce = make_all_reduce(replay.entry(idx).comm(), mirror);
             #[cfg(not(feature = "nccl"))]
-            let all_reduce = make_all_reduce(allreduce_buf, allreduce_ptr);
+            let all_reduce = make_all_reduce(mirror);
             replay
                 .run(&mut StepWork::Decode {
                     ctx: &step_ctx,
@@ -555,7 +549,19 @@ fn exercise(
     report.eager_enqueue = Stats::from_micros(eager_enqueue);
     report.eager_step = Stats::from_micros(eager_step);
 
-    // Soak: replay-only; memory must be flat after the first warm replay.
+    soak(deps, replay, prepared, idx, report)
+}
+
+/// The replay-only soak: every baked address must hold after each replay, and free memory must
+/// be flat after the first warm replay — a nonzero delta fails the cell.
+fn soak(
+    deps: &Deps<'_>,
+    replay: &Replay,
+    prepared: &mut PreparedCell,
+    idx: GraphIdx,
+    report: &mut CellReport,
+) -> Result<()> {
+    let baked = baked_ptrs(replay.entry(idx), deps.setup_stream);
     let mut free_after_warm = None;
     for soak_index in 0..deps.cfg.soak_replays {
         let inputs = prepared.plan.next_step();
@@ -569,14 +575,25 @@ fn exercise(
         if soak_index == 0 || soak_index % 64 == 63 {
             replay.synchronize()?;
         }
+        if baked_ptrs(replay.entry(idx), deps.setup_stream) != baked {
+            bail!("baked device pointers moved during soak replay {soak_index}");
+        }
         if soak_index == 0 {
             free_after_warm = Some(alloc::free_memory()?);
         }
         report.soak_replays += 1;
     }
     replay.synchronize()?;
-    if let Some(free_after_warm) = free_after_warm {
-        report.soak_mem_delta_bytes = Some(free_after_warm - alloc::free_memory()?);
+    let Some(free_after_warm) = free_after_warm else {
+        return Ok(());
+    };
+    let delta = free_after_warm - alloc::free_memory()?;
+    report.soak_mem_delta_bytes = Some(delta);
+    if delta != 0 {
+        bail!(
+            "free memory moved by {delta} bytes across {} soak replays",
+            report.soak_replays
+        );
     }
     Ok(())
 }
@@ -603,21 +620,95 @@ fn step_context<'a>(deps: &Deps<'a>, prepared: &PreparedCell) -> StepContext<'a>
 #[cfg(feature = "nccl")]
 fn make_all_reduce<'a>(
     comm: Option<&'a Comm>,
-    buffer: &'a mut CudaSlice<f32>,
-    buffer_ptr: u64,
+    mirror: &'a mut Mirror<'_>,
 ) -> Option<AllReduce<'a>> {
-    comm.map(|comm| AllReduce {
+    let comm = comm?;
+    Some(AllReduce {
         comm,
-        buffer,
-        buffer_ptr,
+        buffer: &mut *mirror.buffer,
+        buffer_ptr: mirror.ptr,
     })
 }
 
 /// Without the nccl feature no cell has a communicator, so no step gets a hook.
 #[cfg(not(feature = "nccl"))]
-fn make_all_reduce<'a>(buffer: &'a mut CudaSlice<f32>, buffer_ptr: u64) -> Option<AllReduce<'a>> {
-    let _ = (buffer, buffer_ptr);
+fn make_all_reduce<'a>(mirror: &'a mut Mirror<'_>) -> Option<AllReduce<'a>> {
+    let _ = (&mirror.buffer, mirror.ptr);
     None
+}
+
+/// The Capture-phase pass: every cell warmed and recorded, failures noted per report.
+fn capture_cells(
+    deps: &Deps<'_>,
+    capture: &mut Capture,
+    prepared: &mut [PreparedCell],
+    buffers: Vec<CellBuffers>,
+    mirror: &mut Mirror<'_>,
+) -> (Vec<CellReport>, Vec<Option<GraphIdx>>) {
+    let mut reports = Vec::new();
+    let mut recorded = Vec::new();
+    for (cell_prepared, cell_buffers) in prepared.iter_mut().zip(buffers) {
+        let mut report = CellReport::new(cell_prepared.cell.label());
+        match capture_cell(
+            deps,
+            capture,
+            cell_prepared,
+            cell_buffers,
+            mirror,
+            &mut report,
+        ) {
+            Ok(idx) => recorded.push(Some(idx)),
+            Err(err) => {
+                report.failure = Some(format!("{err:#}"));
+                recorded.push(None);
+            }
+        }
+        reports.push(report);
+    }
+    (reports, recorded)
+}
+
+/// The Replay-phase pass: the identity loop and the soak for every cell that recorded.
+fn exercise_cells(
+    deps: &Deps<'_>,
+    replay: &Replay,
+    prepared: &mut [PreparedCell],
+    recorded: &[Option<GraphIdx>],
+    mirror: &mut Mirror<'_>,
+    reports: &mut [CellReport],
+) {
+    for ((cell_prepared, idx), report) in prepared.iter_mut().zip(recorded).zip(reports.iter_mut())
+    {
+        let Some(idx) = idx else { continue };
+        if let Err(err) = exercise(deps, replay, cell_prepared, *idx, mirror, report) {
+            report.failure = Some(format!("{err:#}"));
+        }
+    }
+}
+
+/// Renders findings.md and measurements.json into the run's output directory.
+fn write_findings(
+    cfg: &RunConfig,
+    sm_count: usize,
+    ladder: &[usize],
+    reports: &[CellReport],
+) -> Result<()> {
+    let header = vec![
+        format!("device ordinal {}, {} SMs", cfg.device_ordinal, sm_count),
+        format!(
+            "{} layers, buckets {:?}, {} identity steps, {} soak replays",
+            cfg.layers, ladder, cfg.identity_steps, cfg.soak_replays
+        ),
+        format!(
+            "page_block {}, max_seqlen {}, start_seqlen {}, seed {}",
+            cfg.page_block, cfg.max_seqlen, cfg.start_seqlen, cfg.seed
+        ),
+    ];
+    let markdown = render_markdown(&header, reports);
+    fs::write(cfg.out_dir.join("findings.md"), markdown)?;
+    let json = serde_json::to_string_pretty(reports)?;
+    fs::write(cfg.out_dir.join("measurements.json"), json)?;
+    Ok(())
 }
 
 /// Every device address baked into the cell's graph, for the per-replay stability assert.

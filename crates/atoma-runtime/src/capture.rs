@@ -11,6 +11,7 @@
 //! neither "instantiate with flags 0" nor "discard without instantiating" is expressible through
 //! it. Both paths are built over cudarc's public `result` and `sys` layers — no fork, no patch.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use cudarc::driver::sys::{CUresult, CUstreamCaptureStatus};
@@ -105,7 +106,7 @@ impl CapturedGraph {
     }
 
     /// Writes the recorded topology to `path` as Graphviz dot; see [`debug_dot_print`].
-    pub fn write_debug_dot(&self, path: &std::path::Path, flags: u32) -> Result<(), RuntimeError> {
+    pub fn write_debug_dot(&self, path: &Path, flags: u32) -> Result<(), RuntimeError> {
         // SAFETY: this type owns a live graph handle.
         unsafe { debug_dot_print(self.cu_graph, path, flags) }
     }
@@ -206,7 +207,7 @@ pub(crate) fn end_capture_discard(stream: &CaptureStream) -> Result<(), RuntimeE
 /// `cu_graph` must be a live graph handle, e.g. from [`CapturedGraph::cu_graph`].
 pub unsafe fn debug_dot_print(
     cu_graph: sys::CUgraph,
-    path: &std::path::Path,
+    path: &Path,
     flags: u32,
 ) -> Result<(), RuntimeError> {
     let path = std::ffi::CString::new(path.to_string_lossy().as_bytes())

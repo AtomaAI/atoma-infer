@@ -34,8 +34,10 @@ impl CaptureStream {
     ///
     /// Relaxed mode does not fence other threads' driver calls, so a concurrent thread doing
     /// legal work cannot invalidate this capture — the global mode would let it. The capture
-    /// lifecycle table rejects a begin while a capture is already active or invalidated.
-    pub fn begin_capture(&self) -> Result<(), RuntimeError> {
+    /// lifecycle table rejects a begin while a capture is already active or invalidated. Only
+    /// the session's Capture phase records, so no phase — Allocation included — can begin a
+    /// capture from outside it.
+    pub(crate) fn begin_capture(&self) -> Result<(), RuntimeError> {
         self.state()?.apply(CaptureOp::Begin)?;
         self.stream
             .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)?;
@@ -68,8 +70,9 @@ impl CaptureStream {
     /// foreign stream and invalidating the recording.
     ///
     /// Communicator creation allocates device memory, so it must happen strictly before the
-    /// first capture, like every other allocation. After capture, hand the communicator to
-    /// [`GraphEntry::with_comm`](crate::graph_entry::GraphEntry::with_comm) so teardown ordering
+    /// first capture, like every other allocation. After the record that captures its
+    /// collective, hand the communicator to
+    /// [`Capture::attach_comm`](crate::session::Capture::attach_comm) so teardown ordering
     /// holds: abort blocks until no live graph references the communicator.
     #[cfg(feature = "nccl")]
     pub fn nccl_comm(
