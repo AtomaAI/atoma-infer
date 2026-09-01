@@ -20,6 +20,7 @@
 //!   do not exist; preemption recomputes), `scheduler_delay_factor` (no delay factor), and
 //!   `abort_of_unknown_request` (there is no abort by id; a dropped egress receiver is the cancel).
 
+mod budget;
 mod drain;
 mod intake;
 mod longest_prefix;
