@@ -28,6 +28,7 @@ use crate::kv::{BlockPool, PaddingReservation, PrefixIndex};
 use crate::request::{FinishReason, NewRequest, Request, RequestEvent, RequestSlab, Usage};
 use crate::scheduler::admission::AdmissionWindow;
 use crate::scheduler::kv::Kv;
+use crate::scheduler::retire::Retirement;
 use crate::types::{RequestId, RequestSlot, StepId};
 
 pub use admission::AdmissionPolicy;
@@ -106,8 +107,8 @@ impl Scheduler {
     }
 
     /// The scheduler borrowed apart, so a sequence, the KV substrate, the queues and the budget
-    /// can change together in one pass.
-    fn parts(&mut self) -> Parts<'_> {
+    /// can change together in one pass, with the settings a retirement reads beside them.
+    fn borrow_apart(&mut self) -> (Parts<'_>, Retirement<'_>) {
         let Scheduler {
             config,
             requests,
@@ -123,7 +124,7 @@ impl Scheduler {
             step,
             next_request_id: _,
         } = self;
-        Parts {
+        let parts = Parts {
             kv: Kv {
                 pool,
                 index,
@@ -136,7 +137,14 @@ impl Scheduler {
             preempted,
             budget,
             step: *step,
-        }
+        };
+        let retirement = Retirement {
+            eos_token_ids: &config.eos_token_ids,
+            max_model_len: config.max_model_len,
+            max_client_backlog: config.max_client_backlog,
+            window: config.window,
+        };
+        (parts, retirement)
     }
 
     /// The step the last pass scheduled.
@@ -271,13 +279,14 @@ impl Scheduler {
     pub fn schedule(&mut self) -> Scheduled {
         self.step = StepId::new(self.step.get() + 1);
         self.budget.reset();
-        self.retire_lost_clients();
         let window = AdmissionWindow {
             size: self.config.window,
             policy: self.config.admission,
             open: self.admission_open,
         };
-        pass::schedule(self.parts(), window)
+        let (mut parts, retirement) = self.borrow_apart();
+        retire::retire_lost_clients(&mut parts, retirement);
+        pass::schedule(parts, window)
     }
 
     /// Records the tokens step `scheduled` computed, appending each sampling entry's token from
@@ -295,7 +304,7 @@ impl Scheduler {
         let mut sampled = sampled.iter().copied();
         let mut finished = Vec::new();
         for entry in &scheduled.entries {
-            let mut parts = self.parts();
+            let (mut parts, retirement) = self.borrow_apart();
             let request = parts
                 .requests
                 .get_mut(entry.slot)
@@ -318,7 +327,9 @@ impl Scheduler {
                 sequence: entry.sequence,
                 token,
             });
-            if let Some(reason) = self.stop_reason(entry.slot, entry.sequence, token) {
+            if let Some(reason) =
+                retire::stop_reason(&parts, retirement, entry.slot, entry.sequence, token)
+            {
                 // A request finishes once, for the first of its sequences to reach a stop
                 // criterion: retiring frees the slot, so a second entry for the same request
                 // would retire a slot that is no longer there.
@@ -331,8 +342,9 @@ impl Scheduler {
             sampled.next().is_none(),
             "more sampled tokens than sampling entries"
         );
+        let (mut parts, _) = self.borrow_apart();
         for (slot, reason) in finished {
-            self.retire(slot, reason);
+            retire::retire(&mut parts, slot, reason);
         }
     }
 }
@@ -353,7 +365,7 @@ struct Parts<'a> {
 impl Drop for Scheduler {
     /// Returns every block to the pool so no lease outlives the scheduler unreleased.
     fn drop(&mut self) {
-        let mut parts = self.parts();
+        let (mut parts, _) = self.borrow_apart();
         for (_, request) in parts.requests.iter_mut() {
             for sequence in request.sequences_mut() {
                 parts.kv.release(sequence);
