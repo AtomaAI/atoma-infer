@@ -299,8 +299,9 @@ impl Scheduler {
     /// # Panics
     ///
     /// Panics when `sampled` does not hold exactly one token per sampling entry: the executor
-    /// broke the step protocol, and the caller validates before applying.
-    pub fn apply(&mut self, scheduled: &Scheduled, sampled: &[u32]) {
+    /// broke the step protocol, and the engine thread validates before applying. Nothing outside
+    /// this crate can apply a result, so that validation is the only way in.
+    pub(crate) fn apply(&mut self, scheduled: &Scheduled, sampled: &[u32]) {
         let mut sampled = sampled.iter().copied();
         let mut finished = Vec::new();
         let (mut parts, retirement) = self.borrow_apart();

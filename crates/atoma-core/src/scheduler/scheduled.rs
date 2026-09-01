@@ -7,15 +7,15 @@ use crate::types::{RequestCount, RequestSlot, SequenceIndex, StepId, TokenCount}
 /// One row of a [`Scheduled`]: a sequence, what it computes this step, and whether it samples.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
-    pub slot: RequestSlot,
-    pub sequence: SequenceIndex,
+    pub(crate) slot: RequestSlot,
+    pub(crate) sequence: SequenceIndex,
     /// Tokens the sequence already holds in KV before the step.
-    pub context_len: usize,
+    pub(crate) context_len: usize,
     /// Tokens the entry computes this step.
-    pub query_len: TokenCount,
+    pub(crate) query_len: TokenCount,
     /// Whether the step samples a token for this entry: only when the query reaches the
     /// sequence's total, so a non-final prefill chunk never does.
-    pub samples: bool,
+    pub(crate) samples: bool,
 }
 
 impl Entry {
@@ -29,10 +29,10 @@ impl Entry {
 /// The output of one scheduling pass: indices and counts, never copied request state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scheduled {
-    pub step: StepId,
-    pub entries: Vec<Entry>,
+    pub(crate) step: StepId,
+    pub(crate) entries: Vec<Entry>,
     /// Requests this pass displaced from Running, most recent last.
-    pub preempted: Vec<RequestSlot>,
+    pub(crate) preempted: Vec<RequestSlot>,
 }
 
 impl Scheduled {
