@@ -188,8 +188,8 @@ still holds. Never a swap: nothing is written out to bring back.
 _Avoid_: swap, evict (the prefix index's word for cached blocks), recompute (as the noun)
 
 **Request**:
-The client unit: one prompt, one set of sampling parameters, one egress sink. What admission
-admits and preemption displaces, as a whole.
+The client unit: one prompt, one set of sampling parameters, one priority, one egress sink. What
+admission admits and preemption displaces, as a whole.
 _Avoid_: sequence group, job, query (for a request)
 
 **Sequence**:

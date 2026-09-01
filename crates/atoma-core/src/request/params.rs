@@ -60,9 +60,7 @@ pub struct StopCriteria {
 /// How urgently a request admits: the higher, the sooner an admission policy that reads it
 /// offers the request. The default is the lowest there is, so traffic that asks for nothing
 /// shares one priority and is ordered by arrival alone.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Priority(u32);
 
 impl Priority {

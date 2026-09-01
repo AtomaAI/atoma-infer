@@ -10,14 +10,15 @@ use crate::types::{BlockHash, BlockId, RequestId, StepId, TokenCount};
 /// The one token a padding dummy computes every step it is inserted into.
 pub const PADDING_TOKEN: u32 = 0;
 
-/// A request as its client submits it: one prompt, one set of sampling parameters, one egress
-/// sink. Everything the engine needs to give it a slot.
+/// A request as its client submits it: one prompt, one set of sampling parameters, one priority,
+/// one egress sink. Everything the engine needs to give it a slot.
 #[derive(Debug)]
 pub struct NewRequest {
     pub prompt: Vec<u32>,
     pub sampling: SamplingParams,
     pub stop: StopCriteria,
-    /// How urgently the request admits. Leaving it at the default asks for arrival order.
+    /// How urgently the request admits. [`Priority::default()`] is the lowest there is, and asks
+    /// for arrival order.
     pub priority: Priority,
     pub egress: EgressSender,
 }
