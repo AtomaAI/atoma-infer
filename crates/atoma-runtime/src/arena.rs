@@ -13,7 +13,8 @@
 //! The arena holds only what is sized per bucket: activations and bridge buffers. Buffers sized
 //! once at the ladder maximum — per-step inputs, outputs, and kernel workspaces — are owned by
 //! the [`GraphEntry`](crate::graph_entry::GraphEntry) whose graph baked their addresses, never by
-//! the arena.
+//! the arena. What a kernel's workspace must satisfy is the attention contract's to state, not
+//! the arena's.
 
 use std::fmt;
 
@@ -407,21 +408,6 @@ impl CaptureArena {
     fn num_roles(&self) -> usize {
         self.role_table.roles.len()
     }
-}
-
-/// The workspace-ownership contract for kernels: the caller owns a preallocated workspace, and
-/// the kernel may not allocate.
-///
-/// A kernel that allocates inside a captured region invalidates the capture — or bakes a
-/// pool-owned address into the graph — so allocation-freedom is the backend's contract with
-/// this crate. A kernel-call descriptor implements this trait to declare how much caller-owned
-/// workspace one invocation needs; the caller allocates at least that much before capture
-/// (a [`GraphEntry`](crate::graph_entry::GraphEntry) workspace buffer) and hands it to every
-/// launch. Defined here, implemented by the attention backend that will exist later; the
-/// current FlashAttention-2 wrapper deliberately does not implement it.
-pub trait WorkspaceRequirement {
-    /// Bytes of caller-owned workspace one invocation of this call needs.
-    fn workspace_bytes(&self) -> usize;
 }
 
 #[cfg(test)]

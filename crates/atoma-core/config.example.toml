@@ -37,14 +37,13 @@ eos_token_ids = [ 2 ]
 # The chain-hash algorithm block identity is minted under.
 hash_algorithm = "sha256_v1"
 
+# What is configured about dispatch, and only that. The support level every captured routine is
+# valid at is declared by the active backends, and whether a pass is captured whole or in segments
+# follows from the break points the backends and the model declare; both are settled at startup
+# and neither can be written down here.
 [dispatch]
 # The token buckets the engine captured graphs for. Written order carries no meaning: a batch is
 # padded to the smallest bucket that holds it, whatever order the buckets appear in here.
 bucket_ladder = [ 1, 1024, 128, 16, 2, 2048, 256, 32, 4, 4096, 512, 64, 8, 8192 ]
 # The largest request count any captured graph serves.
 captured_max_requests = 32
-# The minimum support level across the active backends: "never", "uniform_single_token_decode",
-# "uniform_batch" or "always".
-support_level = "uniform_single_token_decode"
-# How the captured set was recorded: "full" or "segmented".
-capture_kind = "full"

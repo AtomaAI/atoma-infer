@@ -14,8 +14,8 @@ mod lookup;
 
 pub use bucket_ladder::{BucketLadder, BucketLadderError, Platform};
 pub(crate) use decision::decide;
-pub use decision::{EagerFallbackCounters, EagerReason, LiveBatch, SupportLevel};
-pub use dispatcher::{CaptureKind, DispatchConfig, DispatchDecision, Dispatcher};
+pub use decision::{EagerFallbackCounters, EagerReason, LiveBatch};
+pub use dispatcher::{DispatchConfig, DispatchDecision, Dispatcher};
 pub use key::GraphKey;
 pub use lookup::PaddingLookup;
 
