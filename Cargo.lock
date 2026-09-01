@@ -166,7 +166,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
- "config",
+ "figment",
  "futures",
  "hdrhistogram",
  "hf-hub",
