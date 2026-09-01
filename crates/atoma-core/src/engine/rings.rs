@@ -26,7 +26,32 @@ pub struct EngineRings {
 pub struct ExecutorRings {
     commands: Consumer<StepCommand>,
     results: Producer<StepResult>,
-    wake: Unparker,
+    /// Declared after the ring ends, and so dropped after them: fields drop in declaration order,
+    /// and it is those ends dropping that makes the loss visible through
+    /// [`EngineRings::executor_gone`]. Waking first would let a woken engine look, find both rings
+    /// intact, and park again.
+    wake: WakeOnDrop,
+}
+
+/// An unparker that wakes the engine thread when it is dropped.
+///
+/// The wake is a field's drop rather than a `Drop` on [`ExecutorRings`] itself, because that runs
+/// before any of the struct's fields drop — it would wake the engine while the rings it is about
+/// to examine are still held.
+#[derive(Debug)]
+struct WakeOnDrop(Unparker);
+
+impl WakeOnDrop {
+    /// Wakes the engine thread now.
+    fn wake(&self) {
+        self.0.unpark();
+    }
+}
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        self.wake();
+    }
 }
 
 /// Opens both rings, handing each thread its ends; `wake` unparks the engine thread after
@@ -43,7 +68,7 @@ pub fn rings(wake: Unparker) -> (EngineRings, ExecutorRings) {
         ExecutorRings {
             commands: command_consumer,
             results: result_producer,
-            wake,
+            wake: WakeOnDrop(wake),
         },
     )
 }
@@ -72,13 +97,6 @@ impl EngineRings {
     }
 }
 
-impl Drop for ExecutorRings {
-    /// The executor leaving is an event the engine must see at once, not at its deadline.
-    fn drop(&mut self) {
-        self.wake.unpark();
-    }
-}
-
 impl ExecutorRings {
     /// The next step command, if the engine has issued one.
     pub fn pop_command(&mut self) -> Option<StepCommand> {
@@ -95,7 +113,7 @@ impl ExecutorRings {
         self.results
             .push(result)
             .map_err(|PushError::Full(result)| result)?;
-        self.wake.unpark();
+        self.wake.wake();
         Ok(())
     }
 
