@@ -126,7 +126,7 @@ async fn completions(State(state): State<Arc<StubState>>) -> Response {
 
 /// The gauge the stub engine publishes its free-block count on, standing in for the name a real
 /// engine publishes and an operator puts in `kv_probe.metric`.
-const STUB_FREE_BLOCKS_METRIC: &str = "atoma_kv_free_gpu_blocks";
+const STUB_FREE_BLOCKS_METRIC: &str = "atoma_engine_free_blocks";
 
 /// Publishes the free-block gauge in the Prometheus text format.
 async fn metrics(State(state): State<Arc<StubState>>) -> String {

@@ -5,8 +5,6 @@ members = [
     "crates/atoma-engine",
     "crates/atoma-kernels",
     "crates/atoma-runtime",
-    "crates/backends",
-    "crates/backends/vllm",
     "crates/bench",
     "crates/graph-harness",
     "crates/models",
@@ -19,7 +17,6 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1.0.89"
-atoma-backends = { path = "crates/backends" }
 atoma-bench = { path = "crates/bench" }
 atoma-core = { path = "crates/atoma-core" }
 atoma-engine = { path = "crates/atoma-engine" }
@@ -33,10 +30,8 @@ candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
 chrono = "0.4.45"
 clap = "4.5.18"
-config = "0.15.25"
 core_affinity = "0.8.3"
 crossbeam-utils = "0.8.22"
-cuda-runtime-sys = "0.3.0-alpha.1"
 cudarc = { version = "0.19.8", features = [
     "cublas",
     "cublaslt",
@@ -67,7 +62,6 @@ serde_json = "1.0.120"
 serial_test = "4.0.1"
 sha2 = "0.10.8"
 slab = "0.4.12"
-sys-info = "0.9.1"
 tempfile = "3.27.0"
 thiserror = "2"
 tokenizers = "0.22.0"

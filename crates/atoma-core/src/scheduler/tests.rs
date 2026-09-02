@@ -1,6 +1,7 @@
 //! Scheduler tests, including the port of the vLLM-derived scheduler tests.
 //!
-//! Port ledger against `crates/backends/vllm/src/scheduler.rs`:
+//! Port ledger against the previous engine's scheduler, `crates/backends/vllm/src/scheduler.rs`
+//! until that engine was deleted:
 //!
 //! - Ported with semantics intact: `add_sequence_group`, `schedule_simple`, `max_seqs`,
 //!   `prefill_schedule_max_prompt_len`, `prefill_schedule_max_seqs`,

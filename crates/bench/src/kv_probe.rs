@@ -24,9 +24,9 @@ pub struct KvProbeConfig {
     /// Name of the gauge carrying the free block count.
     ///
     /// The engine under test owns this name, so the harness takes it as configuration rather than
-    /// compiling in a copy that could drift: `atoma-infer` publishes
-    /// `atoma_vllm_backend::scheduler::FREE_GPU_BLOCKS_METRIC`, and another engine publishes
-    /// whatever it publishes. Naming no gauge is only allowed when no `metrics_url` is configured
+    /// compiling in a copy that could drift: `atoma-infer` publishes `atoma_engine_free_blocks`,
+    /// the `FREE_BLOCKS_GAUGE` of its API crate, and another engine publishes whatever it
+    /// publishes. Naming no gauge is only allowed when no `metrics_url` is configured
     /// and the probe therefore never runs.
     #[serde(default)]
     pub metric: Option<String>,
@@ -391,12 +391,12 @@ mod tests {
         };
 
         assert_eq!(
-            named(Some("atoma_kv_free_gpu_blocks")).gauge(),
-            Some("atoma_kv_free_gpu_blocks")
+            named(Some("atoma_engine_free_blocks")).gauge(),
+            Some("atoma_engine_free_blocks")
         );
         assert_eq!(
-            named(Some("  atoma_kv_free_gpu_blocks  ")).gauge(),
-            Some("atoma_kv_free_gpu_blocks")
+            named(Some("  atoma_engine_free_blocks  ")).gauge(),
+            Some("atoma_engine_free_blocks")
         );
         assert_eq!(named(Some("   ")).gauge(), None);
         assert_eq!(named(Some("")).gauge(), None);
@@ -406,14 +406,14 @@ mod tests {
     #[test]
     fn test_a_gauge_is_read_from_the_prometheus_text_format() {
         let text = "\
-# HELP atoma_kv_free_gpu_blocks Free KV blocks
-# TYPE atoma_kv_free_gpu_blocks gauge
-atoma_kv_free_gpu_blocks 118
+# HELP atoma_engine_free_blocks Free KV blocks
+# TYPE atoma_engine_free_blocks gauge
+atoma_engine_free_blocks 118
 llm_service_requests_total 42
 ";
 
         assert_eq!(
-            parse_gauge(text, "atoma_kv_free_gpu_blocks"),
+            parse_gauge(text, "atoma_engine_free_blocks"),
             Some(118.0),
             "the gauge line must be read, not the HELP or TYPE lines"
         );
@@ -421,32 +421,32 @@ llm_service_requests_total 42
 
     #[test]
     fn test_a_labelled_gauge_is_read() {
-        let text = "atoma_kv_free_gpu_blocks{device=\"gpu\"} 96.0\n";
+        let text = "atoma_engine_free_blocks{device=\"gpu\"} 96.0\n";
 
-        assert_eq!(parse_gauge(text, "atoma_kv_free_gpu_blocks"), Some(96.0));
+        assert_eq!(parse_gauge(text, "atoma_engine_free_blocks"), Some(96.0));
     }
 
-    /// `atoma_kv_free_gpu_blocks_total` is a different series; a prefix match would silently
+    /// `atoma_engine_free_blocks_total` is a different series; a prefix match would silently
     /// probe the wrong one.
     #[test]
     fn test_a_metric_whose_name_is_a_prefix_is_not_mistaken_for_the_gauge() {
-        let text = "atoma_kv_free_gpu_blocks_total 7\n";
+        let text = "atoma_engine_free_blocks_total 7\n";
 
-        assert_eq!(parse_gauge(text, "atoma_kv_free_gpu_blocks"), None);
+        assert_eq!(parse_gauge(text, "atoma_engine_free_blocks"), None);
     }
 
     #[test]
     fn test_a_missing_or_unreadable_gauge_reads_as_absent() {
-        assert_eq!(parse_gauge("", "atoma_kv_free_gpu_blocks"), None);
+        assert_eq!(parse_gauge("", "atoma_engine_free_blocks"), None);
         assert_eq!(
             parse_gauge(
-                "atoma_kv_free_gpu_blocks NaN-ish\n",
-                "atoma_kv_free_gpu_blocks"
+                "atoma_engine_free_blocks NaN-ish\n",
+                "atoma_engine_free_blocks"
             ),
             None
         );
         assert_eq!(
-            parse_gauge("atoma_kv_free_gpu_blocks\n", "atoma_kv_free_gpu_blocks"),
+            parse_gauge("atoma_engine_free_blocks\n", "atoma_engine_free_blocks"),
             None
         );
     }

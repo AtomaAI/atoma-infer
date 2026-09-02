@@ -92,6 +92,6 @@ startup_timeout_seconds = 900
 # below is `atoma-infer`'s. Required whenever `engine.metrics_url` is set.
 [kv_probe]
 interval_ms      = 1000
-metric           = "atoma_kv_free_gpu_blocks"
+metric           = "atoma_engine_free_blocks"
 num_windows      = 4
 tolerance_blocks = 0
