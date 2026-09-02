@@ -14,7 +14,6 @@ use std::sync::Arc;
 use atoma_core::types::TokenCount;
 use atoma_runtime::session::Allocation;
 use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
 use cudarc::driver::CudaStream;
 use models::llama::Config;
 use models::FlashAttention;
@@ -27,6 +26,10 @@ use crate::model::ModelFiles;
 #[cfg(feature = "nccl")]
 use std::rc::Rc;
 
+#[cfg(feature = "nccl")]
+use candle_nn::var_builder::{ShardedSafeTensors, ShardedVarBuilder};
+#[cfg(not(feature = "nccl"))]
+use candle_nn::VarBuilder;
 #[cfg(feature = "nccl")]
 use cudarc::nccl::sys::ncclResult_t;
 #[cfg(feature = "nccl")]
@@ -284,6 +287,8 @@ impl Weights {
         Ok(Self { llama })
     }
 
+    /// The builder the whole-model weights are read through.
+    #[cfg(not(feature = "nccl"))]
     fn var_builder(
         device: &RankDevice,
         checkpoint: Checkpoint<'_>,
@@ -292,6 +297,27 @@ impl Weights {
         // files in the Hub cache, written once when fetched.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(
+                &checkpoint.files.weights,
+                checkpoint.dtype,
+                device.candle(),
+            )
+        }?;
+        Ok(vb)
+    }
+
+    /// The builder this rank's share of each tensor is read through.
+    ///
+    /// The tensor-parallel model splits a tensor as it reads it, so the weights must be opened
+    /// through a builder that shards; the whole-model builder hands back the whole tensor.
+    #[cfg(feature = "nccl")]
+    fn var_builder(
+        device: &RankDevice,
+        checkpoint: Checkpoint<'_>,
+    ) -> Result<ShardedVarBuilder<'static>, DeviceError> {
+        // SAFETY: the shards are memory-mapped and must not change underneath the map; they are
+        // files in the Hub cache, written once when fetched.
+        let vb = unsafe {
+            ShardedSafeTensors::var_builder(
                 &checkpoint.files.weights,
                 checkpoint.dtype,
                 device.candle(),
