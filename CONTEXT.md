@@ -284,6 +284,13 @@ The pinned per-rank thread that owns the device and runs the session. It acts on
 and re-derives nothing in it.
 _Avoid_: worker, model thread, runner
 
+**Follower**:
+An executor rank other than zero. Rank zero, the leader, owns the engine's rings and feeds each
+step command to every follower over a ring of its own; a follower runs the forward for it and
+produces nothing, since the leader alone reads logits back and samples. A follower going ends
+the leader, and the leader going ends every follower.
+_Avoid_: worker rank, replica, secondary
+
 **Ingress**:
 The bounded channel that carries requests into the engine thread. A refused send is overload.
 _Avoid_: request queue, inbound, input channel
@@ -323,6 +330,12 @@ _Avoid_: execute model request, model input, batch (for the command)
 What the executor returns for one step: each sampling entry's token and whatever the engine
 needs to advance request state.
 _Avoid_: model output, step output, sampler output
+
+**Readback**:
+The one device-to-host copy per step that brings the selected logits to the host: into a pinned
+buffer sized for the largest batch, enqueued on the forward's stream, and waited on through the
+buffer's own event and nothing else.
+_Avoid_: download, sync (for this copy), logits fetch
 
 **Drain**:
 The control message that stops admission and lets running requests finish. The engine is
