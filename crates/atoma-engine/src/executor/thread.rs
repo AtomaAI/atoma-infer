@@ -374,10 +374,11 @@ mod tests {
             Ok(Executor::new(rings, FakeForward::constant(7), BLOCK_SIZE))
         })
         .unwrap_err();
-        assert!(
-            matches!(&error, SpawnError::Pin { rank: Rank::ZERO, core, .. } if core.get() == beyond),
-            "{error}"
-        );
+        let SpawnError::Pin { rank, core, .. } = &error else {
+            panic!("a pin failure, not {error}");
+        };
+        assert_eq!(*rank, Rank::ZERO);
+        assert_eq!(core.get(), beyond);
         assert!(error.to_string().contains("may run on cores"), "{error}");
     }
 

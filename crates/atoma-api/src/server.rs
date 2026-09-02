@@ -355,8 +355,16 @@ fn unix_now() -> u64 {
     path = CHAT_COMPLETIONS_PATH,
     request_body = RequestBody,
     responses(
-        (status = 200, description = "The completion, whole or streamed", body = ChatCompletionResponse),
-        (status = 400, description = "Asks for what the engine cannot honour", body = serde_json::Value),
+        (
+            status = 200,
+            description = "The completion, whole or streamed",
+            body = ChatCompletionResponse
+        ),
+        (
+            status = 400,
+            description = "Asks for what the engine cannot honour",
+            body = serde_json::Value
+        ),
         (status = 429, description = "The engine is overloaded", body = serde_json::Value),
         (status = 503, description = "The engine is gone", body = serde_json::Value)
     ),
