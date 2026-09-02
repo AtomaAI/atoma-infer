@@ -144,7 +144,7 @@ fn allocate(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<CudaF
     let weights = Weights::load(&allocation, &device, checkpoint)?;
     #[cfg(feature = "nccl")]
     let weights = Weights::load(&allocation, &device, checkpoint, &communicator)?;
-    let geometry = KvGeometry::new(&config, plan.block_count, plan.block_size, plan.world_size);
+    let geometry = KvGeometry::new(&config, plan.block_count, plan.block_size, plan.world_size)?;
     let kv_cache = KvCache::allocate(&allocation, &device, &config, geometry, plan.dtype)?;
     let readback = if rank == Rank::ZERO {
         Some(Readback::new(

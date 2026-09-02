@@ -42,6 +42,12 @@ pub enum DeviceError {
     Candle(#[from] candle_core::Error),
     #[error(transparent)]
     Model(#[from] ModelError),
+    /// The key-value heads are shared out across the ranks whole, so their count must divide.
+    #[error(
+        "the model's {kv_heads} key-value heads do not split across {world_size} ranks; configure \
+         a rank count that divides them"
+    )]
+    KvHeadsNotSplit { kv_heads: usize, world_size: usize },
     #[cfg(feature = "nccl")]
     #[error(
         "the NCCL communicator for rank {rank} of {world_size} could not be opened: {status:?}"
@@ -120,14 +126,29 @@ pub struct KvGeometry {
 impl KvGeometry {
     /// The geometry of `config`'s cache over `block_count` blocks of `block_size`, with the
     /// key-value heads split `world_size` ways.
-    #[must_use]
-    pub fn new(config: &Config, block_count: usize, block_size: usize, world_size: usize) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceError::KvHeadsNotSplit`] when the heads do not divide across the ranks.
+    pub fn new(
+        config: &Config,
+        block_count: usize,
+        block_size: usize,
+        world_size: usize,
+    ) -> Result<Self, DeviceError> {
+        let kv_heads = config.num_key_value_heads;
+        if kv_heads % world_size != 0 {
+            return Err(DeviceError::KvHeadsNotSplit {
+                kv_heads,
+                world_size,
+            });
+        }
+        Ok(Self {
             block_count,
             block_size,
-            kv_heads: config.num_key_value_heads / world_size,
+            kv_heads: kv_heads / world_size,
             head_dim: config.hidden_size / config.num_attention_heads,
-        }
+        })
     }
 }
 
