@@ -106,7 +106,7 @@ pub fn spawn_ranks(
     let mut launched: Vec<Launched> = Vec::with_capacity(world_size);
     let leader_plan = plan.clone();
     launched.push(launch(Rank::ZERO, leader.core, move || {
-        let forward = allocate(Rank::ZERO, leader.device, &leader_plan)?;
+        let forward = open_forward(Rank::ZERO, leader.device, &leader_plan)?;
         let mut executor = Executor::new(rings, forward, block_size);
         for leader_end in feeds {
             executor.follow(leader_end);
@@ -116,7 +116,7 @@ pub fn spawn_ranks(
     for (rank, config, follower_end) in followers {
         let plan = plan.clone();
         launched.push(launch(rank, config.core, move || {
-            let forward = allocate(rank, config.device, &plan)?;
+            let forward = open_forward(rank, config.device, &plan)?;
             Ok(Follower::new(follower_end, forward, block_size))
         })?);
     }
@@ -125,9 +125,10 @@ pub fn spawn_ranks(
     Ok(threads)
 }
 
-/// Drives one rank's session from Allocation to Replay on the current thread, allocating
-/// everything the rank holds in between, and hands back the forward that holds it all.
-fn allocate(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<CudaForward, Cause> {
+/// Opens the forward of rank `rank` on the current thread: drives the rank's session from
+/// Allocation to Replay, allocating everything the rank holds in between, and hands back the
+/// forward that holds it all.
+fn open_forward(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<CudaForward, Cause> {
     let context = RuntimeContext::new(ordinal.get())?;
     let allocation = Allocation::new(&context)?;
     let device = RankDevice::open(&allocation, ordinal)?;

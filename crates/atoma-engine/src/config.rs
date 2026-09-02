@@ -127,7 +127,7 @@ fn ranks_own_distinct_devices_and_cores(config: &ExecutorConfig) -> Result<(), V
     let mut cores = HashSet::new();
     for rank in &config.ranks {
         if !devices.insert(rank.device) {
-            return Err(shared(
+            return Err(validation_error(
                 "device_shared_by_ranks",
                 format!(
                     "executor.ranks name device {} more than once; every rank owns its own \
@@ -137,7 +137,7 @@ fn ranks_own_distinct_devices_and_cores(config: &ExecutorConfig) -> Result<(), V
             ));
         }
         if !cores.insert(rank.core) {
-            return Err(shared(
+            return Err(validation_error(
                 "core_shared_by_ranks",
                 format!(
                     "executor.ranks name core {} more than once; every rank is pinned to its own \
@@ -150,7 +150,7 @@ fn ranks_own_distinct_devices_and_cores(config: &ExecutorConfig) -> Result<(), V
     Ok(())
 }
 
-fn shared(code: &'static str, message: String) -> ValidationError {
+fn validation_error(code: &'static str, message: String) -> ValidationError {
     let mut error = ValidationError::new(code);
     error.message = Some(message.into());
     error
