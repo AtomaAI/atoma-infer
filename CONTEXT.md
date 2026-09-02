@@ -248,6 +248,13 @@ One engine iteration: a scheduling pass, the step command it yields, and the ste
 comes back. Numbered by step id.
 _Avoid_: iteration, tick, cycle
 
+**Step deadline**:
+How long a step command may be out with the executor before the engine treats the executor as
+lost: live requests fail as executor lost and the engine thread returns. An executor held inside
+a step — a leader kept in a collective by a rank that died mid-step — never drops its rings, so
+the deadline is what ends the wait.
+_Avoid_: step timeout, watchdog, forward timeout
+
 **Scheduled**:
 The output of one scheduling pass: the step it is for, the entries this step runs and the slots
 it preempted. Indices and counts, never copied request state. There are no block deltas: a step

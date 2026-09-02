@@ -16,6 +16,10 @@ block_count = 4096
 ingress_capacity = 256
 # How long the engine thread parks with nothing to do before re-examining its queues.
 idle_deadline_millis = 5
+# How long a step may be out with the executor before the engine treats the executor as lost and
+# fails every live request: an executor held inside a step never drops its rings, so this is
+# what ends the wait. Far above any step's run time; a step is bounded by `token_budget`.
+step_deadline_millis = 60000
 
 [engine.scheduler]
 # Query tokens one step may compute, summed over entries.

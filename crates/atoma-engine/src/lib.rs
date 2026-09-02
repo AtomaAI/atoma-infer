@@ -86,6 +86,7 @@ pub(crate) mod test_support {
             block_count: BLOCKS,
             ingress_capacity: requests(8),
             idle_deadline: LONG_DEADLINE,
+            step_deadline: WAIT,
         }
     }
 

@@ -605,6 +605,7 @@ mod tests {
                 .unwrap(),
             ingress_capacity: requests(8),
             idle_deadline: Duration::from_millis(1),
+            step_deadline: WAIT,
         }
     }
 

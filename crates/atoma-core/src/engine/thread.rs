@@ -7,7 +7,7 @@
 
 use std::io::ErrorKind;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_utils::sync::Parker;
 use flume::{SendError, Sender};
@@ -25,7 +25,7 @@ use crate::kv::{BlockPool, PaddingError, PaddingReservation};
 use crate::request::FinishReason;
 use crate::scheduler::{Scheduled, Scheduler, SchedulerError};
 use crate::step::StepResult;
-use crate::types::{RequestCount, TokenCount};
+use crate::types::{RequestCount, StepId, TokenCount};
 
 /// A configuration the engine refuses to start under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -87,8 +87,15 @@ impl EngineThread {
 pub enum Pass {
     /// Park, then pass again.
     Continue,
-    /// The thread returns: shut down, or the executor is gone.
+    /// The thread returns: shut down, the executor gone, or a step out past its deadline.
     Exit,
+}
+
+/// The step out with the executor: what was scheduled, and when its command was pushed.
+#[derive(Debug)]
+struct InFlight {
+    scheduled: Scheduled,
+    issued: Instant,
 }
 
 /// The engine: the scheduler, dispatcher, rings, channels and heartbeat, owned by one thread.
@@ -102,8 +109,8 @@ pub struct Engine {
     heartbeat: HeartbeatPublisher,
     parker: Parker,
     idle_deadline: Duration,
-    /// The pass whose step command is out with the executor, if one is.
-    in_flight: Option<Scheduled>,
+    step_deadline: Duration,
+    in_flight: Option<InFlight>,
     /// The drain waiting for every live request to be over, if one is.
     draining: Option<Sender<EngineState>>,
     passes: u64,
@@ -158,6 +165,7 @@ impl Engine {
             heartbeat: heartbeat_publisher,
             parker,
             idle_deadline: config.idle_deadline,
+            step_deadline: config.step_deadline,
             in_flight: None,
             draining: None,
             passes: 0,
@@ -188,8 +196,8 @@ impl Engine {
         Ok((handle, executor_rings, EngineThread { join }))
     }
 
-    /// Passes until shutdown or the executor is gone, parking between passes until ingress,
-    /// control, the executor or the idle deadline wakes the thread.
+    /// Passes until shutdown, the executor gone or a step out past its deadline, parking between
+    /// passes until ingress, control, the executor or a deadline wakes the thread.
     pub fn run(mut self) {
         info!("engine thread running");
         while self.pass() == Pass::Continue {
@@ -214,6 +222,15 @@ impl Engine {
             if self.apply_result(&result) == Pass::Exit {
                 return Pass::Exit;
             }
+        } else if let Some(step) = self.overdue_step() {
+            error!(
+                step = step.get(),
+                deadline = ?self.step_deadline,
+                "no result within the step deadline; the executor is wedged, failing every live \
+                 request"
+            );
+            self.fail_all(FinishReason::ExecutorLost);
+            return Pass::Exit;
         }
         self.drain_ingress();
         if self.in_flight.is_none() {
@@ -225,10 +242,25 @@ impl Engine {
         Pass::Continue
     }
 
-    /// Parks until ingress, control or the executor wakes the thread, or the idle deadline
-    /// passes — whichever is first. A spurious wake costs one pass and nothing else.
+    /// Parks until ingress, control or the executor wakes the thread, or a deadline passes —
+    /// the idle deadline, or what is left of the step deadline while a step is out — whichever
+    /// is first. A spurious wake costs one pass and nothing else.
     fn park(&self) {
-        self.parker.park_timeout(self.idle_deadline);
+        let timeout = self
+            .in_flight
+            .as_ref()
+            .map_or(self.idle_deadline, |in_flight| {
+                self.step_deadline
+                    .saturating_sub(in_flight.issued.elapsed())
+                    .min(self.idle_deadline)
+            });
+        self.parker.park_timeout(timeout);
+    }
+
+    /// The step in flight, once it has been out for the step deadline without a result.
+    fn overdue_step(&self) -> Option<StepId> {
+        let in_flight = self.in_flight.as_ref()?;
+        (in_flight.issued.elapsed() >= self.step_deadline).then_some(in_flight.scheduled.step)
     }
 
     /// The engine's state as of now.
@@ -285,7 +317,7 @@ impl Engine {
     /// Applies the result of the step in flight. A result that does not match the step is the
     /// executor breaking the protocol, which is unrecoverable.
     fn apply_result(&mut self, result: &StepResult) -> Pass {
-        let Some(scheduled) = self.in_flight.take() else {
+        let Some(InFlight { scheduled, .. }) = self.in_flight.take() else {
             error!(step = result.step.get(), "result with no step in flight");
             self.fail_all(FinishReason::ExecutorLost);
             return Pass::Exit;
@@ -322,7 +354,10 @@ impl Engine {
         if self.rings.push_command(command).is_err() {
             unreachable!("one step in flight always leaves a slot in a ring of two");
         }
-        self.in_flight = Some(scheduled);
+        self.in_flight = Some(InFlight {
+            scheduled,
+            issued: Instant::now(),
+        });
     }
 
     /// Reports the drain once every live request is over: nothing running, nothing preempted
