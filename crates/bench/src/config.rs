@@ -235,7 +235,7 @@ server_args = []
 startup_timeout_seconds = 900
 
 [kv_probe]
-metric = "atoma_engine_free_blocks"
+metric = "atoma_engine_available_blocks"
 "#
     }
 
@@ -264,7 +264,10 @@ metric = "atoma_engine_free_blocks"
         assert_eq!(config.workload.name(), "long-context");
         assert_eq!(config.engine.name, "atoma-infer");
         assert_eq!(config.baseline.pinned_version(), "0.26.0");
-        assert_eq!(config.kv_probe.gauge(), Some("atoma_engine_free_blocks"));
+        assert_eq!(
+            config.kv_probe.gauge(),
+            Some("atoma_engine_available_blocks")
+        );
     }
 
     /// The example is what an operator copies; if it stops matching this struct, the first thing
@@ -277,7 +280,10 @@ metric = "atoma_engine_free_blocks"
 
         assert_eq!(config.workload.name(), "sharegpt");
         assert_eq!(config.baseline.pinned_version(), "0.26.0");
-        assert_eq!(config.kv_probe.gauge(), Some("atoma_engine_free_blocks"));
+        assert_eq!(
+            config.kv_probe.gauge(),
+            Some("atoma_engine_available_blocks")
+        );
     }
 
     /// Two runs cannot have a median, and the protocol asks for at least three.
@@ -299,7 +305,10 @@ metric = "atoma_engine_free_blocks"
     fn test_a_watched_engine_without_a_named_gauge_is_rejected() {
         let path = write_config(
             &temp_dir("config-metric"),
-            &config_toml().replace("metric = \"atoma_engine_free_blocks\"", "metric = \"\""),
+            &config_toml().replace(
+                "metric = \"atoma_engine_available_blocks\"",
+                "metric = \"\"",
+            ),
         );
 
         let error = BenchConfig::load(&path).expect_err("An unnamed gauge cannot be sampled");
@@ -315,7 +324,10 @@ metric = "atoma_engine_free_blocks"
             &temp_dir("config-unwatched"),
             &config_toml()
                 .replace("metrics_url = \"http://127.0.0.1:8080/metrics\"\n", "")
-                .replace("\n[kv_probe]\nmetric = \"atoma_engine_free_blocks\"\n", ""),
+                .replace(
+                    "\n[kv_probe]\nmetric = \"atoma_engine_available_blocks\"\n",
+                    "",
+                ),
         );
 
         let config = BenchConfig::load(&path).expect("Failed to load the configuration");

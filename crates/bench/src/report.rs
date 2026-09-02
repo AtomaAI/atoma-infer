@@ -29,7 +29,7 @@ const MIN_RUNS: usize = 3;
 pub struct RunResult {
     /// The run's numbers.
     pub summary: RunSummary,
-    /// What the KV-leak probe concluded, or `None` for an engine that publishes no free-block
+    /// What the KV-leak probe concluded, or `None` for an engine that publishes no block-count
     /// gauge. The baseline is one such engine: vLLM does not expose the counter, so its runs are
     /// unwatched rather than unjudgeable.
     pub kv_probe: Option<KvProbeVerdict>,
@@ -112,8 +112,9 @@ impl EngineResults {
 /// Whether an engine's runs are expected to carry a KV-probe verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProbeExpectation {
-    /// The engine under test publishes a free-block gauge, so every run must have been watched and
-    /// must have passed. An unwatched run would retire the leak guard without anyone noticing.
+    /// The engine under test publishes a block-count gauge, so every run must have been watched
+    /// and must have passed. An unwatched run would retire the leak guard without anyone
+    /// noticing.
     Required,
     /// The pinned baseline publishes no such gauge, so its runs are unwatched. Holding it to a
     /// probe it cannot answer would fail every comparison.
@@ -408,12 +409,12 @@ impl BenchmarkResults {
 /// How a probe verdict reads in the table.
 fn rendered_verdict(verdict: Option<&KvProbeVerdict>) -> String {
     match verdict {
-        None => "not watched (no free-block gauge)".to_string(),
+        None => "not watched (no block-count gauge)".to_string(),
         Some(KvProbeVerdict::Pass {
-            baseline_free_blocks,
-            final_free_blocks,
+            baseline_blocks,
+            final_blocks,
             ..
-        }) => format!("pass ({final_free_blocks}/{baseline_free_blocks} blocks free at drain)"),
+        }) => format!("pass ({final_blocks}/{baseline_blocks} blocks available at drain)"),
         Some(KvProbeVerdict::Leak { reason, .. }) => format!("**leak** — {reason}"),
         Some(KvProbeVerdict::Inconclusive { reason, .. }) => format!("inconclusive — {reason}"),
     }
@@ -447,8 +448,8 @@ mod tests {
                 end_to_end_ms: Distribution::default(),
             },
             kv_probe: Some(KvProbeVerdict::Pass {
-                baseline_free_blocks: 4_096,
-                final_free_blocks: 4_096,
+                baseline_blocks: 4_096,
+                final_blocks: 4_096,
                 samples: 20,
             }),
         }
@@ -536,8 +537,8 @@ mod tests {
         let mut subject = engine("atoma-infer", &[3.0, 5.0, 7.0]);
         subject.runs[1].kv_probe = Some(KvProbeVerdict::Leak {
             reason: "128 of 4096 blocks had not returned once the run drained".to_string(),
-            baseline_free_blocks: 4_096,
-            final_free_blocks: 3_968,
+            baseline_blocks: 4_096,
+            final_blocks: 3_968,
             samples: 20,
         });
 
@@ -551,7 +552,7 @@ mod tests {
         );
     }
 
-    /// vLLM publishes no free-block gauge, so its runs carry no verdict. Failing the comparison
+    /// vLLM publishes no block-count gauge, so its runs carry no verdict. Failing the comparison
     /// for that would fail every comparison there is.
     #[test]
     fn test_an_unwatched_baseline_validates() {

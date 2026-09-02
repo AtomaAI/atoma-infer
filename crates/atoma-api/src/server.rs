@@ -48,9 +48,17 @@ pub const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 pub const HEALTHZ_PATH: &str = "/healthz";
 /// The URL path rendering the recorded metrics, in the Prometheus text format.
 pub const METRICS_PATH: &str = "/metrics";
-/// The gauge carrying the engine's free KV block count.
+/// The gauge carrying the blocks on the pool's free list.
 pub const FREE_BLOCKS_GAUGE: &str = "atoma_engine_free_blocks";
-/// How often the free-block gauge is sampled from the engine.
+/// The gauge carrying the blocks a lease could obtain: the free list plus the cached blocks an
+/// eviction would reclaim.
+///
+/// This is the series that falls when blocks go missing. A retired request's blocks move to the
+/// cached tier so a later request can reuse its prefix, not back to the free list, so
+/// [`FREE_BLOCKS_GAUGE`] sitting at zero under sustained load is the cache working rather than a
+/// leak; only a block that is leased and never released leaves this count.
+pub const AVAILABLE_BLOCKS_GAUGE: &str = "atoma_engine_available_blocks";
+/// How often the pool's block counts are sampled from the engine.
 const GAUGE_INTERVAL: Duration = Duration::from_millis(500);
 /// How long the shutdown waits for the executor threads to return: a follower caught inside a
 /// collective when the leader died has no way back, and must not hold the process open.
@@ -105,7 +113,7 @@ pub async fn run_server(
         .install_recorder()
         .context("the Prometheus metrics recorder could not be installed")?;
     let router = build_router(state.clone(), prometheus_handle);
-    let gauge_task = tokio::spawn(publish_free_blocks(state.engine.control.clone()));
+    let gauge_task = tokio::spawn(publish_block_counts(state.engine.control.clone()));
 
     let EngineThreads { engine, executors } = threads;
     let (engine_exited, engine_exit) = oneshot::channel();
@@ -189,37 +197,46 @@ fn root_cause(failed: Vec<(Rank, ExecutorError)>) -> Option<(Rank, ExecutorError
     failed.into_iter().nth(root.unwrap_or(0))
 }
 
-/// Publishes the engine's free block count every [`GAUGE_INTERVAL`], until the engine is gone.
-async fn publish_free_blocks(control: ControlSender) {
+/// What one sample of the KV pool reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockCounts {
+    /// Blocks on the free list.
+    free: usize,
+    /// Blocks a lease could obtain: the free list plus the evictable cached blocks.
+    available: usize,
+}
+
+/// Publishes the engine's KV block counts every [`GAUGE_INTERVAL`], until the engine is gone.
+async fn publish_block_counts(control: ControlSender) {
     let mut ticks = time::interval(GAUGE_INTERVAL);
     loop {
         ticks.tick().await;
         if control.engine_gone() {
             return;
         }
-        if let Some(free_blocks) = sample_free_blocks(&control).await {
-            record_free_blocks(free_blocks);
+        if let Some(counts) = sample_block_counts(&control).await {
+            record_block_counts(counts);
         }
     }
 }
 
-/// Asks the engine for its state and returns its free block count, or nothing when the engine
-/// did not take the query or answer it.
-async fn sample_free_blocks(control: &ControlSender) -> Option<usize> {
+/// Asks the engine for its state and returns its KV block counts, or nothing when the engine did
+/// not take the query or answer it.
+async fn sample_block_counts(control: &ControlSender) -> Option<BlockCounts> {
     let (reply, answer) = flume::bounded(1);
     if control.try_send(Control::State { reply }).is_err() {
         return None;
     }
-    answer
-        .recv_async()
-        .await
-        .ok()
-        .map(|state| state.free_blocks)
+    answer.recv_async().await.ok().map(|state| BlockCounts {
+        free: state.free_blocks,
+        available: state.available_blocks,
+    })
 }
 
-/// Records `free_blocks` on the gauge the pool's watchers read.
-fn record_free_blocks(free_blocks: usize) {
-    gauge!(FREE_BLOCKS_GAUGE).set(free_blocks as f64);
+/// Records `counts` on the gauges the pool's watchers read.
+fn record_block_counts(counts: BlockCounts) {
+    gauge!(FREE_BLOCKS_GAUGE).set(counts.free as f64);
+    gauge!(AVAILABLE_BLOCKS_GAUGE).set(counts.available as f64);
 }
 
 /// Builds the HTTP router the server serves: the OpenAI-compatible endpoint, the operational
@@ -864,27 +881,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_free_block_gauge_is_sampled_from_the_engine_and_recorded() {
+    async fn the_block_gauges_are_sampled_from_the_engine_and_recorded() {
         let served = serve("a", Duration::from_secs(30));
-        let free_blocks = sample_free_blocks(&served.state.engine.control)
+        let counts = sample_block_counts(&served.state.engine.control)
             .await
             .expect("the engine answers a state query");
-        assert!(free_blocks > 0);
+        assert!(counts.free > 0);
+        assert!(counts.available >= counts.free);
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
-        metrics::with_local_recorder(&recorder, || record_free_blocks(free_blocks));
+        metrics::with_local_recorder(&recorder, || record_block_counts(counts));
         let router = build_router(served.state.clone(), handle);
         let (status, body) = get(router, METRICS_PATH).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            body.contains(&format!("{FREE_BLOCKS_GAUGE} {free_blocks}")),
+            body.contains(&format!("{FREE_BLOCKS_GAUGE} {}", counts.free)),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!("{AVAILABLE_BLOCKS_GAUGE} {}", counts.available)),
             "{body}"
         );
         served.shutdown();
         assert_eq!(
-            sample_free_blocks(&served_control_after_shutdown()).await,
+            sample_block_counts(&served_control_after_shutdown()).await,
             None,
             "a gone engine answers nothing"
+        );
+    }
+
+    /// The two gauges are separate series, and the one the KV-leak probe watches is the one that
+    /// still counts a retired request's blocks: they sit on the cached tier for prefix reuse, off
+    /// the free list, so a healthy engine under load publishes a free count of zero.
+    #[test]
+    fn a_pool_holding_everything_in_cache_publishes_zero_free_and_a_full_available() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            record_block_counts(BlockCounts {
+                free: 0,
+                available: 4_096,
+            });
+        });
+
+        let body = handle.render();
+
+        assert!(body.contains(&format!("{FREE_BLOCKS_GAUGE} 0")), "{body}");
+        assert!(
+            body.contains(&format!("{AVAILABLE_BLOCKS_GAUGE} 4096")),
+            "{body}"
         );
     }
 

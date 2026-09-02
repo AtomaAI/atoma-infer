@@ -25,7 +25,7 @@ Per [plan §8](../plan/README.md#8-benchmark--correctness-protocol):
 | **Workloads** | ShareGPT-derived conversational trace, and a long-context workload at 8k input tokens. One artifact and one table per workload — they are not averaged together |
 | **Runs** | ≥3 per engine per workload; the median run by goodput is reported, and every run is listed |
 | **Reporting** | Absolute numbers alongside ratios; both engines' full configurations emitted with the results |
-| **KV-leak probe** | `atoma-infer`'s free-block gauge is sampled across each of its runs, starting from a baseline read before any load is offered. A pool whose ceiling falls, or that ends a run below that baseline, fails the run: `run` exits non-zero and `compare` writes no table. vLLM publishes no such gauge, so its runs are recorded as unwatched |
+| **KV-leak probe** | `atoma-infer`'s `atoma_engine_available_blocks` gauge — the blocks the pool can still hand out, cached ones included — is sampled across each of its runs, starting from a baseline read before any load is offered. A pool whose ceiling falls, or that ends a run below that baseline, fails the run: `run` exits non-zero and `compare` writes no table. The companion `atoma_engine_free_blocks` gauge is the free list alone and is not what the probe judges: a healthy engine drains it to zero as retired requests park their blocks for prefix reuse. vLLM publishes no comparable gauge, so its runs are recorded as unwatched |
 
 ## How it is produced
 

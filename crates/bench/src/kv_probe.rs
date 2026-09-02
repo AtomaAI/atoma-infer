@@ -1,12 +1,12 @@
 //! The KV-leak probe.
 //!
-//! The engine publishes its free KV block count as a gauge; the probe samples it across a run and
+//! The engine publishes the size of its KV pool as a gauge; the probe samples it across a run and
 //! judges the series afterwards. Two things fail a run:
 //!
 //! 1. **A falling ceiling** — the maximum the pool recovers to falls window after window. Under
 //!    steady load the count oscillates as batches are admitted and retire, so the ceiling, not the
 //!    instantaneous value, is the signal.
-//! 2. **A shortfall at drain** — the run ends with fewer free blocks than it started with.
+//! 2. **A shortfall at drain** — the run ends with fewer blocks than it started with.
 //!
 //! This is the standing regression guard for the rung-0 P0 in which finished sequences never
 //! returned their blocks: the pool drained monotonically until the engine wedged, and every
@@ -21,13 +21,15 @@ use tracing::warn;
 /// How the probe samples and how it judges what it sampled.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct KvProbeConfig {
-    /// Name of the gauge carrying the free block count.
+    /// Name of the gauge carrying the count of blocks the pool can still hand out.
     ///
     /// The engine under test owns this name, so the harness takes it as configuration rather than
-    /// compiling in a copy that could drift: `atoma-infer` publishes `atoma_engine_free_blocks`,
-    /// the `FREE_BLOCKS_GAUGE` of its API crate, and another engine publishes whatever it
-    /// publishes. Naming no gauge is only allowed when no `metrics_url` is configured
-    /// and the probe therefore never runs.
+    /// compiling in a copy that could drift: `atoma-infer` publishes
+    /// `atoma_engine_available_blocks`, the `AVAILABLE_BLOCKS_GAUGE` of its API crate, and another
+    /// engine publishes whatever it publishes. It must be the count including any blocks the pool
+    /// holds cached for reuse — `atoma_engine_free_blocks` counts the free list alone, which a
+    /// healthy engine under load drains to zero. Naming no gauge is only allowed when no
+    /// `metrics_url` is configured and the probe therefore never runs.
     #[serde(default)]
     pub metric: Option<String>,
     /// How often the gauge is sampled.
@@ -83,13 +85,13 @@ impl KvProbeConfig {
     }
 }
 
-/// One reading of the engine's free KV block count.
+/// One reading of the engine's KV pool.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct FreeBlockSample {
+pub struct BlockSample {
     /// Offset from the start of the probe.
     pub at: Duration,
-    /// Free blocks at that moment.
-    pub free_blocks: u64,
+    /// Blocks the pool could still hand out at that moment.
+    pub blocks: u64,
 }
 
 /// What the probe concluded about a run.
@@ -98,10 +100,10 @@ pub struct FreeBlockSample {
 pub enum KvProbeVerdict {
     /// The pool held.
     Pass {
-        /// Free blocks before load was offered.
-        baseline_free_blocks: u64,
-        /// Free blocks after the run drained.
-        final_free_blocks: u64,
+        /// Blocks the pool could hand out before load was offered.
+        baseline_blocks: u64,
+        /// Blocks the pool could hand out after the run drained.
+        final_blocks: u64,
         /// Samples the verdict was drawn from.
         samples: usize,
     },
@@ -109,10 +111,10 @@ pub enum KvProbeVerdict {
     Leak {
         /// What the series showed.
         reason: String,
-        /// Free blocks before load was offered.
-        baseline_free_blocks: u64,
-        /// Free blocks after the run drained.
-        final_free_blocks: u64,
+        /// Blocks the pool could hand out before load was offered.
+        baseline_blocks: u64,
+        /// Blocks the pool could hand out after the run drained.
+        final_blocks: u64,
         /// Samples the verdict was drawn from.
         samples: usize,
     },
@@ -141,8 +143,8 @@ impl KvProbeVerdict {
     }
 }
 
-/// Judges a sampled free-block series.
-pub fn verdict(samples: &[FreeBlockSample], config: &KvProbeConfig) -> KvProbeVerdict {
+/// Judges a sampled block-count series.
+pub fn verdict(samples: &[BlockSample], config: &KvProbeConfig) -> KvProbeVerdict {
     if samples.len() < config.min_samples() {
         return KvProbeVerdict::Inconclusive {
             reason: format!(
@@ -151,7 +153,7 @@ pub fn verdict(samples: &[FreeBlockSample], config: &KvProbeConfig) -> KvProbeVe
                 samples.len(),
                 config.min_samples(),
                 config.gauge().map_or_else(
-                    || "a free-block gauge".to_string(),
+                    || "a block-count gauge".to_string(),
                     |gauge| format!("`{gauge}`")
                 )
             ),
@@ -159,8 +161,8 @@ pub fn verdict(samples: &[FreeBlockSample], config: &KvProbeConfig) -> KvProbeVe
         };
     }
 
-    let baseline = samples[0].free_blocks;
-    let last = samples[samples.len() - 1].free_blocks;
+    let baseline = samples[0].blocks;
+    let last = samples[samples.len() - 1].blocks;
 
     if last + config.tolerance_blocks < baseline {
         return KvProbeVerdict::Leak {
@@ -168,8 +170,8 @@ pub fn verdict(samples: &[FreeBlockSample], config: &KvProbeConfig) -> KvProbeVe
                 "{} of {baseline} blocks had not returned once the run drained",
                 baseline - last
             ),
-            baseline_free_blocks: baseline,
-            final_free_blocks: last,
+            baseline_blocks: baseline,
+            final_blocks: last,
             samples: samples.len(),
         };
     }
@@ -177,31 +179,31 @@ pub fn verdict(samples: &[FreeBlockSample], config: &KvProbeConfig) -> KvProbeVe
     if let Some(ceilings) = falling_ceiling(samples, config) {
         return KvProbeVerdict::Leak {
             reason: format!(
-                "the free-block ceiling fell window after window across the run: {ceilings:?}"
+                "the block-count ceiling fell window after window across the run: {ceilings:?}"
             ),
-            baseline_free_blocks: baseline,
-            final_free_blocks: last,
+            baseline_blocks: baseline,
+            final_blocks: last,
             samples: samples.len(),
         };
     }
 
     KvProbeVerdict::Pass {
-        baseline_free_blocks: baseline,
-        final_free_blocks: last,
+        baseline_blocks: baseline,
+        final_blocks: last,
         samples: samples.len(),
     }
 }
 
 /// The per-window maxima, when they never rise and end more than the tolerance below where they
 /// started — the shape of a pool that is being drained rather than cycled.
-fn falling_ceiling(samples: &[FreeBlockSample], config: &KvProbeConfig) -> Option<Vec<u64>> {
+fn falling_ceiling(samples: &[BlockSample], config: &KvProbeConfig) -> Option<Vec<u64>> {
     let window = samples.len() / config.num_windows.max(1);
     let ceilings = samples
         .chunks(window.max(1))
         .map(|window| {
             window
                 .iter()
-                .map(|sample| sample.free_blocks)
+                .map(|sample| sample.blocks)
                 .max()
                 .unwrap_or_default()
         })
@@ -234,11 +236,11 @@ fn gauge_value(line: &str, metric: &str) -> Option<f64> {
     value.trim().parse().ok()
 }
 
-/// Samples an engine's free-block gauge over the length of a run.
+/// Samples an engine's block-count gauge over the length of a run.
 pub struct KvProbe {
     /// The engine's Prometheus endpoint.
     metrics_url: String,
-    /// The gauge the engine publishes its free block count on.
+    /// The gauge the engine publishes its block count on.
     gauge: String,
     /// How often the gauge is sampled.
     interval: Duration,
@@ -277,9 +279,9 @@ impl KvProbe {
     async fn sample_until_stopped(
         self,
         mut stopped: oneshot::Receiver<()>,
-        mut samples: Vec<FreeBlockSample>,
+        mut samples: Vec<BlockSample>,
         started: Instant,
-    ) -> Vec<FreeBlockSample> {
+    ) -> Vec<BlockSample> {
         // The first tick is skipped: `start` has already taken the baseline sample.
         let first_tick = tokio::time::Instant::now() + self.interval;
         let mut ticks = tokio::time::interval_at(first_tick, self.interval);
@@ -296,16 +298,16 @@ impl KvProbe {
     }
 
     /// Takes one sample, keeping it only if the gauge could be read.
-    async fn sample_into(&self, samples: &mut Vec<FreeBlockSample>, started: Instant) {
+    async fn sample_into(&self, samples: &mut Vec<BlockSample>, started: Instant) {
         match self.read_gauge().await {
-            Some(free_blocks) => samples.push(FreeBlockSample {
+            Some(blocks) => samples.push(BlockSample {
                 at: started.elapsed(),
-                free_blocks,
+                blocks,
             }),
             None => warn!(
                 metric = self.gauge,
                 url = self.metrics_url,
-                "Could not read the free-block gauge; skipping this sample"
+                "Could not read the block-count gauge; skipping this sample"
             ),
         }
     }
@@ -335,12 +337,12 @@ pub struct RunningKvProbe {
     /// Tells the sampling task to take its last sample and finish.
     stop: oneshot::Sender<()>,
     /// The sampling task.
-    task: JoinHandle<Vec<FreeBlockSample>>,
+    task: JoinHandle<Vec<BlockSample>>,
 }
 
 impl RunningKvProbe {
     /// Stops sampling and returns the series, ending with the sample taken after the run drained.
-    pub async fn finish(self) -> Vec<FreeBlockSample> {
+    pub async fn finish(self) -> Vec<BlockSample> {
         let _ = self.stop.send(());
         self.task.await.unwrap_or_else(|error| {
             warn!(%error, "The KV probe task did not finish");
@@ -360,19 +362,19 @@ mod tests {
         }
     }
 
-    /// Builds a sample series one second apart from a free-block series.
-    fn samples(free_blocks: &[u64]) -> Vec<FreeBlockSample> {
-        free_blocks
+    /// Builds a sample series one second apart from a block-count series.
+    fn samples(blocks: &[u64]) -> Vec<BlockSample> {
+        blocks
             .iter()
             .enumerate()
-            .map(|(index, free_blocks)| FreeBlockSample {
+            .map(|(index, blocks)| BlockSample {
                 at: Duration::from_secs(index as u64),
-                free_blocks: *free_blocks,
+                blocks: *blocks,
             })
             .collect()
     }
 
-    /// A busy engine's free-block count oscillates: it falls as a batch is admitted and comes back
+    /// A busy engine's block count oscillates: it falls as a batch is admitted and comes back
     /// as the batch retires. Only the ceiling falling is a leak.
     fn sawtooth(cycles: usize, ceiling: u64, floor: u64) -> Vec<u64> {
         (0..cycles)
@@ -391,12 +393,12 @@ mod tests {
         };
 
         assert_eq!(
-            named(Some("atoma_engine_free_blocks")).gauge(),
-            Some("atoma_engine_free_blocks")
+            named(Some("atoma_engine_available_blocks")).gauge(),
+            Some("atoma_engine_available_blocks")
         );
         assert_eq!(
-            named(Some("  atoma_engine_free_blocks  ")).gauge(),
-            Some("atoma_engine_free_blocks")
+            named(Some("  atoma_engine_available_blocks  ")).gauge(),
+            Some("atoma_engine_available_blocks")
         );
         assert_eq!(named(Some("   ")).gauge(), None);
         assert_eq!(named(Some("")).gauge(), None);
@@ -406,14 +408,14 @@ mod tests {
     #[test]
     fn test_a_gauge_is_read_from_the_prometheus_text_format() {
         let text = "\
-# HELP atoma_engine_free_blocks Free KV blocks
-# TYPE atoma_engine_free_blocks gauge
-atoma_engine_free_blocks 118
+# HELP atoma_engine_available_blocks Blocks the KV pool can hand out
+# TYPE atoma_engine_available_blocks gauge
+atoma_engine_available_blocks 118
 llm_service_requests_total 42
 ";
 
         assert_eq!(
-            parse_gauge(text, "atoma_engine_free_blocks"),
+            parse_gauge(text, "atoma_engine_available_blocks"),
             Some(118.0),
             "the gauge line must be read, not the HELP or TYPE lines"
         );
@@ -421,32 +423,38 @@ llm_service_requests_total 42
 
     #[test]
     fn test_a_labelled_gauge_is_read() {
-        let text = "atoma_engine_free_blocks{device=\"gpu\"} 96.0\n";
+        let text = "atoma_engine_available_blocks{device=\"gpu\"} 96.0\n";
 
-        assert_eq!(parse_gauge(text, "atoma_engine_free_blocks"), Some(96.0));
+        assert_eq!(
+            parse_gauge(text, "atoma_engine_available_blocks"),
+            Some(96.0)
+        );
     }
 
-    /// `atoma_engine_free_blocks_total` is a different series; a prefix match would silently
+    /// `atoma_engine_available_blocks_total` is a different series; a prefix match would silently
     /// probe the wrong one.
     #[test]
     fn test_a_metric_whose_name_is_a_prefix_is_not_mistaken_for_the_gauge() {
-        let text = "atoma_engine_free_blocks_total 7\n";
+        let text = "atoma_engine_available_blocks_total 7\n";
 
-        assert_eq!(parse_gauge(text, "atoma_engine_free_blocks"), None);
+        assert_eq!(parse_gauge(text, "atoma_engine_available_blocks"), None);
     }
 
     #[test]
     fn test_a_missing_or_unreadable_gauge_reads_as_absent() {
-        assert_eq!(parse_gauge("", "atoma_engine_free_blocks"), None);
+        assert_eq!(parse_gauge("", "atoma_engine_available_blocks"), None);
         assert_eq!(
             parse_gauge(
-                "atoma_engine_free_blocks NaN-ish\n",
-                "atoma_engine_free_blocks"
+                "atoma_engine_available_blocks NaN-ish\n",
+                "atoma_engine_available_blocks"
             ),
             None
         );
         assert_eq!(
-            parse_gauge("atoma_engine_free_blocks\n", "atoma_engine_free_blocks"),
+            parse_gauge(
+                "atoma_engine_available_blocks\n",
+                "atoma_engine_available_blocks"
+            ),
             None
         );
     }
@@ -493,12 +501,12 @@ llm_service_requests_total 42
         assert!(!verdict.run_passes(), "{verdict:?}");
         match verdict {
             KvProbeVerdict::Leak {
-                baseline_free_blocks,
-                final_free_blocks,
+                baseline_blocks,
+                final_blocks,
                 ..
             } => {
-                assert_eq!(baseline_free_blocks, 128);
-                assert_eq!(final_free_blocks, 120);
+                assert_eq!(baseline_blocks, 128);
+                assert_eq!(final_blocks, 120);
             }
             other => panic!("expected a leak verdict, got {other:?}"),
         }

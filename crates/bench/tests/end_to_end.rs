@@ -1,6 +1,6 @@
 //! The harness driven end to end against a stub engine.
 //!
-//! The stub speaks the same OpenAI streaming surface and publishes the same free-block gauge as
+//! The stub speaks the same OpenAI streaming surface and publishes the same block-count gauge as
 //! the engine under test, so these tests cover what the unit tests cannot: arrivals actually
 //! firing over the wire, tokens actually being timed, and the KV-leak probe actually failing a run
 //! whose pool drains.
@@ -64,9 +64,10 @@ struct StubState {
 }
 
 impl StubState {
-    /// The free-block count the stub publishes: blocks are held while a request is in flight, and
-    /// a leaking engine also keeps one per request it has finished.
-    fn free_blocks(&self) -> u64 {
+    /// The count of blocks the pool can still hand out, as the stub publishes it: blocks are held
+    /// while a request is in flight, and a leaking engine also keeps one per request it has
+    /// finished.
+    fn available_blocks(&self) -> u64 {
         let held = self.in_flight.load(Ordering::Relaxed) * BLOCKS_PER_REQUEST;
         let leaked = match self.behaviour {
             Behaviour::Leaking => self.answered.load(Ordering::Relaxed),
@@ -124,17 +125,17 @@ async fn completions(State(state): State<Arc<StubState>>) -> Response {
         .into_response()
 }
 
-/// The gauge the stub engine publishes its free-block count on, standing in for the name a real
-/// engine publishes and an operator puts in `kv_probe.metric`.
-const STUB_FREE_BLOCKS_METRIC: &str = "atoma_engine_free_blocks";
+/// The gauge the stub engine publishes its block count on, standing in for the name a real engine
+/// publishes and an operator puts in `kv_probe.metric`.
+const STUB_BLOCKS_METRIC: &str = "atoma_engine_available_blocks";
 
-/// Publishes the free-block gauge in the Prometheus text format.
+/// Publishes the block-count gauge in the Prometheus text format.
 async fn metrics(State(state): State<Arc<StubState>>) -> String {
     state.scrapes.fetch_add(1, Ordering::Relaxed);
     format!(
         "# TYPE {metric} gauge\n{metric} {value}\n",
-        metric = STUB_FREE_BLOCKS_METRIC,
-        value = state.free_blocks()
+        metric = STUB_BLOCKS_METRIC,
+        value = state.available_blocks()
     )
 }
 
@@ -209,7 +210,7 @@ fn config(address: SocketAddr, runs: usize) -> BenchConfig {
             ..VllmBaseline::default()
         },
         kv_probe: KvProbeConfig {
-            metric: Some(STUB_FREE_BLOCKS_METRIC.to_string()),
+            metric: Some(STUB_BLOCKS_METRIC.to_string()),
             interval_ms: 10,
             ..KvProbeConfig::default()
         },
@@ -335,7 +336,7 @@ async fn test_the_probe_reads_its_baseline_before_it_starts_sampling() {
 
     let probe = KvProbe::new(
         format!("http://{address}/metrics"),
-        STUB_FREE_BLOCKS_METRIC.to_string(),
+        STUB_BLOCKS_METRIC.to_string(),
         Duration::from_secs(60),
     )
     .start()
@@ -349,7 +350,7 @@ async fn test_the_probe_reads_its_baseline_before_it_starts_sampling() {
 
     let samples = probe.finish().await;
     assert_eq!(
-        samples.first().map(|sample| sample.free_blocks),
+        samples.first().map(|sample| sample.blocks),
         Some(POOL_BLOCKS),
         "the baseline is the whole pool, measured before any load: {samples:?}"
     );
