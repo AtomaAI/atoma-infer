@@ -7,3 +7,64 @@
 
 pub mod batch;
 pub mod config;
+pub mod logits;
+pub mod sampler;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use atoma_core::dispatch::{DispatchDecision, EagerReason};
+    use atoma_core::request::{SamplingParams, PADDING_TOKEN};
+    use atoma_core::step::{CommandEntry, StepCommand};
+    use atoma_core::types::{BlockId, RequestCount, RequestId, RequestSlot, SequenceIndex, StepId};
+
+    /// An entry for `request` in the slot of the same number, sampling under the default
+    /// parameters when `samples`.
+    pub(crate) fn entry(
+        request: u64,
+        context_len: usize,
+        input_tokens: Vec<u32>,
+        blocks: &[u32],
+        samples: bool,
+    ) -> CommandEntry {
+        let slot = u32::try_from(request).expect("test request numbers fit u32");
+        let sampling = samples.then(SamplingParams::default);
+        entry_with(request, slot, context_len, input_tokens, blocks, sampling)
+    }
+
+    pub(crate) fn entry_with(
+        request: u64,
+        slot: u32,
+        context_len: usize,
+        input_tokens: Vec<u32>,
+        blocks: &[u32],
+        sampling: Option<SamplingParams>,
+    ) -> CommandEntry {
+        CommandEntry {
+            request: RequestId::new(request),
+            slot: RequestSlot::new(slot),
+            sequence: SequenceIndex::new(0),
+            context_len,
+            input_tokens,
+            block_table: blocks.iter().map(|&block| BlockId::new(block)).collect(),
+            sampling,
+        }
+    }
+
+    /// A padding dummy's entry: one token over its own block, never sampling.
+    pub(crate) fn dummy(request: u64, block: u32) -> CommandEntry {
+        entry(request, 0, vec![PADDING_TOKEN], &[block], false)
+    }
+
+    /// An eager step command over `entries`, the last `padding_count` of which are dummies.
+    pub(crate) fn command(entries: Vec<CommandEntry>, padding_count: usize) -> StepCommand {
+        StepCommand {
+            step: StepId::new(1),
+            entries,
+            padding_count,
+            dispatch: DispatchDecision::Eager(EagerReason::RequestsAboveCapturedMaximum {
+                request_count: RequestCount::new(1).expect("nonzero"),
+                captured_maximum: RequestCount::new(1).expect("nonzero"),
+            }),
+        }
+    }
+}

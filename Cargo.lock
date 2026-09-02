@@ -206,6 +206,8 @@ name = "atoma-engine"
 version = "0.1.0"
 dependencies = [
  "atoma-core",
+ "candle-core",
+ "candle-transformers",
  "figment",
  "serde",
  "serde_json",

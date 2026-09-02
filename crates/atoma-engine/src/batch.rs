@@ -210,48 +210,14 @@ fn fits_i64(value: usize) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use atoma_core::dispatch::{DispatchDecision, EagerReason};
-    use atoma_core::request::{SamplingParams, PADDING_TOKEN};
-    use atoma_core::step::{CommandEntry, StepCommand};
-    use atoma_core::types::{BlockId, RequestCount, RequestId, RequestSlot, SequenceIndex, StepId};
+    use atoma_core::request::PADDING_TOKEN;
+    use atoma_core::step::StepCommand;
+    use atoma_core::types::RequestId;
 
     use super::{BatchLayout, LayoutError};
+    use crate::test_support::{command, dummy, entry};
 
     const BLOCK_SIZE: usize = 4;
-
-    fn entry(
-        request: u64,
-        context_len: usize,
-        input_tokens: Vec<u32>,
-        blocks: &[u32],
-        samples: bool,
-    ) -> CommandEntry {
-        CommandEntry {
-            request: RequestId::new(request),
-            slot: RequestSlot::new(u32::try_from(request).unwrap()),
-            sequence: SequenceIndex::new(0),
-            context_len,
-            input_tokens,
-            block_table: blocks.iter().map(|&block| BlockId::new(block)).collect(),
-            sampling: samples.then(SamplingParams::default),
-        }
-    }
-
-    fn dummy(request: u64, block: u32) -> CommandEntry {
-        entry(request, 0, vec![PADDING_TOKEN], &[block], false)
-    }
-
-    fn command(entries: Vec<CommandEntry>, padding_count: usize) -> StepCommand {
-        StepCommand {
-            step: StepId::new(1),
-            entries,
-            padding_count,
-            dispatch: DispatchDecision::Eager(EagerReason::RequestsAboveCapturedMaximum {
-                request_count: RequestCount::new(1).unwrap(),
-                captured_maximum: RequestCount::new(1).unwrap(),
-            }),
-        }
-    }
 
     /// A decode, a prefill, a dummy and another decode, in the engine's order.
     fn mixed() -> StepCommand {

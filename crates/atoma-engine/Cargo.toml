@@ -6,10 +6,12 @@ name        = "atoma-engine"
 version     = { workspace = true }
 
 [dependencies]
-atoma-core = { workspace = true }
-serde      = { workspace = true, features = [ "derive" ] }
-thiserror  = { workspace = true }
-validator  = { workspace = true, features = [ "derive" ] }
+atoma-core          = { workspace = true }
+candle-core         = { workspace = true }
+candle-transformers = { workspace = true }
+serde               = { workspace = true, features = [ "derive" ] }
+thiserror           = { workspace = true }
+validator           = { workspace = true, features = [ "derive" ] }
 
 [dev-dependencies]
 figment    = { workspace = true, features = [ "toml" ] }
