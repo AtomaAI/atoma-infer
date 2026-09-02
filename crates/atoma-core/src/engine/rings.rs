@@ -2,9 +2,11 @@
 //! thread: step commands one way, step results the other.
 //!
 //! Rings are not channels: each has exactly one producer and one consumer, no lock and no
-//! allocation on push or pop.
+//! allocation on push or pop. Each side parks between steps and is woken by the other: a pushed
+//! command wakes the executor, a pushed result wakes the engine, and either side dropping its ends
+//! wakes the other so the loss is seen rather than waited on.
 
-use crossbeam_utils::sync::Unparker;
+use crossbeam_utils::sync::{Parker, Unparker};
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
 use crate::step::{StepCommand, StepResult};
@@ -13,36 +15,41 @@ use crate::step::{StepCommand, StepResult};
 /// the push that follows a pop.
 pub const RING_CAPACITY: usize = 2;
 
-/// The engine thread's ends: it produces commands and consumes results.
+/// The engine thread's ends: it produces commands and consumes results, waking the executor
+/// thread after every command.
 #[derive(Debug)]
 pub struct EngineRings {
     commands: Producer<StepCommand>,
     results: Consumer<StepResult>,
+    /// Declared after the ring ends, and so dropped after them: fields drop in declaration order,
+    /// and it is those ends dropping that makes the loss visible through
+    /// [`ExecutorRings::engine_gone`]. Waking first would let a woken executor look, find both
+    /// rings intact, and park again.
+    wake: WakeOnDrop,
 }
 
 /// The executor thread's ends: it consumes commands and produces results, waking the engine
-/// thread after every result.
+/// thread after every result, and parks here until the engine wakes it.
 #[derive(Debug)]
 pub struct ExecutorRings {
     commands: Consumer<StepCommand>,
     results: Producer<StepResult>,
-    /// Declared after the ring ends, and so dropped after them: fields drop in declaration order,
-    /// and it is those ends dropping that makes the loss visible through
-    /// [`EngineRings::executor_gone`]. Waking first would let a woken engine look, find both rings
-    /// intact, and park again.
+    parker: Parker,
+    /// Declared after the ring ends for the same reason as [`EngineRings::wake`]: the loss must
+    /// be visible through [`EngineRings::executor_gone`] before the engine is woken to look.
     wake: WakeOnDrop,
 }
 
-/// An unparker that wakes the engine thread when it is dropped.
+/// An unparker that wakes the thread on the other side of the rings when it is dropped.
 ///
-/// The wake is a field's drop rather than a `Drop` on [`ExecutorRings`] itself, because that runs
-/// before any of the struct's fields drop — it would wake the engine while the rings it is about
-/// to examine are still held.
+/// The wake is a field's drop rather than a `Drop` on the rings struct itself, because that runs
+/// before any of the struct's fields drop — it would wake the other thread while the rings it is
+/// about to examine are still held.
 #[derive(Debug)]
 struct WakeOnDrop(Unparker);
 
 impl WakeOnDrop {
-    /// Wakes the engine thread now.
+    /// Wakes the other thread now.
     fn wake(&self) {
         self.0.unpark();
     }
@@ -55,26 +62,31 @@ impl Drop for WakeOnDrop {
 }
 
 /// Opens both rings, handing each thread its ends; `wake` unparks the engine thread after
-/// every result the executor pushes.
+/// every result the executor pushes. The executor's own parker lives in its ends.
 #[must_use]
 pub fn rings(wake: Unparker) -> (EngineRings, ExecutorRings) {
     let (command_producer, command_consumer) = RingBuffer::new(RING_CAPACITY);
     let (result_producer, result_consumer) = RingBuffer::new(RING_CAPACITY);
+    let executor_parker = Parker::new();
+    let wake_executor = WakeOnDrop(executor_parker.unparker().clone());
     (
         EngineRings {
             commands: command_producer,
             results: result_consumer,
+            wake: wake_executor,
         },
         ExecutorRings {
             commands: command_consumer,
             results: result_producer,
+            parker: executor_parker,
             wake: WakeOnDrop(wake),
         },
     )
 }
 
 impl EngineRings {
-    /// Pushes `command` for the executor, handing it back when the ring is full.
+    /// Pushes `command` for the executor and wakes it, handing the command back when the ring
+    /// is full.
     ///
     /// # Errors
     ///
@@ -82,7 +94,9 @@ impl EngineRings {
     pub fn push_command(&mut self, command: StepCommand) -> Result<(), StepCommand> {
         self.commands
             .push(command)
-            .map_err(|PushError::Full(command)| command)
+            .map_err(|PushError::Full(command)| command)?;
+        self.wake.wake();
+        Ok(())
     }
 
     /// The next step result, if the executor has produced one.
@@ -121,6 +135,13 @@ impl ExecutorRings {
     #[must_use]
     pub fn engine_gone(&self) -> bool {
         self.commands.is_abandoned() || self.results.is_abandoned()
+    }
+
+    /// Parks until the engine pushes a command or drops its ends. A wake that arrived since the
+    /// last park returns at once, so a command pushed between a failed pop and the park is never
+    /// waited on.
+    pub fn park(&self) {
+        self.parker.park();
     }
 }
 
@@ -241,5 +262,56 @@ mod tests {
             })
             .unwrap();
         engine_thread.join().unwrap();
+    }
+
+    #[test]
+    fn the_engine_leaving_wakes_a_parked_executor_thread() {
+        let parker = Parker::new();
+        let (engine, executor) = rings(parker.unparker().clone());
+        let executor_thread = thread::spawn(move || {
+            executor.park();
+            executor.engine_gone()
+        });
+        thread::sleep(Duration::from_millis(10));
+        assert!(!executor_thread.is_finished(), "parked until woken");
+
+        drop(engine);
+        assert!(
+            executor_thread.join().unwrap(),
+            "woken, and the loss is visible"
+        );
+    }
+
+    #[test]
+    fn a_pushed_command_wakes_a_parked_executor_thread() {
+        let parker = Parker::new();
+        let (mut engine, mut executor) = rings(parker.unparker().clone());
+        let executor_thread = thread::spawn(move || {
+            executor.park();
+            executor.pop_command().map(|command| command.step)
+        });
+        thread::sleep(Duration::from_millis(10));
+        assert!(!executor_thread.is_finished(), "parked until woken");
+
+        engine.push_command(command(1)).unwrap();
+        assert_eq!(
+            executor_thread.join().unwrap(),
+            Some(StepId::new(1)),
+            "woken, and the command is there"
+        );
+    }
+
+    /// A command pushed before the executor parks is not waited on: the wake is a token, not a
+    /// signal that can be missed.
+    #[test]
+    fn a_command_pushed_before_the_park_returns_the_park_at_once() {
+        let parker = Parker::new();
+        let (mut engine, executor) = rings(parker.unparker().clone());
+        engine.push_command(command(1)).unwrap();
+        executor.park();
+        assert!(
+            !executor.engine_gone(),
+            "returned by the wake, not the loss"
+        );
     }
 }
