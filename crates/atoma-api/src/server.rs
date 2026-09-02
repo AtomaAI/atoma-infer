@@ -15,7 +15,8 @@ use anyhow::{anyhow, Context};
 use atoma_core::engine::{Control, ControlSender, EngineHandle, EngineThread, IngressRefused};
 use atoma_core::request::{egress, EgressReceiver, NewRequest, Priority, StopCriteria};
 use atoma_core::types::TokenCount;
-use atoma_engine::executor::ExecutorThread;
+use atoma_engine::config::Rank;
+use atoma_engine::executor::{ExecutorError, ExecutorThread};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
@@ -137,10 +138,10 @@ pub async fn run_server(
 }
 
 /// Joins every executor thread that returns within [`EXECUTOR_JOIN_TIMEOUT`], reporting the
-/// first cause any of them stopped on, and giving up on any still running at the deadline.
+/// cause the ranks stopped on, and giving up on any still running at the deadline.
 fn join_executors(mut executors: Vec<ExecutorThread>) -> anyhow::Result<()> {
     let deadline = Instant::now() + EXECUTOR_JOIN_TIMEOUT;
-    let mut failure = None;
+    let mut failed: Vec<(Rank, ExecutorError)> = Vec::new();
     while !executors.is_empty() {
         let (finished, still_running): (Vec<_>, Vec<_>) =
             executors.into_iter().partition(ExecutorThread::is_finished);
@@ -151,7 +152,7 @@ fn join_executors(mut executors: Vec<ExecutorThread>) -> anyhow::Result<()> {
                 Ok(()) => info!(%rank, "executor thread returned"),
                 Err(cause) => {
                     error!(%rank, %cause, "executor thread failed");
-                    failure.get_or_insert_with(|| anyhow!("executor rank {rank} failed: {cause}"));
+                    failed.push((rank, cause));
                 }
             }
         }
@@ -161,18 +162,31 @@ fn join_executors(mut executors: Vec<ExecutorThread>) -> anyhow::Result<()> {
         if Instant::now() >= deadline {
             let ranks: Vec<String> = executors.iter().map(|e| e.rank().to_string()).collect();
             error!(ranks = ?ranks, "executor threads did not return; giving up on them");
-            failure.get_or_insert_with(|| {
-                anyhow!(
+            if failed.is_empty() {
+                return Err(anyhow!(
                     "executor ranks {} did not return within {:?}",
                     ranks.join(", "),
                     EXECUTOR_JOIN_TIMEOUT
-                )
-            });
+                ));
+            }
             break;
         }
         thread::sleep(EXECUTOR_JOIN_POLL);
     }
-    failure.map_or(Ok(()), Err)
+    match root_cause(failed) {
+        Some((rank, cause)) => Err(anyhow!("executor rank {rank} failed: {cause}")),
+        None => Ok(()),
+    }
+}
+
+/// The cause the ranks stopped on. A rank that saw another go stopped on that rank's loss, so
+/// the first cause that is not a loss is the one the rest followed from; when every cause is a
+/// loss, the first is it.
+fn root_cause(failed: Vec<(Rank, ExecutorError)>) -> Option<(Rank, ExecutorError)> {
+    let root = failed
+        .iter()
+        .position(|(_, cause)| !matches!(cause, ExecutorError::FollowerLost { .. }));
+    failed.into_iter().nth(root.unwrap_or(0))
 }
 
 /// Publishes the engine's free block count every [`GAUGE_INTERVAL`], until the engine is gone.
@@ -544,6 +558,26 @@ mod tests {
             }
             Ok(Logits::new(&self.logits, self.vocab))
         }
+    }
+
+    #[test]
+    fn the_root_cause_is_the_first_failure_that_is_not_another_ranks_loss() {
+        let lost = || ExecutorError::FollowerLost { rank: Rank::new(1) };
+        let (rank, cause) = root_cause(vec![
+            (Rank::ZERO, lost()),
+            (Rank::new(1), ExecutorError::ResultRingFull),
+        ])
+        .unwrap();
+        assert_eq!(rank, Rank::new(1));
+        assert!(matches!(cause, ExecutorError::ResultRingFull), "{cause}");
+
+        let (rank, cause) = root_cause(vec![(Rank::ZERO, lost())]).unwrap();
+        assert_eq!(rank, Rank::ZERO);
+        assert!(
+            matches!(cause, ExecutorError::FollowerLost { .. }),
+            "{cause}"
+        );
+        assert!(root_cause(Vec::new()).is_none());
     }
 
     fn engine_config() -> EngineConfig {
