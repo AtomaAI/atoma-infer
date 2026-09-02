@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use atoma_core::step::StepCommand;
 use atoma_runtime::session::Replay;
 use candle_core::{Storage, Tensor};
 use cudarc::driver::CudaStream;
@@ -107,11 +106,7 @@ struct Uploaded {
 impl Forward for CudaForward {
     type Error = CudaForwardError;
 
-    fn forward(
-        &mut self,
-        _command: &StepCommand,
-        layout: &BatchLayout,
-    ) -> Result<Logits<'_>, CudaForwardError> {
+    fn forward(&mut self, layout: &BatchLayout) -> Result<Logits<'_>, CudaForwardError> {
         let Uploaded {
             tokens,
             positions,

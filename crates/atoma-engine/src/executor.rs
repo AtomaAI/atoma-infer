@@ -97,7 +97,7 @@ impl<F: Forward> Executor<F> {
         let layout = BatchLayout::lay_out(&command, self.block_size)?;
         let logits = self
             .forward
-            .forward(&command, &layout)
+            .forward(&layout)
             .map_err(|cause| ExecutorError::Forward(Box::new(cause)))?;
         let sampled = self
             .sampler
@@ -215,13 +215,9 @@ mod tests {
         ));
         let served = served.lock().clone();
         assert_eq!(served.len(), 2, "one prefill, one decode");
-        assert_eq!(served[0].entries[0].input_tokens, [1, 2, 3]);
-        assert_eq!(
-            served[1].entries[0].input_tokens,
-            [5],
-            "decoding what was sampled"
-        );
-        assert_eq!(served[1].entries[0].context_len, 3);
+        assert_eq!(served[0].tokens, [1, 2, 3]);
+        assert_eq!(served[1].tokens, [5], "decoding what was sampled");
+        assert_eq!(served[1].context_lengths, [3]);
 
         handle.control.try_send(Control::Shutdown).unwrap();
         engine.join();

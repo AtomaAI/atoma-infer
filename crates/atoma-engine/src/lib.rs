@@ -128,7 +128,7 @@ pub(crate) mod test_support {
     }
 
     /// A forward whose every selected row peaks at one chosen token, so greedy sampling returns
-    /// it; it can be told to fail on its n-th command, and it keeps every command it served.
+    /// it; it can be told to fail on its n-th command, and it keeps every layout it ran.
     ///
     /// Commands are counted rather than matched by step id: the scheduler mints a step id on
     /// every pass, empty ones included, so the first served step's id depends on whether the
@@ -138,7 +138,7 @@ pub(crate) mod test_support {
         fail_on_command: Option<usize>,
         seen: usize,
         logits: Vec<f32>,
-        served: Arc<Mutex<Vec<StepCommand>>>,
+        served: Arc<Mutex<Vec<BatchLayout>>>,
     }
 
     impl FakeForward {
@@ -158,8 +158,8 @@ pub(crate) mod test_support {
             self
         }
 
-        /// Every command served so far, shared with whoever holds the clone.
-        pub(crate) fn served(&self) -> Arc<Mutex<Vec<StepCommand>>> {
+        /// Every layout run so far, shared with whoever holds the clone.
+        pub(crate) fn served(&self) -> Arc<Mutex<Vec<BatchLayout>>> {
             Arc::clone(&self.served)
         }
     }
@@ -167,16 +167,12 @@ pub(crate) mod test_support {
     impl Forward for FakeForward {
         type Error = FakeForwardError;
 
-        fn forward(
-            &mut self,
-            command: &StepCommand,
-            layout: &BatchLayout,
-        ) -> Result<Logits<'_>, FakeForwardError> {
+        fn forward(&mut self, layout: &BatchLayout) -> Result<Logits<'_>, FakeForwardError> {
             self.seen += 1;
             if self.fail_on_command == Some(self.seen) {
                 return Err(FakeForwardError { command: self.seen });
             }
-            self.served.lock().push(command.clone());
+            self.served.lock().push(layout.clone());
             let rows = layout.selected.len();
             self.logits.clear();
             self.logits.resize(rows * VOCAB, 0.0);

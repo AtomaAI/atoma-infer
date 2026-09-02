@@ -502,7 +502,6 @@ mod tests {
     use atoma_core::engine::{control, heartbeat, ingress, Engine, EngineConfig, EngineThread};
     use atoma_core::kv::HashAlgorithm;
     use atoma_core::scheduler::{AdmissionPolicy, SchedulerConfig};
-    use atoma_core::step::StepCommand;
     use atoma_core::types::{RequestCount, TokenCount};
     use atoma_engine::batch::BatchLayout;
     use atoma_engine::executor::{Executor, ExecutorError, ExecutorLoop};
@@ -535,11 +534,7 @@ mod tests {
     impl Forward for ConstantForward {
         type Error = Infallible;
 
-        fn forward(
-            &mut self,
-            _command: &StepCommand,
-            layout: &BatchLayout,
-        ) -> Result<Logits<'_>, Infallible> {
+        fn forward(&mut self, layout: &BatchLayout) -> Result<Logits<'_>, Infallible> {
             let rows = layout.selected.len();
             self.logits.clear();
             self.logits.resize(rows * self.vocab, 0.0);

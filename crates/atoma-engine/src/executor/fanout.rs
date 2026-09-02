@@ -141,7 +141,7 @@ impl<F: Forward> Follower<F> {
     fn serve(&mut self, command: &StepCommand) -> Result<(), ExecutorError> {
         let layout = BatchLayout::lay_out(command, self.block_size)?;
         self.forward
-            .forward(command, &layout)
+            .forward(&layout)
             .map_err(|cause| ExecutorError::Forward(Box::new(cause)))?;
         debug!(
             rank = %self.rings.rank(),
