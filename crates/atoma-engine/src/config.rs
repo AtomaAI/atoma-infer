@@ -97,7 +97,7 @@ impl fmt::Display for CoreId {
 
 /// One executor rank: its position in [`ExecutorConfig::ranks`]. Rank zero owns the engine's
 /// rings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Rank(usize);
 
 impl Rank {
@@ -120,8 +120,8 @@ impl fmt::Display for Rank {
     }
 }
 
-/// Two ranks on one device would share it, and two on one core would share the core each is
-/// pinned to so as not to share.
+/// Every rank owns its own device and is pinned to its own core, so a device or core named twice
+/// would be shared.
 fn ranks_own_distinct_devices_and_cores(config: &ExecutorConfig) -> Result<(), ValidationError> {
     let mut devices = HashSet::new();
     let mut cores = HashSet::new();

@@ -9,32 +9,25 @@
 mod fanout;
 #[cfg(feature = "cuda")]
 mod spawn;
+mod thread;
 
-use std::io::ErrorKind;
-use std::panic::resume_unwind;
-use std::sync::mpsc::{sync_channel, Receiver, SendError, SyncSender};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 
 use atoma_core::engine::ExecutorRings;
 use atoma_core::step::{StepCommand, StepResult};
 use atoma_core::types::TokenCount;
-use core_affinity::{get_core_ids, set_for_current, CoreId as AffinityCoreId};
 use thiserror::Error;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 pub use fanout::{feed, Follower, FollowerFeed, FollowerRings};
 #[cfg(feature = "cuda")]
 pub use spawn::{spawn_ranks, StartupError};
+pub use thread::{launch, spawn, wait_all, Cause, ExecutorThread, Launched, SpawnError};
 
 use crate::batch::{BatchLayout, LayoutError};
-use crate::config::{CoreId, Rank};
+use crate::config::Rank;
 use crate::forward::Forward;
 use crate::sampler::{SampleError, Sampler};
-
-/// An error whose type the executor does not name: the forward's own, or whatever building an
-/// executor failed with.
-pub type Cause = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Why an executor stopped.
 #[derive(Debug, Error)]
@@ -51,6 +44,9 @@ pub enum ExecutorError {
     /// A follower rank dropped its ends of its feed: it is over, so every rank is.
     #[error("follower rank {rank} is gone")]
     FollowerLost { rank: Rank },
+    /// The executor thread panicked, with what the panic said.
+    #[error("the executor thread panicked: {message}")]
+    Panicked { message: String },
 }
 
 /// What one rank's thread runs until the ranks are done: the leader's loop or a follower's.
@@ -92,12 +88,6 @@ impl<F: Forward> Executor<F> {
     /// whoever spawns both.
     pub fn follow(&mut self, feed: FollowerFeed) {
         self.followers.push(feed);
-    }
-
-    /// The block size the executor lays batches out over.
-    #[must_use]
-    pub fn block_size(&self) -> usize {
-        self.block_size
     }
 
     /// Feeds `command` to every follower, then serves it here.
@@ -178,209 +168,16 @@ impl<F: Forward> ExecutorLoop for Executor<F> {
     }
 }
 
-/// Why an executor thread could not be started.
-#[derive(Debug, Error)]
-pub enum SpawnError {
-    /// The operating system refused the thread.
-    #[error("the executor thread for rank {rank} could not be spawned: {kind:?}")]
-    Thread { rank: Rank, kind: ErrorKind },
-    /// The core is not one this process may run on, or the affinity could not be set.
-    #[error(
-        "rank {rank} cannot be pinned to core {core}; this process may run on cores {allowed:?}"
-    )]
-    Pin {
-        rank: Rank,
-        core: CoreId,
-        allowed: Vec<usize>,
-    },
-    /// Building the executor on its thread failed.
-    #[error("rank {rank} could not be built: {source}")]
-    Build {
-        rank: Rank,
-        #[source]
-        source: Cause,
-    },
-}
-
-/// The running executor thread of one rank.
-#[derive(Debug)]
-pub struct ExecutorThread {
-    rank: Rank,
-    join: JoinHandle<Result<(), ExecutorError>>,
-}
-
-impl ExecutorThread {
-    #[must_use]
-    pub fn rank(&self) -> Rank {
-        self.rank
-    }
-
-    /// Waits for the thread to return, handing back why it stopped if it failed.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`ExecutorError`] the loop stopped on.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the executor thread panicked, carrying its panic on.
-    pub fn join(self) -> Result<(), ExecutorError> {
-        self.join.join().expect("the executor thread panicked")
-    }
-
-    #[must_use]
-    pub fn is_finished(&self) -> bool {
-        self.join.is_finished()
-    }
-}
-
-/// An executor thread that is starting: pinning itself, building its loop and reporting.
-#[derive(Debug)]
-pub struct Launched {
-    rank: Rank,
-    join: JoinHandle<Result<(), ExecutorError>>,
-    readiness: Receiver<Result<(), SpawnError>>,
-}
-
-impl Launched {
-    /// Waits until the thread's loop is built and running, or it failed to start.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SpawnError`] when the thread could not be pinned or its loop could not be built.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the thread panicked while starting, carrying its panic on.
-    pub fn wait(self) -> Result<ExecutorThread, SpawnError> {
-        let Self {
-            rank,
-            join,
-            readiness,
-        } = self;
-        match readiness.recv() {
-            Ok(Ok(())) => Ok(ExecutorThread { rank, join }),
-            Ok(Err(error)) => Err(error),
-            Err(_) => {
-                // The thread reports before it returns, so a report that never came is a panic
-                // while starting.
-                let panic = join
-                    .join()
-                    .expect_err("the executor thread returned without reporting");
-                resume_unwind(panic)
-            }
-        }
-    }
-}
-
-/// Spawns rank `rank`'s executor thread pinned to `core`, builds its loop there with `build` and
-/// runs it until the far side is gone. Returns once the loop is built and running, so whatever
-/// stops it from starting is this call's error.
-///
-/// # Errors
-///
-/// Returns [`SpawnError`] when the thread cannot be spawned, cannot be pinned to `core`, or
-/// `build` fails.
-pub fn spawn<L, B>(rank: Rank, core: CoreId, build: B) -> Result<ExecutorThread, SpawnError>
-where
-    L: ExecutorLoop + 'static,
-    B: FnOnce() -> Result<L, Cause> + Send + 'static,
-{
-    launch(rank, core, build)?.wait()
-}
-
-/// Launches rank `rank`'s executor thread pinned to `core`, building its loop there with `build`,
-/// without waiting for it to start: what [`Launched::wait`] does. Ranks whose start is a
-/// rendezvous — every NCCL rank must join before any communicator opens — are all launched
-/// before any is waited on.
-///
-/// The thread is named `atoma-executor-{rank}`. The loop is built on the thread because what it
-/// holds — the device, the session — belongs to that thread alone.
-///
-/// # Errors
-///
-/// Returns [`SpawnError::Thread`] when the operating system refuses the thread.
-pub fn launch<L, B>(rank: Rank, core: CoreId, build: B) -> Result<Launched, SpawnError>
-where
-    L: ExecutorLoop + 'static,
-    B: FnOnce() -> Result<L, Cause> + Send + 'static,
-{
-    let (ready, readiness) = sync_channel::<Result<(), SpawnError>>(1);
-    let join = thread::Builder::new()
-        .name(format!("atoma-executor-{rank}"))
-        .spawn(move || {
-            let executor_loop = match start(rank, core, build) {
-                Ok(executor_loop) => executor_loop,
-                Err(error) => {
-                    report(&ready, Err(error));
-                    return Ok(());
-                }
-            };
-            report(&ready, Ok(()));
-            executor_loop
-                .run()
-                .inspect_err(|cause| error!(%rank, %cause, "executor failed"))
-        })
-        .map_err(|error| SpawnError::Thread {
-            rank,
-            kind: error.kind(),
-        })?;
-    Ok(Launched {
-        rank,
-        join,
-        readiness,
-    })
-}
-
-/// Pins the current thread and builds its loop.
-fn start<L, B>(rank: Rank, core: CoreId, build: B) -> Result<L, SpawnError>
-where
-    L: ExecutorLoop,
-    B: FnOnce() -> Result<L, Cause>,
-{
-    pin(rank, core)?;
-    build().map_err(|source| SpawnError::Build { rank, source })
-}
-
-/// Pins the current thread to `core`, refusing a core this process may not run on.
-fn pin(rank: Rank, core: CoreId) -> Result<(), SpawnError> {
-    let allowed: Vec<usize> = get_core_ids()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|id| id.id)
-        .collect();
-    let pinned =
-        allowed.contains(&core.get()) && set_for_current(AffinityCoreId { id: core.get() });
-    if !pinned {
-        return Err(SpawnError::Pin {
-            rank,
-            core,
-            allowed,
-        });
-    }
-    info!(%rank, %core, "executor thread pinned");
-    Ok(())
-}
-
-/// Reports whether starting succeeded; the spawner is waiting, so the send cannot fail.
-fn report(ready: &SyncSender<Result<(), SpawnError>>, outcome: Result<(), SpawnError>) {
-    match ready.send(outcome) {
-        Ok(()) | Err(SendError(_)) => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
     use atoma_core::engine::{Control, Engine, EngineHandle, EngineThread, ExecutorRings};
     use atoma_core::request::{FinishReason, RequestEvent};
-    use core_affinity::get_core_ids;
 
-    use super::{feed, spawn, Executor, ExecutorError, ExecutorLoop, Follower, SpawnError};
-    use crate::config::{CoreId, Rank};
+    use super::{feed, Executor, ExecutorError, ExecutorLoop, Follower};
+    use crate::config::Rank;
     use crate::test_support::{
         contract, engine_config, submit, FakeForward, FakeForwardError, BLOCK_SIZE, WAIT,
     };
@@ -416,7 +213,7 @@ mod tests {
                 ..
             }
         ));
-        let served = served.lock().unwrap().clone();
+        let served = served.lock().clone();
         assert_eq!(served.len(), 2, "one prefill, one decode");
         assert_eq!(served[0].entries[0].input_tokens, [1, 2, 3]);
         assert_eq!(
@@ -461,79 +258,6 @@ mod tests {
         engine.join();
     }
 
-    #[test]
-    fn spawn_pins_the_thread_names_it_and_runs_the_executor_on_it() {
-        let Some(core) = get_core_ids().and_then(|cores| cores.first().copied()) else {
-            return;
-        };
-        let (handle, rings, engine) = engine();
-        let (observed, observations) = mpsc::channel();
-        let thread = spawn(Rank::new(3), CoreId::new(core.id), move || {
-            let name = thread::current().name().map(str::to_owned);
-            let pinned_to: Vec<usize> = get_core_ids()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|id| id.id)
-                .collect();
-            observed.send((name, pinned_to)).unwrap();
-            Ok(Executor::new(rings, FakeForward::constant(7), BLOCK_SIZE))
-        })
-        .unwrap();
-        assert_eq!(thread.rank(), Rank::new(3));
-        let (name, pinned_to) = observations.recv_timeout(WAIT).unwrap();
-        assert_eq!(name.as_deref(), Some("atoma-executor-3"));
-        assert_eq!(
-            pinned_to,
-            [core.id],
-            "the thread may run on that core alone"
-        );
-
-        let client = submit(&handle, 2, 1);
-        assert!(matches!(
-            client.recv_timeout(WAIT).unwrap(),
-            RequestEvent::Token { token: 7, .. }
-        ));
-        handle.control.try_send(Control::Shutdown).unwrap();
-        engine.join();
-        assert!(thread.join().is_ok());
-    }
-
-    #[test]
-    fn spawn_refuses_a_core_the_process_may_not_run_on() {
-        let allowed = get_core_ids().unwrap_or_default();
-        let beyond = allowed
-            .iter()
-            .map(|id| id.id)
-            .max()
-            .map_or(0, |max| max + 1);
-        let (_handle, rings, _engine) = engine();
-        let error = spawn(Rank::ZERO, CoreId::new(beyond), move || {
-            Ok(Executor::new(rings, FakeForward::constant(7), BLOCK_SIZE))
-        })
-        .unwrap_err();
-        assert!(
-            matches!(&error, SpawnError::Pin { rank: Rank::ZERO, core, .. } if core.get() == beyond),
-            "{error}"
-        );
-        assert!(error.to_string().contains("may run on cores"), "{error}");
-    }
-
-    #[test]
-    fn spawn_returns_a_build_failure_from_the_thread() {
-        let Some(core) = get_core_ids().and_then(|cores| cores.first().copied()) else {
-            return;
-        };
-        let error = spawn::<Executor<FakeForward>, _>(Rank::ZERO, CoreId::new(core.id), || {
-            Err("no model at /nowhere".into())
-        })
-        .unwrap_err();
-        assert!(matches!(&error, SpawnError::Build { .. }), "{error}");
-        assert!(
-            error.to_string().contains("no model at /nowhere"),
-            "{error}"
-        );
-    }
-
     type RankThread = thread::JoinHandle<Result<(), ExecutorError>>;
 
     /// A leader with one follower, each on a thread of its own, over fakes that record what
@@ -546,7 +270,7 @@ mod tests {
         let (leader_end, follower_rings) = feed(Rank::new(1), rings.unparker());
         let mut leader = executor(rings, leader_forward);
         leader.follow(leader_end);
-        let follower = Follower::new(follower_rings, follower_forward, leader.block_size());
+        let follower = Follower::new(follower_rings, follower_forward, BLOCK_SIZE);
         let follower_thread = thread::spawn(move || follower.run());
         let leader_thread = thread::spawn(move || leader.run());
         (handle, engine, leader_thread, follower_thread)
@@ -583,10 +307,7 @@ mod tests {
             .join()
             .unwrap()
             .expect("the follower returns cleanly once the leader is gone");
-        let (led, followed) = (
-            led.lock().unwrap().clone(),
-            followed.lock().unwrap().clone(),
-        );
+        let (led, followed) = (led.lock().clone(), followed.lock().clone());
         assert_eq!(led.len(), 2);
         assert_eq!(
             led, followed,

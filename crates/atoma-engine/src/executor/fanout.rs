@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
+use atoma_core::engine::WakeOnDrop;
 use atoma_core::step::StepCommand;
+use atoma_core::types::TokenCount;
 use crossbeam_utils::sync::{Parker, Unparker};
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use tracing::{debug, info};
@@ -44,29 +46,12 @@ pub struct FollowerRings {
     wake: WakeOnDrop,
 }
 
-/// An unparker that wakes the far side of a feed when it is dropped. A field's drop rather than
-/// a `Drop` on the owning struct, which would run before the ring end it must follow.
-#[derive(Debug)]
-struct WakeOnDrop(Unparker);
-
-impl WakeOnDrop {
-    fn wake(&self) {
-        self.0.unpark();
-    }
-}
-
-impl Drop for WakeOnDrop {
-    fn drop(&mut self) {
-        self.wake();
-    }
-}
-
 /// Opens the feed to follower `rank`; `wake_leader` unparks the leader when the follower goes.
 #[must_use]
 pub fn feed(rank: Rank, wake_leader: Unparker) -> (FollowerFeed, FollowerRings) {
     let (producer, consumer) = RingBuffer::new(FEED_CAPACITY);
     let parker = Parker::new();
-    let wake_follower = WakeOnDrop(parker.unparker().clone());
+    let wake_follower = WakeOnDrop::new(parker.unparker().clone());
     (
         FollowerFeed {
             rank,
@@ -77,7 +62,7 @@ pub fn feed(rank: Rank, wake_leader: Unparker) -> (FollowerFeed, FollowerRings) 
             rank,
             commands: consumer,
             parker,
-            wake: WakeOnDrop(wake_leader),
+            wake: WakeOnDrop::new(wake_leader),
         },
     )
 }
@@ -145,11 +130,11 @@ pub struct Follower<F> {
 
 impl<F: Forward> Follower<F> {
     /// A follower serving `rings` through `forward`, over `block_size`-token KV blocks.
-    pub fn new(rings: FollowerRings, forward: F, block_size: usize) -> Self {
+    pub fn new(rings: FollowerRings, forward: F, block_size: TokenCount) -> Self {
         Self {
             rings,
             forward,
-            block_size,
+            block_size: block_size.get(),
         }
     }
 
@@ -193,6 +178,7 @@ mod tests {
     use std::time::Duration;
 
     use atoma_core::engine::rings;
+    use atoma_core::step::StepCommand;
     use crossbeam_utils::sync::Parker;
 
     use super::{feed, FEED_CAPACITY};
@@ -202,8 +188,6 @@ mod tests {
     fn step() -> Arc<StepCommand> {
         Arc::new(command(vec![entry(1, 0, vec![1, 2], &[10], true)], 0))
     }
-
-    use atoma_core::step::StepCommand;
 
     #[test]
     fn a_feed_carries_commands_in_order_and_bounds_what_is_with_the_follower() {

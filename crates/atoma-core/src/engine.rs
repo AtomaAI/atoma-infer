@@ -21,5 +21,5 @@ pub use control::{
 };
 pub use heartbeat::{heartbeat, Heartbeat, HeartbeatPublisher, HeartbeatReader};
 pub use ingress::{ingress, IngressReceiver, IngressRefused, IngressSender};
-pub use rings::{rings, EngineRings, ExecutorRings, RING_CAPACITY};
+pub use rings::{rings, EngineRings, ExecutorRings, WakeOnDrop, RING_CAPACITY};
 pub use thread::{Engine, EngineError, EngineHandle, EngineThread, Pass};

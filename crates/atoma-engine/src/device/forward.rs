@@ -44,37 +44,22 @@ pub struct Allocated {
 /// Holds the session's Replay phase for the process lifetime: nothing is captured in this crate,
 /// and holding the phase is what keeps the allocation from being reopened.
 pub struct CudaForward {
-    device: RankDevice,
-    weights: Weights,
-    kv_cache: KvCache,
-    readback: Option<Readback>,
-    vocab: usize,
+    allocated: Allocated,
     _session: Replay,
 }
 
 impl CudaForward {
     #[must_use]
     pub fn new(allocated: Allocated, session: Replay) -> Self {
-        let Allocated {
-            device,
-            weights,
-            kv_cache,
-            readback,
-            vocab,
-        } = allocated;
         Self {
-            device,
-            weights,
-            kv_cache,
-            readback,
-            vocab,
+            allocated,
             _session: session,
         }
     }
 
     /// The forward's inputs and attention metadata, uploaded from `layout`.
     fn upload(&self, layout: &BatchLayout) -> Result<Uploaded, candle_core::Error> {
-        let device = self.device.candle();
+        let device = self.allocated.device.candle();
         let tokens = layout.token_count();
         let entries = layout.entry_count();
         // A step in which no entry samples still runs, to write its KV; selecting one row keeps

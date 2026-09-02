@@ -40,17 +40,22 @@ pub struct ExecutorRings {
     wake: WakeOnDrop,
 }
 
-/// An unparker that wakes the thread on the other side of the rings when it is dropped.
+/// An unparker that wakes the thread on the other side of a ring when it is dropped.
 ///
 /// The wake is a field's drop rather than a `Drop` on the rings struct itself, because that runs
 /// before any of the struct's fields drop — it would wake the other thread while the rings it is
-/// about to examine are still held.
+/// about to examine are still held. Declare it after the ring ends it goes with.
 #[derive(Debug)]
-struct WakeOnDrop(Unparker);
+pub struct WakeOnDrop(Unparker);
 
 impl WakeOnDrop {
+    #[must_use]
+    pub fn new(unparker: Unparker) -> Self {
+        Self(unparker)
+    }
+
     /// Wakes the other thread now.
-    fn wake(&self) {
+    pub fn wake(&self) {
         self.0.unpark();
     }
 }
@@ -68,7 +73,7 @@ pub fn rings(wake: Unparker) -> (EngineRings, ExecutorRings) {
     let (command_producer, command_consumer) = RingBuffer::new(RING_CAPACITY);
     let (result_producer, result_consumer) = RingBuffer::new(RING_CAPACITY);
     let executor_parker = Parker::new();
-    let wake_executor = WakeOnDrop(executor_parker.unparker().clone());
+    let wake_executor = WakeOnDrop::new(executor_parker.unparker().clone());
     (
         EngineRings {
             commands: command_producer,
@@ -79,7 +84,7 @@ pub fn rings(wake: Unparker) -> (EngineRings, ExecutorRings) {
             commands: command_consumer,
             results: result_producer,
             parker: executor_parker,
-            wake: WakeOnDrop(wake),
+            wake: WakeOnDrop::new(wake),
         },
     )
 }

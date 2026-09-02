@@ -1,9 +1,10 @@
 //! Spawning one pinned executor thread per rank, each driving its capture session from
 //! Allocation through Capture to Replay before it serves a step.
 //!
-//! Every rank's thread is launched before any is waited on: under NCCL, opening a communicator is
-//! a rendezvous that returns only once every rank has joined, so waiting for rank zero to finish
-//! starting before launching rank one would never return.
+//! Every rank's thread is launched before any is waited on, and the ranks are waited on together:
+//! under NCCL, opening a communicator is a rendezvous that returns only once every rank has
+//! joined, so waiting for rank zero alone would never return when a follower fails before it
+//! joins.
 
 use atoma_core::engine::{EngineConfig, ExecutorRings};
 use atoma_runtime::context::RuntimeContext;
@@ -16,7 +17,8 @@ use crate::config::{DeviceOrdinal, ExecutorConfig, ModelConfig, Rank, RankConfig
 use crate::device::forward::{Allocated, CudaForward};
 use crate::device::{read_config, Checkpoint, KvCache, KvGeometry, RankDevice, Weights};
 use crate::executor::{
-    feed, launch, Cause, Executor, ExecutorThread, Follower, FollowerRings, Launched, SpawnError,
+    feed, launch, wait_all, Cause, Executor, ExecutorThread, Follower, FollowerRings, Launched,
+    SpawnError,
 };
 use crate::model::ModelFiles;
 use crate::readback::Readback;
@@ -115,13 +117,10 @@ pub fn spawn_ranks(
         let plan = plan.clone();
         launched.push(launch(rank, config.core, move || {
             let forward = allocate(rank, config.device, &plan)?;
-            Ok(Follower::new(follower_end, forward, block_size.get()))
+            Ok(Follower::new(follower_end, forward, block_size))
         })?);
     }
-    let threads = launched
-        .into_iter()
-        .map(Launched::wait)
-        .collect::<Result<Vec<_>, _>>()?;
+    let threads = wait_all(launched)?;
     info!(ranks = threads.len(), "every rank is serving");
     Ok(threads)
 }
@@ -149,6 +148,7 @@ fn allocate(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<CudaF
     let kv_cache = KvCache::allocate(&allocation, &device, &config, geometry, plan.dtype)?;
     let readback = if rank == Rank::ZERO {
         Some(Readback::new(
+            &allocation,
             device.stream().context(),
             plan.max_batch,
             config.vocab_size,

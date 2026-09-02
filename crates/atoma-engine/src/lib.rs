@@ -18,7 +18,7 @@ pub mod sampler;
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use atoma_core::attention::{
@@ -35,6 +35,7 @@ pub(crate) mod test_support {
     use atoma_core::types::{
         BlockId, RequestCount, RequestId, RequestSlot, SequenceIndex, StepId, TokenCount,
     };
+    use parking_lot::Mutex;
     use thiserror::Error;
 
     use crate::batch::BatchLayout;
@@ -48,7 +49,7 @@ pub(crate) mod test_support {
     const VOCAB: usize = 128;
 
     /// How long a test waits on a thread before calling it wedged: generous, since a loaded
-    /// runner is slow rather than broken.
+    /// machine is slow rather than broken.
     pub(crate) const WAIT: Duration = Duration::from_secs(30);
 
     /// An idle deadline longer than any test, so a test that finishes proves the thread was
@@ -175,10 +176,7 @@ pub(crate) mod test_support {
             if self.fail_on_command == Some(self.seen) {
                 return Err(FakeForwardError { command: self.seen });
             }
-            self.served
-                .lock()
-                .expect("served lock")
-                .push(command.clone());
+            self.served.lock().push(command.clone());
             let rows = layout.selected.len();
             self.logits.clear();
             self.logits.resize(rows * VOCAB, 0.0);
@@ -199,18 +197,6 @@ pub(crate) mod test_support {
         samples: bool,
     ) -> CommandEntry {
         let slot = u32::try_from(request).expect("test request numbers fit u32");
-        let sampling = samples.then(SamplingParams::default);
-        entry_with(request, slot, context_len, input_tokens, blocks, sampling)
-    }
-
-    pub(crate) fn entry_with(
-        request: u64,
-        slot: u32,
-        context_len: usize,
-        input_tokens: Vec<u32>,
-        blocks: &[u32],
-        sampling: Option<SamplingParams>,
-    ) -> CommandEntry {
         CommandEntry {
             request: RequestId::new(request),
             slot: RequestSlot::new(slot),
@@ -218,7 +204,16 @@ pub(crate) mod test_support {
             context_len,
             input_tokens,
             block_table: blocks.iter().map(|&block| BlockId::new(block)).collect(),
-            sampling,
+            sampling: samples.then(SamplingParams::default),
+        }
+    }
+
+    /// A one-token decode entry for `request` in `slot`, sampling under `params`.
+    pub(crate) fn sampling_entry(request: u64, slot: u32, params: SamplingParams) -> CommandEntry {
+        CommandEntry {
+            slot: RequestSlot::new(slot),
+            sampling: Some(params),
+            ..entry(request, 0, vec![1], &[10], true)
         }
     }
 

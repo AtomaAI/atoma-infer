@@ -28,12 +28,14 @@ use crate::model::{read_json, ModelError, ModelFiles};
 use std::rc::Rc;
 
 #[cfg(feature = "nccl")]
+use cudarc::nccl::sys::ncclResult_t;
+#[cfg(feature = "nccl")]
 use cudarc::nccl::{Comm, Id};
 
 #[cfg(feature = "nccl")]
 use crate::config::Rank;
 
-/// Why a rank's device could not be set up.
+/// Why a rank's device could not be opened, or what it holds could not be allocated.
 #[derive(Debug, Error)]
 pub enum DeviceError {
     #[error(transparent)]
@@ -47,7 +49,7 @@ pub enum DeviceError {
     Nccl {
         rank: Rank,
         world_size: usize,
-        status: cudarc::nccl::sys::ncclResult_t,
+        status: ncclResult_t,
     },
 }
 

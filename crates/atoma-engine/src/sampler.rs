@@ -224,7 +224,7 @@ mod tests {
 
     use super::{SampleError, Sampler};
     use crate::logits::Logits;
-    use crate::test_support::{command, entry, entry_with};
+    use crate::test_support::{command, entry, sampling_entry};
 
     const VOCAB: usize = 4;
     /// Token 1 leads, token 3 is second; penalising 1 by two hands the lead to 3.
@@ -253,10 +253,7 @@ mod tests {
 
     /// One sampling entry for `request` in slot `slot`, under `params`.
     fn one(request: u64, slot: u32, params: SamplingParams) -> StepCommand {
-        command(
-            vec![entry_with(request, slot, 0, vec![1], &[10], Some(params))],
-            0,
-        )
+        command(vec![sampling_entry(request, slot, params)], 0)
     }
 
     #[test]

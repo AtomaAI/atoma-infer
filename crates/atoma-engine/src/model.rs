@@ -4,7 +4,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 
 use hf_hub::api::sync::{ApiBuilder, ApiError, ApiRepo};
@@ -50,7 +50,7 @@ pub enum ModelError {
     Unreadable {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     #[error("{} is not the JSON expected of it: {source}", path.display())]
     Malformed {
@@ -78,11 +78,7 @@ pub enum ModelError {
 /// Returns [`ModelError`] when the Hub cannot be reached, the repository holds no safetensors,
 /// or the weight index cannot be read.
 pub fn fetch(model: &ModelConfig) -> Result<ModelFiles, ModelError> {
-    let hub = |source| ModelError::Hub {
-        id: model.id.clone(),
-        revision: model.revision.clone(),
-        source,
-    };
+    let hub = hub_error(model);
     let mut builder = ApiBuilder::from_env().with_progress(false);
     if let Ok(token) = env::var(HF_TOKEN) {
         builder = builder.with_token(Some(token));
@@ -90,15 +86,15 @@ pub fn fetch(model: &ModelConfig) -> Result<ModelFiles, ModelError> {
     if let Some(cache_dir) = &model.cache_dir {
         builder = builder.with_cache_dir(cache_dir.clone());
     }
-    let api = builder.build().map_err(hub)?;
+    let api = builder.build().map_err(&hub)?;
     let repo = api.repo(Repo::with_revision(
         model.id.clone(),
         RepoType::Model,
         model.revision.clone(),
     ));
     info!(id = %model.id, revision = %model.revision, "fetching the model's files");
-    let config = repo.get(CONFIG_FILE).map_err(hub)?;
-    let tokenizer = repo.get(TOKENIZER_FILE).map_err(hub)?;
+    let config = repo.get(CONFIG_FILE).map_err(&hub)?;
+    let tokenizer = repo.get(TOKENIZER_FILE).map_err(&hub)?;
     let weights = fetch_weights(&repo, model)?;
     info!(
         shards = weights.len(),
@@ -113,32 +109,37 @@ pub fn fetch(model: &ModelConfig) -> Result<ModelFiles, ModelError> {
 
 /// The safetensors shards the repository holds: the one file, or every file its index names.
 fn fetch_weights(repo: &ApiRepo, model: &ModelConfig) -> Result<Vec<PathBuf>, ModelError> {
-    let hub = |source| ModelError::Hub {
-        id: model.id.clone(),
-        revision: model.revision.clone(),
-        source,
-    };
+    let hub = hub_error(model);
     let held: HashSet<String> = repo
         .info()
-        .map_err(hub)?
+        .map_err(&hub)?
         .siblings
         .into_iter()
         .map(|sibling| sibling.rfilename)
         .collect();
     if held.contains(WEIGHTS_INDEX_FILE) {
-        let index = repo.get(WEIGHTS_INDEX_FILE).map_err(hub)?;
+        let index = repo.get(WEIGHTS_INDEX_FILE).map_err(&hub)?;
         return weight_files_in_index(&index)?
             .iter()
-            .map(|shard| repo.get(shard).map_err(hub))
+            .map(|shard| repo.get(shard).map_err(&hub))
             .collect();
     }
     if held.contains(WEIGHTS_FILE) {
-        return Ok(vec![repo.get(WEIGHTS_FILE).map_err(hub)?]);
+        return Ok(vec![repo.get(WEIGHTS_FILE).map_err(&hub)?]);
     }
     Err(ModelError::NoWeights {
         id: model.id.clone(),
         revision: model.revision.clone(),
     })
+}
+
+/// The Hub error for `model`, naming the repository and revision.
+fn hub_error(model: &ModelConfig) -> impl Fn(ApiError) -> ModelError + '_ {
+    |source| ModelError::Hub {
+        id: model.id.clone(),
+        revision: model.revision.clone(),
+        source,
+    }
 }
 
 /// The safetensors index: which shard holds each weight.
