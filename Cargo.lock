@@ -205,9 +205,11 @@ dependencies = [
 name = "atoma-engine"
 version = "0.1.0"
 dependencies = [
+ "atoma-core",
  "figment",
  "serde",
  "serde_json",
+ "thiserror 2.0.19",
  "validator",
 ]
 

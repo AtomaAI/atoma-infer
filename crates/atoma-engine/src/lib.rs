@@ -5,4 +5,5 @@
 //! command over a ring; the executor runs the model forward for it, samples the tokens the command
 //! asks for, and hands a step result back. It re-derives nothing the command already settled.
 
+pub mod batch;
 pub mod config;
