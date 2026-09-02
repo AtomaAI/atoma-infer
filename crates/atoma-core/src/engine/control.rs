@@ -5,7 +5,7 @@
 //! drain or a query cannot queue behind a burst of new requests.
 
 use crossbeam_utils::sync::Unparker;
-use flume::{Receiver, Sender, TrySendError};
+use flume::{Receiver, SendError, Sender, TrySendError};
 use serde::{Deserialize, Serialize};
 
 use crate::types::StepId;
@@ -81,6 +81,21 @@ impl ControlSender {
         }
     }
 
+    /// Hands `control` to the engine, waking it, waiting for room when the channel is full.
+    /// The engine drains control every pass, so the wait is one pass at most; for a shutdown,
+    /// which must not be lost to a full channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message when the engine thread has exited.
+    pub fn send(&self, control: Control) -> Result<(), Control> {
+        self.sender
+            .send(control)
+            .map_err(|SendError(control)| control)?;
+        self.wake.unpark();
+        Ok(())
+    }
+
     /// Whether the engine thread dropped its end: no control will ever be acted on again.
     #[must_use]
     pub fn engine_gone(&self) -> bool {
@@ -98,6 +113,9 @@ impl ControlReceiver {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
     use crossbeam_utils::sync::Parker;
 
     use super::{control, Control, EngineState, CONTROL_CAPACITY};
@@ -145,6 +163,32 @@ mod tests {
         drop(receiver);
         assert!(matches!(
             sender.try_send(Control::Shutdown),
+            Err(Control::Shutdown)
+        ));
+    }
+
+    #[test]
+    fn a_waiting_send_goes_through_once_the_engine_drains_and_is_handed_back_once_it_is_gone() {
+        let parker = Parker::new();
+        let (sender, receiver) = control(parker.unparker().clone());
+        for _ in 0..CONTROL_CAPACITY {
+            sender.try_send(Control::Shutdown).unwrap();
+        }
+        let waiting = thread::spawn({
+            let sender = sender.clone();
+            move || sender.send(Control::Shutdown)
+        });
+        thread::sleep(Duration::from_millis(10));
+        assert!(!waiting.is_finished(), "a full channel makes the send wait");
+
+        assert!(receiver.try_recv().is_some());
+        waiting
+            .join()
+            .unwrap()
+            .expect("the drained slot takes the waiting message");
+        drop(receiver);
+        assert!(matches!(
+            sender.send(Control::Shutdown),
             Err(Control::Shutdown)
         ));
     }

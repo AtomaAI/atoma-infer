@@ -18,8 +18,9 @@ use atoma_runtime::error::RuntimeError;
 use atoma_runtime::session::Allocation;
 use cudarc::driver::result::{free_host, malloc_host, memcpy_dtoh_async};
 use cudarc::driver::sys::CUevent_flags;
-use cudarc::driver::{CudaContext, CudaEvent, CudaStream, DevicePtr, DriverError};
+use cudarc::driver::{CudaContext, CudaEvent, CudaStream, DevicePtr};
 use thiserror::Error;
+use tracing::warn;
 
 use crate::logits::Logits;
 
@@ -119,13 +120,13 @@ impl Readback {
 impl Drop for Readback {
     fn drop(&mut self) {
         // The last copy may still be in flight; the event waits for it before the memory goes.
-        // Neither failure can be acted on from a destructor.
-        match self.event.synchronize() {
-            Ok(()) | Err(DriverError(_)) => {}
+        // Neither failure can be acted on from a destructor beyond saying so.
+        if let Err(error) = self.event.synchronize() {
+            warn!(%error, "the readback's last copy could not be waited on before its buffer goes");
         }
         // SAFETY: the pointer came from `malloc_host` and is freed here alone.
-        match unsafe { free_host(self.buffer.cast::<c_void>()) } {
-            Ok(()) | Err(DriverError(_)) => {}
+        if let Err(error) = unsafe { free_host(self.buffer.cast::<c_void>()) } {
+            warn!(%error, "the readback's pinned buffer could not be freed");
         }
     }
 }

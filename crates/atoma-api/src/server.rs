@@ -126,9 +126,10 @@ pub async fn run_server(
         .with_graceful_shutdown(shutdown)
         .await?;
 
-    // A shutdown after the engine has exited is refused, and that is nothing to act on.
-    match state.engine.control.try_send(Control::Shutdown) {
-        Ok(()) | Err(Control::Shutdown | Control::Drain { .. } | Control::State { .. }) => {}
+    // The send waits for room in a full control channel rather than losing the shutdown, which
+    // would leave the join below waiting forever; the engine drains control every pass.
+    if state.engine.control.send(Control::Shutdown).is_err() {
+        info!("the engine thread had already exited");
     }
     engine_join.await.context("the engine thread panicked")?;
     gauge_task.abort();

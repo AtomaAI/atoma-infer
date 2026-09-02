@@ -28,7 +28,7 @@ mod startup {
     use clap::Parser;
     use tokenizers::Tokenizer;
     use tokio::net::TcpListener;
-    use tracing::info;
+    use tracing::{error, info};
 
     use crate::config::Config;
     use crate::server::{run_server, AppState, EngineThreads};
@@ -78,9 +78,10 @@ mod startup {
         ) {
             Ok(executors) => executors,
             Err(error) => {
-                // The engine has nothing to serve; take it down before reporting.
-                match handle.control.try_send(Control::Shutdown) {
-                    Ok(()) | Err(_) => {}
+                // The engine has nothing to serve; take it down before reporting. It has had
+                // no control yet and no executor to lose, so it is there to be shut down.
+                if handle.control.send(Control::Shutdown).is_err() {
+                    error!("the engine thread exited before it was shut down");
                 }
                 engine.join();
                 return Err(error.into());
