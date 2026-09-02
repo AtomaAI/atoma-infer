@@ -28,6 +28,13 @@ pub enum Emission {
     Stopped(String),
 }
 
+/// Whether a stop string has been matched. Once one has, nothing further is emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopState {
+    Open,
+    Stopped,
+}
+
 /// One request's detokenization state.
 pub struct Detokenizer {
     tokenizer: Arc<Tokenizer>,
@@ -45,7 +52,7 @@ pub struct Detokenizer {
     /// The longest stop string's length in bytes; how far back a match can start into text
     /// already accumulated, and how much of the tail is held back.
     longest_stop: usize,
-    stopped: bool,
+    stop_state: StopState,
 }
 
 impl Detokenizer {
@@ -64,7 +71,7 @@ impl Detokenizer {
             emitted: 0,
             stop,
             longest_stop,
-            stopped: false,
+            stop_state: StopState::Open,
         }
     }
 
@@ -75,29 +82,21 @@ impl Detokenizer {
     ///
     /// Returns the tokenizer's error when the window cannot be decoded.
     pub fn feed(&mut self, token: u32) -> Result<Emission, tokenizers::Error> {
-        if self.stopped {
+        if self.stop_state == StopState::Stopped {
             return Ok(Emission::Stopped(String::new()));
         }
         self.tokens.push(token);
         let Some(delta) = self.decode_window()? else {
             return Ok(Emission::Text(String::new()));
         };
-        let search_from = self.char_boundary_at_or_before(
-            self.text
-                .len()
-                .saturating_sub(self.longest_stop.saturating_sub(1)),
-        );
+        let search_from = self.held_back_boundary();
         self.text.push_str(&delta);
         if let Some(at) = self.first_stop_match(search_from) {
             self.text.truncate(at);
-            self.stopped = true;
+            self.stop_state = StopState::Stopped;
             return Ok(Emission::Stopped(self.release(at)));
         }
-        let releasable = self.char_boundary_at_or_before(
-            self.text
-                .len()
-                .saturating_sub(self.longest_stop.saturating_sub(1)),
-        );
+        let releasable = self.held_back_boundary();
         Ok(Emission::Text(self.release(releasable)))
     }
 
@@ -105,7 +104,7 @@ impl Detokenizer {
     /// client. Nothing is left to release after a stop, or a second time.
     #[must_use]
     pub fn finish(&mut self) -> String {
-        if self.stopped {
+        if self.stop_state == StopState::Stopped {
             return String::new();
         }
         self.release(self.text.len())
@@ -141,6 +140,17 @@ impl Detokenizer {
             .iter()
             .filter_map(|stop| self.text[from..].find(stop.as_str()).map(|at| from + at))
             .min()
+    }
+
+    /// Where the text stops being safe to release: a stop string can begin up to its length
+    /// less one before the end, so everything from here on is held back. Before the new delta
+    /// is appended, it is also where a match can earliest start in text already accumulated.
+    fn held_back_boundary(&self) -> usize {
+        self.char_boundary_at_or_before(
+            self.text
+                .len()
+                .saturating_sub(self.longest_stop.saturating_sub(1)),
+        )
     }
 
     /// The text from what was last emitted up to `to`, marking it emitted.
