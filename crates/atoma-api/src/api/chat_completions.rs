@@ -105,6 +105,13 @@ pub enum Model {
         deserialize = "meta-llama/Llama-3.2-3B-Instruct"
     ))]
     Llama323bInstruct,
+    /// The ungated mirror of `meta-llama/Llama-3.1-8B-Instruct`: the same weights, reachable
+    /// without a Hugging Face token, and served with the same prompt template.
+    #[serde(rename(
+        serialize = "NousResearch/Meta-Llama-3.1-8B-Instruct",
+        deserialize = "NousResearch/Meta-Llama-3.1-8B-Instruct"
+    ))]
+    NousLlama318bInstruct,
     #[serde(rename(
         serialize = "NousResearch/Hermes-3-Llama-3.1-8B",
         deserialize = "NousResearch/Hermes-3-Llama-3.1-8B"
@@ -142,6 +149,9 @@ impl std::fmt::Display for Model {
             Model::Llama321bInstruct => write!(f, "meta-llama/Llama-3.2-1B-Instruct"),
             Model::Llama323b => write!(f, "meta-llama/Llama-3.2-3B"),
             Model::Llama323bInstruct => write!(f, "meta-llama/Llama-3.2-3B-Instruct"),
+            Model::NousLlama318bInstruct => {
+                write!(f, "NousResearch/Meta-Llama-3.1-8B-Instruct")
+            }
             Model::HermesLlama318b => write!(f, "NousResearch/Hermes-3-Llama-3.1-8B"),
             Model::HermesLlama3170b => write!(f, "NousResearch/Hermes-3-Llama-3.1-70B"),
             Model::HermesLlama31405b => write!(f, "NousResearch/Hermes-3-Llama-3.1-405B"),
@@ -154,10 +164,21 @@ impl Model {
         use Model::*;
         match self {
             Llama27b | Llama27bChatHf | Llama270b => messages::messages_to_llama2_prompt(messages),
-            Llama38b | Llama38bInstruct | Llama370b | Llama370bInstruct | Llama318b
-            | Llama318bInstruct | Llama3170b | Llama3170bInstruct | Llama31405b
-            | Llama31405bInstruct | Llama321b | Llama321bInstruct | Llama323b
-            | Llama323bInstruct => messages::messages_to_llama3_prompt(messages),
+            Llama38b
+            | Llama38bInstruct
+            | Llama370b
+            | Llama370bInstruct
+            | Llama318b
+            | Llama318bInstruct
+            | Llama3170b
+            | Llama3170bInstruct
+            | Llama31405b
+            | Llama31405bInstruct
+            | Llama321b
+            | Llama321bInstruct
+            | Llama323b
+            | Llama323bInstruct
+            | NousLlama318bInstruct => messages::messages_to_llama3_prompt(messages),
             HermesLlama318b | HermesLlama3170b | HermesLlama31405b => {
                 messages::messages_to_hermes3_prompt(messages)
             }
@@ -592,7 +613,8 @@ impl ToolCall {
             | Model::Llama321b
             | Model::Llama321bInstruct
             | Model::Llama323b
-            | Model::Llama323bInstruct => {
+            | Model::Llama323bInstruct
+            | Model::NousLlama318bInstruct => {
                 // Check if arguments is a JSON object
                 if let Some(args) = self.function.arguments.as_object() {
                     let params_str = args
