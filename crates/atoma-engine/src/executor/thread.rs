@@ -2,6 +2,7 @@
 //! reported as running before the spawner goes on, and joined for why it stopped.
 
 use std::any::Any;
+use std::error::Error;
 use std::io::ErrorKind;
 use std::mem;
 use std::panic::resume_unwind;
@@ -18,7 +19,7 @@ use crate::executor::{ExecutorError, ExecutorLoop};
 
 /// An error whose type the executor does not name: the forward's own, or whatever building an
 /// executor failed with.
-pub type Cause = Box<dyn std::error::Error + Send + Sync + 'static>;
+pub type Cause = Box<dyn Error + Send + Sync + 'static>;
 
 /// Why an executor thread could not be started.
 #[derive(Debug, Error)]

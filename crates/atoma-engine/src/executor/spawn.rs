@@ -24,6 +24,8 @@ use crate::model::ModelFiles;
 use crate::readback::Readback;
 
 #[cfg(feature = "nccl")]
+use cudarc::nccl::sys::ncclResult_t;
+#[cfg(feature = "nccl")]
 use cudarc::nccl::Id;
 
 #[cfg(feature = "nccl")]
@@ -43,9 +45,7 @@ pub enum StartupError {
     RanksNeedNccl { ranks: usize },
     #[cfg(feature = "nccl")]
     #[error("the NCCL collective could not be opened: {status:?}")]
-    Collective {
-        status: cudarc::nccl::sys::ncclResult_t,
-    },
+    Collective { status: ncclResult_t },
 }
 
 /// What every rank is built from.
