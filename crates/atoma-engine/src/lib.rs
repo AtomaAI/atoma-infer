@@ -7,6 +7,8 @@
 
 pub mod batch;
 pub mod config;
+#[cfg(feature = "cuda")]
+pub mod device;
 pub mod executor;
 pub mod forward;
 pub mod logits;

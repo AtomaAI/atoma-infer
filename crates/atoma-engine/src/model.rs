@@ -204,7 +204,12 @@ pub fn check_eos_token_ids(configured: &[u32], model: &[u32]) -> Result<(), Mode
     })
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ModelError> {
+/// The JSON at `path`, read as `T`.
+///
+/// # Errors
+///
+/// Returns [`ModelError`] when the file cannot be read or does not hold a `T`.
+pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ModelError> {
     let file = File::open(path).map_err(|source| ModelError::Unreadable {
         path: path.to_path_buf(),
         source,
