@@ -5,5 +5,6 @@ pub mod alloc;
 pub mod blas;
 pub mod descriptor;
 pub mod kernels;
+pub mod observe;
 pub mod runner;
 pub mod step;

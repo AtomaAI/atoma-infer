@@ -221,6 +221,7 @@ dependencies = [
  "cudarc 0.19.8",
  "proptest",
  "thiserror 2.0.19",
+ "tracing",
 ]
 
 [[package]]

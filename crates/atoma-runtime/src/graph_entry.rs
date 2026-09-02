@@ -2,10 +2,10 @@
 //! graph does.
 
 use cudarc::driver::CudaSlice;
-#[cfg(feature = "nccl")]
-use cudarc::nccl::Comm;
 
 use crate::capture::CapturedGraph;
+#[cfg(feature = "nccl")]
+use crate::communicator::Communicator;
 
 /// One captured graph together with every device buffer whose address is baked into it, so a
 /// dropped buffer cannot leave a dangling pointer in a live graph.
@@ -26,7 +26,7 @@ pub struct GraphEntry {
     graph: CapturedGraph,
     /// The communicator captured collectives run on. Last: abort blocks on live graphs.
     #[cfg(feature = "nccl")]
-    comm: Option<Comm>,
+    comm: Option<Communicator>,
 }
 
 impl GraphEntry {
@@ -51,14 +51,14 @@ impl GraphEntry {
     /// Attaches the communicator the captured collectives run on; it outlives the graph and is
     /// torn down after it.
     #[cfg(feature = "nccl")]
-    pub(crate) fn attach_comm(&mut self, comm: Comm) {
+    pub(crate) fn attach_comm(&mut self, comm: Communicator) {
         self.comm = Some(comm);
     }
 
     /// The communicator the captured collectives run on, for eager (non-replay) steps that must
-    /// issue the same collective outside the graph.
+    /// issue the same collective outside the graph. It reaches no stream.
     #[cfg(feature = "nccl")]
-    pub fn comm(&self) -> Option<&Comm> {
+    pub fn comm(&self) -> Option<&Communicator> {
         self.comm.as_ref()
     }
 

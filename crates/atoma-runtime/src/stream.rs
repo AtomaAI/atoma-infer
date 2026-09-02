@@ -5,8 +5,12 @@ use std::sync::Arc;
 
 use cudarc::driver::sys;
 use cudarc::driver::CudaStream;
+#[cfg(feature = "nccl")]
+use cudarc::nccl::{Comm, Id};
 
 use crate::capture::{CaptureOp, CaptureState};
+#[cfg(feature = "nccl")]
+use crate::communicator::Communicator;
 use crate::context::RuntimeContext;
 use crate::error::RuntimeError;
 
@@ -65,6 +69,17 @@ impl CaptureStream {
         &self.stream
     }
 
+    /// Binds a library handle to this stream by handing the raw handle to `bind` once. Reachable
+    /// only through the session's Allocation phase, so a handle bound after capture has begun
+    /// cannot be expressed.
+    ///
+    /// `bind` must do nothing with the handle but store it in the library object it binds
+    /// (`cublasSetStream` and the like). Retaining it anywhere else reintroduces the raw-stream
+    /// call sites the descriptor seam removes.
+    pub fn bind<E>(&self, bind: impl FnOnce(sys::CUstream) -> Result<(), E>) -> Result<(), E> {
+        bind(self.stream.cu_stream())
+    }
+
     /// Creates the NCCL communicator whose collectives enqueue on this capture stream, so an
     /// all-reduce issued during capture is recorded into the graph instead of landing on a
     /// foreign stream and invalidating the recording.
@@ -79,13 +94,9 @@ impl CaptureStream {
         &self,
         rank: usize,
         world_size: usize,
-        id: cudarc::nccl::Id,
-    ) -> Result<cudarc::nccl::Comm, RuntimeError> {
-        Ok(cudarc::nccl::Comm::from_rank(
-            self.stream.clone(),
-            rank,
-            world_size,
-            id,
-        )?)
+        id: Id,
+    ) -> Result<Communicator, RuntimeError> {
+        let comm = Comm::from_rank(self.stream.clone(), rank, world_size, id)?;
+        Ok(Communicator::new(comm))
     }
 }

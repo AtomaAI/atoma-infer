@@ -17,21 +17,23 @@
 //!
 //! All enqueue onto the capture stream goes through the [`Descriptor`] seam. Kernels reached
 //! through a C ABI take a raw stream in their signature and always will; the seam confines that to
-//! one implementation per backend instead of one occurrence per call site. Outside this crate the
-//! capture stream's raw handle exists only as the argument of a [`Descriptor::enqueue`]
-//! implementation — `sys::CUstream` anywhere else in a consuming crate is a review failure.
+//! one implementation per backend instead of one occurrence per call site. A library handle that
+//! must be bound to the stream (cuBLAS) is bound through [`CaptureStream::bind`], reachable only
+//! from Allocation. Outside this crate the capture stream's raw handle exists only as the argument
+//! of a [`Descriptor::enqueue`] implementation or of a bind closure — `sys::CUstream` anywhere else
+//! in a consuming crate is a review failure.
 //!
 //! A transition that does not exist has no method to call, so it does not compile. Beginning a
 //! capture from the Replay phase:
 //!
 //! ```compile_fail
 //! use atoma_runtime::session::{BakedBuffers, Descriptor, Replay};
-//! fn begin<D: Descriptor>(replay: &mut Replay, work: &mut D, buffers: BakedBuffers) {
-//!     replay.record(work, buffers);
+//! fn begin<D: Descriptor>(replay: &mut Replay, descriptor: &mut D, buffers: BakedBuffers) {
+//!     replay.record(descriptor, buffers);
 //! }
 //! ```
 //!
-//! Reaching the owning stream reference after allocation is sealed:
+//! Reaching the owning stream reference after allocation is over:
 //!
 //! ```compile_fail
 //! use atoma_runtime::session::Capture;
@@ -63,7 +65,7 @@
 //! ```compile_fail
 //! use atoma_runtime::session::{Allocation, Replay};
 //! fn shortcut(replay: Replay) -> Allocation {
-//!     replay.seal()
+//!     replay.into_allocation()
 //! }
 //! ```
 //!
@@ -93,10 +95,11 @@
 //! fn one_session() -> Result<(), RuntimeError> {
 //!     let ctx = RuntimeContext::new(0)?;
 //!     let allocation = Allocation::new(&ctx)?;
-//!     let mut capture = allocation.seal();
+//!     allocation.stream().bind(|_raw| Ok::<(), RuntimeError>(()))?;
+//!     let mut capture = allocation.into_capture();
 //!     capture.warm_up(&mut Noop)?;
 //!     let graph = capture.record(&mut Noop, BakedBuffers::default())?;
-//!     let replay = capture.seal();
+//!     let replay = capture.into_replay();
 //!     replay.run(&mut Noop)?;
 //!     replay.replay(graph)?;
 //!     replay.synchronize()?;
@@ -108,10 +111,11 @@
 use std::marker::PhantomData;
 
 use cudarc::driver::{sys, CudaSlice};
-#[cfg(feature = "nccl")]
-use cudarc::nccl::Comm;
+use tracing::warn;
 
 use crate::capture::{self, CaptureState};
+#[cfg(feature = "nccl")]
+use crate::communicator::Communicator;
 use crate::context::RuntimeContext;
 use crate::error::RuntimeError;
 use crate::graph_entry::GraphEntry;
@@ -176,21 +180,44 @@ impl Allocation {
         })
     }
 
-    /// The owning reference to the capture stream, for binding communicators. Unreachable from
-    /// any later phase, so a handle bound after capture has begun cannot be expressed.
+    /// The owning reference to the capture stream, for binding communicators and library
+    /// handles. Unreachable from any later phase, so a handle bound after capture has begun
+    /// cannot be expressed.
     pub fn stream(&self) -> &CaptureStream {
         &self.stream
     }
 
-    /// Seals allocation: every device address is fixed and every handle bound. The stream
+    /// Ends allocation: every device address is fixed and every handle bound. The stream
     /// reference does not survive the transition.
     #[must_use]
-    pub fn seal(self) -> Capture {
+    pub fn into_capture(self) -> Capture {
         Capture {
             stream: self.stream,
             entries: Vec::new(),
-            warmed: false,
+            warmup: Warmup::Pending,
             _executor_thread: PhantomData,
+        }
+    }
+}
+
+/// Whether a warmup pass has run since the last recording. A run-time latch inside the Capture
+/// phase, not a session phase: the phase says warming and recording are legal here, and the
+/// latch orders the two so each recording consumes the warmup that preceded it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Warmup {
+    /// No warmup has run since the last recording; a record is a named error.
+    Pending,
+    /// A warmup pass ran; the next record consumes it.
+    Done,
+}
+
+impl Warmup {
+    /// The latch after a recording consumes it, or the named error when there was nothing to
+    /// consume.
+    fn consume(self) -> Result<Self, RuntimeError> {
+        match self {
+            Self::Done => Ok(Self::Pending),
+            Self::Pending => Err(RuntimeError::RecordWithoutWarmup),
         }
     }
 }
@@ -199,27 +226,25 @@ impl Allocation {
 pub struct Capture {
     stream: CaptureStream,
     entries: Vec<GraphEntry>,
-    /// Whether a warmup pass ran since the last recording. A run-time detail, not a phase: the
-    /// phase says warming and recording are legal here, and this orders the two.
-    warmed: bool,
+    warmup: Warmup,
     _executor_thread: ExecutorThreadOnly,
 }
 
 impl Capture {
-    /// Runs `work` eagerly on the capture stream and waits for it: the warmup pass that lands a
-    /// backend's lazy allocations before any recording. Run the exact step at the graph's exact
-    /// shape immediately before each [`Capture::record`] of it.
-    pub fn warm_up<D: Descriptor>(&mut self, work: &mut D) -> Result<(), D::Error> {
+    /// Runs `descriptor` eagerly on the capture stream and waits for it: the warmup pass that
+    /// lands a backend's lazy allocations before any recording. Run the exact step at the graph's
+    /// exact shape immediately before each [`Capture::record`] of it.
+    pub fn warm_up<D: Descriptor>(&mut self, descriptor: &mut D) -> Result<(), D::Error> {
         // SAFETY: the session's own stream, on the thread that owns it.
-        unsafe { work.enqueue(self.stream.cu_stream()) }?;
+        unsafe { descriptor.enqueue(self.stream.cu_stream()) }?;
         synchronize_idle(&self.stream)?;
-        self.warmed = true;
+        self.warmup = Warmup::Done;
         Ok(())
     }
 
-    /// Records `work` as one graph on the dedicated side stream in relaxed mode, instantiates it
-    /// with flags zero, pre-uploads the executable, and takes ownership of every buffer whose
-    /// address the recording baked.
+    /// Records `descriptor` as one graph on the dedicated side stream in relaxed mode,
+    /// instantiates it with flags zero, pre-uploads the executable, and takes ownership of every
+    /// buffer whose address the recording baked.
     ///
     /// Each recording consumes the preceding [`Capture::warm_up`]; recording without one is a
     /// named error before anything reaches the driver. A capture the driver invalidated — by the
@@ -227,17 +252,14 @@ impl Capture {
     /// stream is left idle for the next warmup.
     pub fn record<D: Descriptor>(
         &mut self,
-        work: &mut D,
+        descriptor: &mut D,
         buffers: BakedBuffers,
     ) -> Result<GraphIdx, D::Error> {
-        if !self.warmed {
-            return Err(D::Error::from(RuntimeError::RecordWithoutWarmup));
-        }
-        self.warmed = false;
+        self.warmup = self.warmup.consume()?;
 
-        self.stream.begin_capture().map_err(D::Error::from)?;
+        self.stream.begin_capture()?;
         // SAFETY: the session's own stream, on the thread that owns it.
-        if let Err(err) = unsafe { work.enqueue(self.stream.cu_stream()) } {
+        if let Err(err) = unsafe { descriptor.enqueue(self.stream.cu_stream()) } {
             discard_recording(&self.stream);
             return Err(err);
         }
@@ -248,7 +270,7 @@ impl Capture {
                 return Err(D::Error::from(err));
             }
         };
-        graph.upload().map_err(D::Error::from)?;
+        graph.upload()?;
         synchronize_idle(&self.stream)?;
 
         let BakedBuffers {
@@ -268,7 +290,7 @@ impl Capture {
     /// # Panics
     /// Panics when `idx` was minted by a different session.
     #[cfg(feature = "nccl")]
-    pub fn attach_comm(&mut self, idx: GraphIdx, comm: Comm) {
+    pub fn attach_comm(&mut self, idx: GraphIdx, comm: Communicator) {
         self.entries[idx.0].attach_comm(comm);
     }
 
@@ -280,9 +302,9 @@ impl Capture {
         &self.entries[idx.0]
     }
 
-    /// Seals the graph set: recording is over and only launches remain.
+    /// Ends recording: the graph set is complete and only launches remain.
     #[must_use]
-    pub fn seal(self) -> Replay {
+    pub fn into_replay(self) -> Replay {
         Replay {
             stream: self.stream,
             entries: self.entries,
@@ -302,9 +324,9 @@ pub struct Replay {
 impl Replay {
     /// Enqueues eager work onto the capture stream: the per-step input uploads and the eager
     /// fallback path. Launch only — pair with [`Replay::synchronize`].
-    pub fn run<D: Descriptor>(&self, work: &mut D) -> Result<(), D::Error> {
+    pub fn run<D: Descriptor>(&self, descriptor: &mut D) -> Result<(), D::Error> {
         // SAFETY: the session's own stream, on the thread that owns it.
-        unsafe { work.enqueue(self.stream.cu_stream()) }
+        unsafe { descriptor.enqueue(self.stream.cu_stream()) }
     }
 
     /// Launches entry `idx`'s executable on the stream it was captured from. Launch only — pair
@@ -360,14 +382,49 @@ fn synchronize_idle(stream: &CaptureStream) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// Best-effort drain after a failed recording, so the stream is idle for the session's next
-/// operation. The originating failure is already on its way to the caller; a discard failure here
-/// would have nothing actionable to add.
+/// Drains a failed recording so the stream is idle for the session's next operation. The
+/// originating failure is already on its way to the caller; a drain failure is logged, and the
+/// next session operation reports the stream state it finds.
 fn discard_recording(stream: &CaptureStream) {
-    if matches!(
-        stream.state(),
-        Ok(CaptureState::Active | CaptureState::Invalidated)
-    ) {
-        let _ = capture::end_capture_discard(stream);
+    let drained = match stream.state() {
+        Ok(CaptureState::Active | CaptureState::Invalidated) => {
+            capture::end_capture_discard(stream)
+        }
+        Ok(CaptureState::Idle) => Ok(()),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = drained {
+        warn!(
+            error = %err,
+            "the failed recording was not drained from the capture stream; the next session \
+             operation reports the stream state"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_recording_consumes_the_warmup_that_preceded_it() {
+        assert_eq!(Warmup::Done.consume().unwrap(), Warmup::Pending);
+    }
+
+    #[test]
+    fn recording_without_a_warmup_is_a_named_error() {
+        assert!(matches!(
+            Warmup::Pending.consume(),
+            Err(RuntimeError::RecordWithoutWarmup)
+        ));
+    }
+
+    #[test]
+    fn a_consumed_warmup_does_not_cover_a_second_recording() {
+        let after_first = Warmup::Done.consume().unwrap();
+        assert!(matches!(
+            after_first.consume(),
+            Err(RuntimeError::RecordWithoutWarmup)
+        ));
     }
 }

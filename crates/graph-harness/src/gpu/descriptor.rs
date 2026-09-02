@@ -2,34 +2,36 @@
 //! onto the capture stream passes, and the only place this backend's C-ABI kernels receive the
 //! raw stream handle.
 
-#[cfg(not(feature = "nccl"))]
-use anyhow::bail;
 use anyhow::{anyhow, Result};
-use atoma_runtime::session::Descriptor;
-use cudarc::driver::{result, sys, CudaSlice};
 #[cfg(feature = "nccl")]
-use cudarc::nccl::{Comm, ReduceOp};
+use atoma_runtime::communicator::Communicator;
+use atoma_runtime::session::Descriptor;
+#[cfg(feature = "nccl")]
+use cudarc::driver::CudaSlice;
+use cudarc::driver::{result, sys};
+#[cfg(feature = "nccl")]
+use cudarc::nccl::ReduceOp;
 
-use crate::gpu::step::{self, StagingPtrs, StepContext, StepPtrs};
+#[cfg(feature = "nccl")]
+use crate::gpu::alloc;
+use crate::gpu::step::{self, InputPtrs, StepContext, StepPtrs};
 use crate::layout::StaticSizes;
 use crate::variation::StepInputs;
 
-/// The pieces the per-layer all-reduce hook needs. Only all-reduce cells construct one, and only
-/// the `nccl` build can run them.
+/// The per-layer all-reduce: the cell's communicator and the f32 mirror it reduces in.
+#[cfg(feature = "nccl")]
 pub struct AllReduce<'a> {
-    #[cfg(feature = "nccl")]
-    pub comm: &'a Comm,
-    pub buffer: &'a mut CudaSlice<f32>,
-    pub buffer_ptr: u64,
+    pub comm: &'a Communicator,
+    pub mirror: &'a mut CudaSlice<f32>,
 }
 
 /// One enqueue of harness work onto the capture stream.
-pub enum StepWork<'a> {
+pub enum StepDescriptor<'a> {
     /// H2D upload of one step's inputs into their persistent staging mirrors — the pre-work
     /// every step, replayed or eager, consumes. Pageable H2D is host-synchronous, so it is never
     /// part of a recording; the graph reads staging only through captured D2D nodes.
     Upload {
-        staging: &'a StagingPtrs,
+        staging: &'a InputPtrs,
         inputs: &'a StepInputs,
     },
     /// The captured copy-in from staging plus the full decode step — what a recording bakes and
@@ -37,28 +39,40 @@ pub enum StepWork<'a> {
     Decode {
         ctx: &'a StepContext<'a>,
         ptrs: &'a StepPtrs,
-        staging: &'a StagingPtrs,
         sizes: &'a StaticSizes,
+        #[cfg(feature = "nccl")]
         all_reduce: Option<AllReduce<'a>>,
     },
 }
 
-impl Descriptor for StepWork<'_> {
+impl Descriptor for StepDescriptor<'_> {
     type Error = anyhow::Error;
 
     unsafe fn enqueue(&mut self, stream: sys::CUstream) -> Result<()> {
         match self {
-            Self::Upload { staging, inputs } => unsafe { upload_staging(stream, staging, inputs) },
+            Self::Upload { staging, inputs } => {
+                // SAFETY: the session hands a live stream, and staging was fixed in Allocation
+                // at the sizes this step's inputs have.
+                unsafe { upload_staging(stream, staging, inputs) }
+            }
             Self::Decode {
                 ctx,
                 ptrs,
-                staging,
                 sizes,
+                #[cfg(feature = "nccl")]
                 all_reduce,
-            } => unsafe {
-                step::copy_inputs(stream, ptrs, staging, sizes)?;
-                decode_step(stream, ctx, ptrs, all_reduce.as_mut())
-            },
+            } => {
+                // SAFETY: the session hands a live stream, and every address in `ptrs` was
+                // fixed in Allocation at the shapes `ctx` and `sizes` describe.
+                unsafe { step::copy_inputs(stream, &ptrs.statics, sizes) }?;
+                #[cfg(feature = "nccl")]
+                if let Some(all_reduce) = all_reduce {
+                    // SAFETY: as above, plus a live communicator bound to this stream.
+                    return unsafe { reduce_step(stream, ctx, ptrs, all_reduce) };
+                }
+                // SAFETY: as above.
+                unsafe { step::run_step(stream, ctx, ptrs, None) }
+            }
         }
     }
 }
@@ -70,51 +84,54 @@ impl Descriptor for StepWork<'_> {
 /// The staging addresses must be live and sized for `inputs`.
 unsafe fn upload_staging(
     stream: sys::CUstream,
-    staging: &StagingPtrs,
+    staging: &InputPtrs,
     inputs: &StepInputs,
 ) -> Result<()> {
+    // SAFETY: the caller's contract, forwarded to each upload.
     unsafe {
-        result::memcpy_htod_async(staging.token_ids, &inputs.token_ids, stream)
-            .and_then(|()| result::memcpy_htod_async(staging.seqlens_k, &inputs.seqlens_k, stream))
-            .and_then(|()| {
-                result::memcpy_htod_async(staging.block_table, &inputs.block_table, stream)
-            })
-            .and_then(|()| {
-                result::memcpy_htod_async(staging.slot_mapping, &inputs.slot_mapping, stream)
-            })
+        upload(stream, staging.token_ids, &inputs.token_ids)?;
+        upload(stream, staging.seqlens_k, &inputs.seqlens_k)?;
+        upload(stream, staging.block_table, &inputs.block_table)?;
+        upload(stream, staging.slot_mapping, &inputs.slot_mapping)
     }
-    .map_err(|e| anyhow!("staging upload: {:?}", e.0))
 }
 
-/// Runs the step with the cell's all-reduce hook when it has one.
+/// One H2D upload of `src` to `dst`.
 ///
 /// # Safety
-/// See [`step::run_step`].
-unsafe fn decode_step(
+/// `dst` must be live and sized for `src`.
+unsafe fn upload<T>(stream: sys::CUstream, dst: u64, src: &[T]) -> Result<()> {
+    // SAFETY: the caller's contract.
+    unsafe { result::memcpy_htod_async(dst, src, stream) }
+        .map_err(|e| anyhow!("staging upload: {:?}", e.0))
+}
+
+/// Runs the step with the cell's per-layer all-reduce installed: each layer's o-projection is
+/// widened into the mirror, summed across the ranks, and narrowed back in place.
+///
+/// # Safety
+/// See [`step::run_step`]; the communicator must be bound to `stream`.
+#[cfg(feature = "nccl")]
+unsafe fn reduce_step(
     stream: sys::CUstream,
     ctx: &StepContext<'_>,
     ptrs: &StepPtrs,
-    all_reduce: Option<&mut AllReduce<'_>>,
+    all_reduce: &mut AllReduce<'_>,
 ) -> Result<()> {
-    match all_reduce {
-        #[cfg(feature = "nccl")]
-        Some(parts) => {
-            let kernels = ctx.kernels;
-            let buffer_ptr = parts.buffer_ptr;
-            let comm = parts.comm;
-            let buffer = &mut *parts.buffer;
-            let mut hook = |o_proj: u64, elements: usize| -> Result<()> {
-                unsafe { kernels.bf16_to_f32(stream, o_proj, buffer_ptr, elements) }?;
-                let mut view = buffer.slice_mut(0..elements);
-                comm.all_reduce_in_place(&mut view, &ReduceOp::Sum)
-                    .map_err(|e| anyhow!("ncclAllReduce: {:?}", e.0))?;
-                unsafe { kernels.f32_to_bf16(stream, buffer_ptr, o_proj, elements) }?;
-                Ok(())
-            };
-            unsafe { step::run_step(stream, ctx, ptrs, Some(&mut hook)) }
-        }
-        #[cfg(not(feature = "nccl"))]
-        Some(_) => bail!("all-reduce cell in a build without the nccl feature"),
-        None => unsafe { step::run_step(stream, ctx, ptrs, None) },
-    }
+    let kernels = ctx.kernels;
+    let comm = all_reduce.comm;
+    let mirror = &mut *all_reduce.mirror;
+    let mirror_ptr = alloc::addr(mirror);
+    let mut hook = |o_proj: u64, elements: usize| -> Result<()> {
+        // SAFETY: `o_proj` is a live arena slot of `elements` bf16 values, and the mirror was
+        // allocated for at least `elements` f32 values.
+        unsafe { kernels.bf16_to_f32(stream, o_proj, mirror_ptr, elements) }?;
+        let mut view = mirror.slice_mut(0..elements);
+        comm.all_reduce_in_place(&mut view, &ReduceOp::Sum)?;
+        // SAFETY: as above, in the other direction.
+        unsafe { kernels.f32_to_bf16(stream, mirror_ptr, o_proj, elements) }?;
+        Ok(())
+    };
+    // SAFETY: the caller's contract.
+    unsafe { step::run_step(stream, ctx, ptrs, Some(&mut hook)) }
 }
