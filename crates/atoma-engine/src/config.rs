@@ -2,6 +2,7 @@
 //! device and core each rank owns.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -85,6 +86,37 @@ impl CoreId {
     #[must_use]
     pub const fn get(self) -> usize {
         self.0
+    }
+}
+
+impl fmt::Display for CoreId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// One executor rank: its position in [`ExecutorConfig::ranks`]. Rank zero owns the engine's
+/// rings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Rank(usize);
+
+impl Rank {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(rank: usize) -> Self {
+        Self(rank)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl fmt::Display for Rank {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 

@@ -7,15 +7,177 @@
 
 pub mod batch;
 pub mod config;
+pub mod executor;
+pub mod forward;
 pub mod logits;
 pub mod sampler;
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use atoma_core::dispatch::{DispatchDecision, EagerReason};
-    use atoma_core::request::{SamplingParams, PADDING_TOKEN};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use atoma_core::attention::{
+        BackendDeclaration, CaptureContract, ModelDeclaration, SupportLevel,
+    };
+    use atoma_core::dispatch::{BucketLadder, DispatchConfig, DispatchDecision, EagerReason};
+    use atoma_core::engine::{EngineConfig, EngineHandle};
+    use atoma_core::kv::HashAlgorithm;
+    use atoma_core::request::{
+        egress, EgressReceiver, NewRequest, Priority, SamplingParams, StopCriteria, PADDING_TOKEN,
+    };
+    use atoma_core::scheduler::{AdmissionPolicy, SchedulerConfig};
     use atoma_core::step::{CommandEntry, StepCommand};
-    use atoma_core::types::{BlockId, RequestCount, RequestId, RequestSlot, SequenceIndex, StepId};
+    use atoma_core::types::{
+        BlockId, RequestCount, RequestId, RequestSlot, SequenceIndex, StepId, TokenCount,
+    };
+    use thiserror::Error;
+
+    use crate::batch::BatchLayout;
+    use crate::forward::Forward;
+    use crate::logits::Logits;
+
+    pub(crate) const BLOCK_SIZE: TokenCount = TokenCount::new(4).expect("nonzero");
+    const MAX_BATCH: usize = 4;
+    const BLOCKS: u32 = 16;
+    const EOS: u32 = 99;
+    const VOCAB: usize = 128;
+
+    /// How long a test waits on a thread before calling it wedged: generous, since a loaded
+    /// runner is slow rather than broken.
+    pub(crate) const WAIT: Duration = Duration::from_secs(30);
+
+    /// An idle deadline longer than any test, so a test that finishes proves the thread was
+    /// woken rather than that it passed at its deadline.
+    const LONG_DEADLINE: Duration = Duration::from_mins(5);
+
+    fn tokens(value: usize) -> TokenCount {
+        TokenCount::new(value).expect("test token counts are nonzero")
+    }
+
+    fn requests(value: usize) -> RequestCount {
+        RequestCount::new(value).expect("test request counts are nonzero")
+    }
+
+    /// A small engine: four-token blocks, batches of four, a slab of eight.
+    pub(crate) fn engine_config() -> EngineConfig {
+        EngineConfig {
+            scheduler: SchedulerConfig {
+                token_budget: tokens(64),
+                max_batch: requests(MAX_BATCH),
+                max_model_len: tokens(32),
+                block_size: BLOCK_SIZE,
+                window: requests(8),
+                admission: AdmissionPolicy::Fcfs,
+                max_requests: requests(8),
+                max_client_backlog: tokens(1024),
+                eos_token_ids: vec![EOS],
+                hash_algorithm: HashAlgorithm::Sha256V1,
+            },
+            dispatch: DispatchConfig {
+                bucket_ladder: BucketLadder::new(vec![1, 2, 4]).expect("nonempty"),
+                captured_max_requests: requests(MAX_BATCH),
+            },
+            block_count: BLOCKS,
+            ingress_capacity: requests(8),
+            idle_deadline: LONG_DEADLINE,
+        }
+    }
+
+    /// One backend that captures anything and a model that breaks nothing.
+    pub(crate) fn contract() -> CaptureContract {
+        CaptureContract::resolve(
+            &[BackendDeclaration::new(
+                "test-backend",
+                SupportLevel::Always,
+            )],
+            &ModelDeclaration::new("test-model"),
+        )
+    }
+
+    /// Submits a greedy request of `prompt_len` tokens asking for `max_new_tokens`.
+    pub(crate) fn submit(
+        handle: &EngineHandle,
+        prompt_len: usize,
+        max_new_tokens: usize,
+    ) -> EgressReceiver {
+        let (sender, receiver) = egress();
+        let request = NewRequest {
+            prompt: (1..=u32::try_from(prompt_len).expect("fits u32")).collect(),
+            sampling: SamplingParams::default(),
+            stop: StopCriteria {
+                max_new_tokens: tokens(max_new_tokens),
+                ignore_eos: false,
+            },
+            priority: Priority::default(),
+            egress: sender,
+        };
+        handle.ingress.try_send(request).expect("ingress has room");
+        receiver
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Error)]
+    #[error("the fake forward was told to fail at step {step}")]
+    pub(crate) struct FakeForwardError {
+        pub(crate) step: u64,
+    }
+
+    /// A forward whose every selected row peaks at one chosen token, so greedy sampling returns
+    /// it; it can be told to fail at a step, and it keeps every command it served.
+    pub(crate) struct FakeForward {
+        token: u32,
+        fail_at_step: Option<u64>,
+        logits: Vec<f32>,
+        served: Arc<Mutex<Vec<StepCommand>>>,
+    }
+
+    impl FakeForward {
+        pub(crate) fn constant(token: u32) -> Self {
+            Self {
+                token,
+                fail_at_step: None,
+                logits: Vec::new(),
+                served: Arc::default(),
+            }
+        }
+
+        pub(crate) fn failing_at_step(mut self, step: u64) -> Self {
+            self.fail_at_step = Some(step);
+            self
+        }
+
+        /// Every command served so far, shared with whoever holds the clone.
+        pub(crate) fn served(&self) -> Arc<Mutex<Vec<StepCommand>>> {
+            Arc::clone(&self.served)
+        }
+    }
+
+    impl Forward for FakeForward {
+        type Error = FakeForwardError;
+
+        fn forward(
+            &mut self,
+            command: &StepCommand,
+            layout: &BatchLayout,
+        ) -> Result<Logits<'_>, FakeForwardError> {
+            if self.fail_at_step == Some(command.step.get()) {
+                return Err(FakeForwardError {
+                    step: command.step.get(),
+                });
+            }
+            self.served
+                .lock()
+                .expect("served lock")
+                .push(command.clone());
+            let rows = layout.selected.len();
+            self.logits.clear();
+            self.logits.resize(rows * VOCAB, 0.0);
+            for row in 0..rows {
+                self.logits[row * VOCAB + self.token as usize] = 1.0;
+            }
+            Ok(Logits::new(&self.logits, VOCAB))
+        }
+    }
 
     /// An entry for `request` in the slot of the same number, sampling under the default
     /// parameters when `samples`.
