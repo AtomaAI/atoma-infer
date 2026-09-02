@@ -80,6 +80,12 @@ impl ControlSender {
             Err(TrySendError::Full(control) | TrySendError::Disconnected(control)) => Err(control),
         }
     }
+
+    /// Whether the engine thread dropped its end: no control will ever be acted on again.
+    #[must_use]
+    pub fn engine_gone(&self) -> bool {
+        self.sender.is_disconnected()
+    }
 }
 
 impl ControlReceiver {

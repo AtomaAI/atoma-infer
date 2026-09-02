@@ -1,14 +1,8 @@
 //! OpenAI-compatible chat completion request and response types.
 
-use atoma_backends::{
-    GenerateParameters, GenerateRequest, GenerateRequestOutput, GenerateStreamingOutput,
-};
 use atoma_core::request::{SamplingParams, Usage as EngineUsage};
 use atoma_core::types::TokenCount;
-use std::{
-    collections::HashMap,
-    time::{Instant, SystemTime},
-};
+use std::collections::HashMap;
 use thiserror::Error;
 use utoipa::ToSchema;
 
@@ -913,50 +907,6 @@ impl RequestBody {
             stream: self.stream.unwrap_or(false),
         })
     }
-
-    /// The request the previous engine took. Goes with that engine.
-    pub fn to_generate_request(self, request_id: String) -> GenerateRequest {
-        let model = self.model();
-        let inputs = model.messages_to_prompt(self.messages());
-        let frequency_penalty = self.frequency_penalty();
-        let max_new_tokens = self.max_completion_tokens();
-        let decoder_input_details = self.logprobs().unwrap_or_default();
-        let repetition_penalty = self.presence_penalty();
-        let stop = match self.stop() {
-            Some(StopCondition::Array(stop_tokens)) => stop_tokens.clone(),
-            Some(StopCondition::String(stop_token)) => vec![stop_token.clone()],
-            None => Vec::new(),
-        };
-        let seed = self.seed();
-        let temperature = self.temperature();
-        let top_p = self.top_p();
-        let _user = self.user();
-        let n = self.n.unwrap_or(1);
-        let parameters = GenerateParameters {
-            best_of: None,
-            temperature,
-            repetition_penalty,
-            frequency_penalty,
-            max_new_tokens,
-            repeat_last_n: None,
-            top_k: None,
-            top_p,
-            typical_p: None,
-            do_sample: true,
-            return_full_text: Some(false),
-            stop,
-            truncate: None,
-            decoder_input_details,
-            random_seed: seed,
-            top_n_tokens: None,
-            n,
-        };
-        GenerateRequest {
-            request_id,
-            inputs,
-            parameters,
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -986,18 +936,6 @@ pub enum FinishReason {
     Stop,
     /// The completion budget, or the max model length, was reached.
     Length,
-}
-
-impl TryFrom<Option<&str>> for FinishReason {
-    type Error = String;
-
-    fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
-        match value {
-            Some("stopped") | None => Ok(FinishReason::Stop),
-            Some("length_capped") => Ok(FinishReason::Length),
-            Some(other) => Err(format!("Invalid finish reason: {other}")),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1065,67 +1003,6 @@ impl ChatCompletionResponse {
     }
 }
 
-impl TryFrom<(String, GenerateRequestOutput)> for ChatCompletionResponse {
-    type Error = String;
-
-    fn try_from((model, value): (String, GenerateRequestOutput)) -> Result<Self, Self::Error> {
-        let inference_outputs = value.inference_outputs;
-        let choices = inference_outputs
-            .iter()
-            .map(|output| {
-                Ok(Choice {
-                    index: output.index as u32,
-                    message: Message::Assistant {
-                        content: Some(MessageContent::Text(output.output_text.clone())),
-                        name: None,
-                        refusal: None,
-                        tool_calls: vec![],
-                    },
-                    logprobs: Some(
-                        serde_json::to_value(&output.logprobs)
-                            .map_err(|e| format!("Failed to convert logprobs to JSON: {}", e))?,
-                    ),
-                    finish_reason: FinishReason::try_from(output.finish_reason.as_deref())?,
-                })
-            })
-            .collect::<Result<Vec<Choice>, Self::Error>>()?;
-        let prompt_tokens = value.prompt_token_ids.len() as u32;
-        let completion_tokens = inference_outputs
-            .iter()
-            .map(|o| o.token_ids.len())
-            .sum::<usize>() as u32;
-        let total_tokens = prompt_tokens + completion_tokens;
-
-        let now = Instant::now();
-        let finished_time = value
-            .metrics
-            .read()
-            .expect("Failed to read metrics from the inference output response")
-            .finished_time
-            .ok_or("Finished time not found")?;
-        let duration = now.duration_since(finished_time);
-        let system_now = SystemTime::now();
-        let system_duration = system_now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Failed to get system duration");
-        let created = system_duration.as_millis() as u64 - duration.as_millis() as u64;
-
-        Ok(ChatCompletionResponse {
-            id: value.request_id,
-            object: "chat.completions".into(),
-            created,
-            model,
-            system_fingerprint: "vllm".into(),
-            choices,
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-            },
-        })
-    }
-}
-
 /// Represents a chunk of a streaming chat completion response.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ChatCompletionChunk {
@@ -1175,48 +1052,6 @@ pub struct Delta {
     /// A list of tool calls made by the assistant, if any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
-}
-
-impl TryFrom<(String, GenerateStreamingOutput)> for ChatCompletionChunk {
-    type Error = String;
-
-    fn try_from((model, value): (String, GenerateStreamingOutput)) -> Result<Self, Self::Error> {
-        let id = value.request_id;
-        let created = value.created;
-        let usage = Usage {
-            prompt_tokens: value.num_prompt_tokens as u32,
-            completion_tokens: value.num_completion_tokens as u32,
-            total_tokens: value.num_prompt_tokens as u32 + value.num_completion_tokens as u32,
-        };
-        let choices = vec![StreamChoice {
-            index: 0,
-            delta: Delta {
-                role: "assistant".into(),
-                content: Some(value.output_text),
-                refusal: None,
-                tool_calls: vec![],
-            },
-            logprobs: Some(
-                serde_json::to_value(&value.logprobs)
-                    .map_err(|e| format!("Failed to convert logprobs to JSON: {}", e))?,
-            ),
-            finish_reason: value
-                .finish_reason
-                .as_deref()
-                .map(|reason| FinishReason::try_from(Some(reason)))
-                .transpose()?,
-        }];
-        let chunk = ChatCompletionChunk {
-            id,
-            object: "chat.completion.chunk".into(),
-            created,
-            model,
-            system_fingerprint: "vllm".into(),
-            choices,
-            usage,
-        };
-        Ok(chunk)
-    }
 }
 
 /// The chunks a streamed request is made of: the text as it comes, then the finish.

@@ -1,0 +1,77 @@
+# Everything the server is built from: the engine thread, the executor threads, the model and the
+# server itself. Copy this file to `config.toml` and set the model, the device and core of each
+# rank, and where to listen.
+#
+# Every field can be overridden by an environment variable under `ATOMA_`, nesting with `__`:
+# `ATOMA_ENGINE__SCHEDULER__TOKEN_BUDGET=4096` sets `token_budget` in `[engine.scheduler]`, and
+# `ATOMA_SERVER__BIND=0.0.0.0:9000` sets `bind` in `[server]`. A Hugging Face token is read from
+# the `HF_TOKEN` environment variable.
+
+# What the engine thread is built from, fixed for the process lifetime.
+[engine]
+# KV blocks allocated on every rank's device, before the padding reservation. Allocated as
+# written; a device that cannot hold them refuses to start.
+block_count = 4096
+# Requests ingress holds beyond what the slab has room for; the burst buffer behind the 429.
+ingress_capacity = 256
+# How long the engine thread parks with nothing to do before re-examining its queues.
+idle_deadline_millis = 5
+
+[engine.scheduler]
+# Query tokens one step may compute, summed over entries.
+token_budget = 8192
+# Entries one step may hold. Never above `dispatch.captured_max_requests`, and never above
+# `max_requests`, which is the population a batch is drawn from.
+max_batch = 32
+# The longest sequence the model serves. A request whose prompt leaves no room under it is
+# refused; one that asks for no completion budget gets the room left.
+max_model_len = 4096
+# Tokens per KV block.
+block_size = 16
+# Admission candidates one pass examines.
+window = 32
+# How admission orders the window: "fcfs", "longest_prefix_match" or "priority".
+admission = "longest_prefix_match"
+# Requests the slab holds at once — running, waiting and preempted together — before ingress is
+# refused.
+max_requests = 256
+# Generated tokens a client may leave unread on its egress channel before its request is retired.
+max_client_backlog = 1024
+# The model's end-of-sequence token ids. Startup refuses to run when these are not what the
+# model's config.json declares; these are Llama 3.2 Instruct's.
+eos_token_ids = [ 128001, 128008, 128009 ]
+# The chain-hash algorithm block identity is minted under.
+hash_algorithm = "sha256_v1"
+
+[engine.dispatch]
+# The token buckets the engine captures graphs for. Written order carries no meaning.
+bucket_ladder = [ 1, 1024, 128, 16, 2, 2048, 256, 32, 4, 4096, 512, 64, 8, 8192 ]
+# The largest request count any captured graph serves.
+captured_max_requests = 32
+
+# The executor: one pinned thread per rank.
+[executor]
+# One entry per rank, in rank order: the CUDA device the rank owns and the core its thread is
+# pinned to. Rank zero owns the engine's rings and samples; every further rank follows it, and
+# more than one rank needs a build with the `nccl` feature.
+ranks = [ { core = 2, device = 0 } ]
+
+# Where the model comes from and how it is loaded.
+[model]
+# The Hugging Face Hub repository.
+id = "meta-llama/Llama-3.2-1B-Instruct"
+# The revision to fetch.
+revision = "main"
+# Where fetched files are kept; the Hub's default cache when absent.
+# cache_dir = "/var/cache/atoma/models"
+# The dtype the weights are loaded in and the forward computes in: "bf16", "f16" or "f32".
+dtype = "bf16"
+
+# The HTTP server.
+[server]
+# The address and port to listen on.
+bind = "0.0.0.0:8080"
+# How often a keep-alive comment is written to a stream with nothing to say.
+keep_alive_millis = 100
+# How old the engine thread's heartbeat may be before `/healthz` reports the node unhealthy.
+heartbeat_stale_millis = 1000

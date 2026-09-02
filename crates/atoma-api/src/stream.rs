@@ -1,123 +1,111 @@
-use crate::api::chat_completions::ChatCompletionChunk;
-use atoma_backends::StreamResponse;
-use axum::{response::sse::Event, Error};
-use flume::{r#async::RecvStream, Receiver};
-use futures::stream::Stream;
+//! Streaming one request's completion as server-sent events: a chunk per piece of new text, the
+//! last chunk with the finish and the usage, then `[DONE]`.
+//!
+//! The engine's events are polled through a stream rather than a bare receiver so that a poll on
+//! an empty channel registers a waker: an SSE response that returns `Pending` without one is never
+//! polled again, and the client hangs until it gives up. The receiver is dropped the moment the
+//! request is over, which is the cancel a stop string matched here needs.
+
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-/// What the client is told when the engine retires a request before streaming anything.
-const STREAM_CLOSED_BEFORE_OUTPUT: &str = "the engine closed the stream before any output";
+use atoma_core::request::{EgressReceiver, RequestEvent};
+use axum::response::sse::Event;
+use axum::Error;
+use flume::r#async::RecvStream;
+use futures::stream::Stream;
+use serde_json::json;
 
-/// A structure for streaming chat completion chunks.
-///
-/// `Streamer` manages the reception of `ChatCompletionChunk`s and tracks the current status
-/// of the streaming process.
+use crate::completion::{Completion, Progress};
+
+/// What the client is told when the engine closes the request without a finish.
+const CLOSED_WITHOUT_FINISH: &str = "the engine closed the request without a finish";
+
+/// One streamed chat completion.
 pub struct Streamer {
-    /// The engine's messages for this request.
-    ///
-    /// This is a stream rather than a bare receiver so that a poll on an empty channel registers a
-    /// waker: an SSE response that returns `Pending` without one is never polled again, and the
-    /// client hangs until it gives up.
-    responses: RecvStream<'static, StreamResponse>,
-    /// The current status of the streaming process.
-    status: StreamStatus,
-    /// The model used for generating the output.
-    model: String,
+    /// The engine's events for this request; dropped once the request is over.
+    events: Option<RecvStream<'static, RequestEvent>>,
+    completion: Completion,
+    /// Events ready to go out: one engine event can yield several.
+    pending: VecDeque<Result<Event, Error>>,
 }
 
 impl Streamer {
-    /// Creates a new `Streamer` with the specified receiver and model.
-    pub fn new(receiver: Receiver<StreamResponse>, model: String) -> Self {
+    #[must_use]
+    pub fn new(receiver: EgressReceiver, completion: Completion) -> Self {
         Self {
-            responses: receiver.into_stream(),
-            status: StreamStatus::NotStarted,
-            model,
+            events: Some(receiver.into_stream()),
+            completion,
+            pending: VecDeque::new(),
         }
     }
-}
 
-/// Represents the various states of a streaming process.
-///
-/// This enum is used to track and communicate the current state of a `Streamer`,
-/// allowing for proper handling of different scenarios during streaming.
-#[derive(Debug, PartialEq, Eq)]
-pub enum StreamStatus {
-    /// Indicates that the streaming process has not started yet.
-    NotStarted,
-    /// Indicates that the streaming process has started and is actively receiving data.
-    ///
-    /// This is the initial state when a stream begins and is ready to process incoming chunks.
-    Started,
-    /// Indicates that the streaming process has completed successfully.
-    ///
-    /// This state is reached when all data has been received and processed without errors.
-    Completed,
-    /// Indicates that the streaming process has failed, with an associated error message.
-    ///
-    /// This state is used when an error occurs during streaming, providing context about the
-    /// failure.
-    Failed {
-        /// A descriptive error message explaining the reason for the failure.
-        error: String,
-    },
-    /// Indicates that the streaming process was interrupted before completion.
-    ///
-    /// This state is used when the stream is stopped prematurely, either by user action or system
-    /// events.
-    Interrupted {
-        /// A description of why the stream was interrupted.
-        reason: String,
-    },
+    /// Whether the request is over and everything owed has been yielded.
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        self.events.is_none() && self.pending.is_empty()
+    }
+
+    /// Queues `event` and, when it ends the request, drops the engine's channel.
+    fn handle(&mut self, event: RequestEvent) {
+        match self.completion.apply(event) {
+            Ok(Progress::Nothing) => {}
+            Ok(Progress::Text(text)) => self.queue_text(text),
+            Ok(Progress::Finished {
+                text,
+                finish_reason,
+                usage,
+            }) => {
+                self.queue_text(text);
+                self.pending.push_back(
+                    Event::default().json_data(self.completion.last_chunk(finish_reason, usage)),
+                );
+                self.pending.push_back(Ok(Event::default().data("[DONE]")));
+                self.events = None;
+            }
+            Ok(Progress::Failed(failed)) => {
+                self.queue_error(&failed.to_string(), failed.status().as_u16());
+            }
+            Err(error) => {
+                self.queue_error(&format!("a token cannot be decoded: {error}"), 500);
+            }
+        }
+    }
+
+    fn queue_text(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.pending
+            .push_back(Event::default().json_data(self.completion.chunk(text)));
+    }
+
+    /// Queues an error event and ends the request.
+    fn queue_error(&mut self, message: &str, status: u16) {
+        self.pending.push_back(
+            Event::default()
+                .json_data(json!({ "error": { "message": message, "status": status } })),
+        );
+        self.events = None;
+    }
 }
 
 impl Stream for Streamer {
     type Item = Result<Event, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // `Completed` and `Failed` are terminal: the request is over either way, and the client
-        // has already been told which it was.
-        if matches!(
-            self.status,
-            StreamStatus::Completed | StreamStatus::Failed { .. }
-        ) {
-            return Poll::Ready(None);
-        }
-
-        match Pin::new(&mut self.responses).poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) if self.status == StreamStatus::NotStarted => {
-                // The engine retired the request before it streamed anything — an aborted request,
-                // for instance. Saying so beats answering with an empty body.
-                self.status = StreamStatus::Failed {
-                    error: STREAM_CLOSED_BEFORE_OUTPUT.to_string(),
-                };
-                Poll::Ready(Some(Ok(Event::default().data(STREAM_CLOSED_BEFORE_OUTPUT))))
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Poll::Ready(Some(event));
             }
-            Poll::Ready(None) => {
-                // The engine dropped the request's sender part-way through.
-                self.status = StreamStatus::Interrupted {
-                    reason: "Stream disconnected".to_string(),
-                };
-                Poll::Ready(None)
-            }
-            Poll::Ready(Some(StreamResponse::Chunk(chunk))) => {
-                if self.status != StreamStatus::Started {
-                    self.status = StreamStatus::Started;
-                }
-                let response = ChatCompletionChunk::try_from((self.model.clone(), chunk))
-                    .map_err(Error::new)?;
-                Poll::Ready(Some(Event::default().json_data(response)))
-            }
-            Poll::Ready(Some(StreamResponse::Finished)) => {
-                self.status = StreamStatus::Completed;
-                Poll::Ready(Some(Ok(Event::default().data("[DONE]"))))
-            }
-            Poll::Ready(Some(StreamResponse::Error(error))) => {
-                self.status = StreamStatus::Failed {
-                    error: error.clone(),
-                };
-                Poll::Ready(Some(Ok(Event::default().data(error))))
+            let Some(events) = self.events.as_mut() else {
+                return Poll::Ready(None);
+            };
+            match Pin::new(events).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(event)) => self.handle(event),
+                Poll::Ready(None) => self.queue_error(CLOSED_WITHOUT_FINISH, 500),
             }
         }
     }
@@ -125,18 +113,17 @@ impl Stream for Streamer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-    use atoma_backends::GenerateStreamingOutput;
-    use futures::{
-        task::{waker, ArcWake},
-        StreamExt,
-    };
+    use atoma_core::request::{egress, EgressSender, FinishReason, RequestEvent, Usage};
+    use atoma_core::types::{RequestId, SequenceIndex};
+    use futures::task::{waker, ArcWake};
+    use futures::StreamExt;
 
     use super::*;
+    use crate::detokenize::Detokenizer;
+    use crate::test_support::tokenizer;
 
     /// A waker that counts how many times the stream asked to be polled again.
     struct CountingWaker {
@@ -149,130 +136,157 @@ mod tests {
         }
     }
 
-    fn chunk(output_text: &str) -> StreamResponse {
-        StreamResponse::Chunk(GenerateStreamingOutput {
-            request_id: "request".to_string(),
-            created: 0,
-            finish_reason: None,
-            logprobs: vec![],
-            num_prompt_tokens: 4,
-            num_completion_tokens: 1,
-            output_text: output_text.to_string(),
-        })
+    fn streamer(stop: Vec<String>) -> (EgressSender, Streamer) {
+        let (sender, receiver) = egress();
+        let completion = Completion::new(
+            "chatcmpl-1".into(),
+            "llama".into(),
+            17,
+            Detokenizer::new(tokenizer(), stop),
+            3,
+        );
+        (sender, Streamer::new(receiver, completion))
     }
 
-    /// The bytes an event will put on the wire. Axum keeps them inside the event, and its `Debug`
-    /// output is the only view of them from outside that crate.
-    fn event_data(event: Event) -> String {
+    fn token_events(text: &str) -> Vec<RequestEvent> {
+        tokenizer()
+            .encode(text, false)
+            .unwrap()
+            .get_ids()
+            .iter()
+            .map(|&token| RequestEvent::Token {
+                request: RequestId::new(1),
+                sequence: SequenceIndex::new(0),
+                token,
+            })
+            .collect()
+    }
+
+    fn finished(reason: FinishReason, generated: usize) -> RequestEvent {
+        RequestEvent::Finished {
+            request: RequestId::new(1),
+            reason,
+            usage: Usage {
+                prompt_tokens: 3,
+                generated_tokens: generated,
+            },
+        }
+    }
+
+    /// The bytes an event will put on the wire. Axum keeps them inside the event, and its
+    /// `Debug` output is the only view of them from outside that crate.
+    fn wire(event: Event) -> String {
         format!("{event:?}")
     }
 
+    async fn drain(streamer: Streamer) -> Vec<String> {
+        streamer
+            .map(|event| wire(event.expect("the streamer yielded an error")))
+            .collect()
+            .await
+    }
+
     #[test]
-    fn test_polling_an_empty_stream_registers_a_waker() {
-        let (sender, receiver) = flume::unbounded();
-        let mut streamer = Streamer::new(receiver, "model".to_string());
-        let counting_waker = Arc::new(CountingWaker {
+    fn polling_an_empty_stream_registers_a_waker() {
+        let (sender, mut streamer) = streamer(Vec::new());
+        let counting = Arc::new(CountingWaker {
             wakes: AtomicUsize::new(0),
         });
-        let waker = waker(counting_waker.clone());
+        let waker = waker(Arc::clone(&counting));
         let mut context = Context::from_waker(&waker);
 
         assert!(Pin::new(&mut streamer).poll_next(&mut context).is_pending());
-        assert_eq!(counting_waker.wakes.load(Ordering::SeqCst), 0);
-
-        sender.send(chunk("hello")).expect("Failed to send chunk");
-
-        assert_eq!(
-            counting_waker.wakes.load(Ordering::SeqCst),
-            1,
-            "a chunk arriving must wake the task polling the stream"
+        assert_eq!(counting.wakes.load(Ordering::SeqCst), 0);
+        for event in token_events("hi") {
+            sender.send(event);
+        }
+        assert!(
+            counting.wakes.load(Ordering::SeqCst) >= 1,
+            "an event arriving must wake the task polling the stream"
         );
         assert!(Pin::new(&mut streamer).poll_next(&mut context).is_ready());
     }
 
     #[tokio::test]
-    async fn test_chunks_are_streamed_until_the_finished_marker() {
-        let (sender, receiver) = flume::unbounded();
-        let streamer = Streamer::new(receiver, "model".to_string());
+    async fn text_chunks_are_followed_by_the_finish_and_done() {
+        let (sender, streamer) = streamer(Vec::new());
+        let tokens = token_events("hello");
+        let generated = tokens.len();
+        for event in tokens {
+            sender.send(event);
+        }
+        sender.send(finished(FinishReason::MaxNewTokens, generated));
 
-        sender.send(chunk("hello")).expect("Failed to send chunk");
-        sender.send(chunk(" world")).expect("Failed to send chunk");
-        sender
-            .send(StreamResponse::Finished)
-            .expect("Failed to send finish marker");
-
-        let events = streamer
-            .map(|event| event_data(event.expect("Streamer yielded an error")))
-            .collect::<Vec<_>>()
-            .await;
-
-        assert_eq!(events.len(), 3);
-        assert!(events[0].contains("hello"));
-        assert!(events[1].contains(" world"));
-        assert!(events[2].contains("[DONE]"));
-    }
-
-    /// The engine drops a request's sender when it retires the request, which has to end the SSE
-    /// response rather than leave the client waiting.
-    #[tokio::test]
-    async fn test_stream_ends_when_the_engine_drops_the_sender() {
-        let (sender, receiver) = flume::unbounded();
-        let mut streamer = Streamer::new(receiver, "model".to_string());
-
-        sender.send(chunk("hello")).expect("Failed to send chunk");
-        drop(sender);
-
-        assert!(streamer.next().await.is_some());
-        assert!(streamer.next().await.is_none());
-        assert_eq!(
-            streamer.status,
-            StreamStatus::Interrupted {
-                reason: "Stream disconnected".to_string()
-            }
-        );
-    }
-
-    /// A request the engine retired before it generated anything — an aborted request, say — has
-    /// to end the response with a reason rather than an empty body.
-    #[tokio::test]
-    async fn test_a_stream_closed_before_any_output_reports_why() {
-        let (sender, receiver) = flume::unbounded();
-        let mut streamer = Streamer::new(receiver, "model".to_string());
-        drop(sender);
-
-        let event = streamer
-            .next()
-            .await
-            .expect("Streamer ended without saying why")
-            .expect("Streamer yielded an error");
-        assert!(event_data(event).contains(STREAM_CLOSED_BEFORE_OUTPUT));
-        assert!(streamer.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_engine_errors_are_forwarded_to_the_client() {
-        let (sender, receiver) = flume::unbounded();
-        let mut streamer = Streamer::new(receiver, "model".to_string());
-
-        sender
-            .send(StreamResponse::Error("model failed".to_string()))
-            .expect("Failed to send error");
-
-        let event = streamer
-            .next()
-            .await
-            .expect("Streamer ended without forwarding the error")
-            .expect("Streamer yielded an error");
-        assert!(event_data(event).contains("model failed"));
-        assert_eq!(
-            streamer.status,
-            StreamStatus::Failed {
-                error: "model failed".to_string()
-            }
+        let events = drain(streamer).await;
+        assert!(events.len() >= 3, "{events:?}");
+        assert!(events[0].contains("chat.completion.chunk"), "{}", events[0]);
+        let last_chunk = &events[events.len() - 2];
+        assert!(
+            last_chunk.contains("\\\"finish_reason\\\":\\\"length\\\""),
+            "{last_chunk}"
         );
         assert!(
-            streamer.next().await.is_none(),
-            "a failed request has nothing left to stream"
+            last_chunk.contains(&format!("\\\"total_tokens\\\":{}", 3 + generated)),
+            "{last_chunk}"
+        );
+        assert!(events.last().unwrap().contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn a_stop_string_cancels_the_request_and_ends_the_stream_as_a_stop() {
+        let (sender, mut streamer) = streamer(vec!["ll".into()]);
+        for event in token_events("hello") {
+            sender.send(event);
+        }
+        let mut events = Vec::new();
+        while let Some(event) = streamer.next().await {
+            events.push(wire(event.unwrap()));
+        }
+        assert!(
+            sender.is_cancelled(),
+            "the receiver was dropped at the match, which is the cancel"
+        );
+        assert!(streamer.is_done());
+        let last_chunk = &events[events.len() - 2];
+        assert!(
+            last_chunk.contains("\\\"finish_reason\\\":\\\"stop\\\""),
+            "{last_chunk}"
+        );
+        assert!(events.last().unwrap().contains("[DONE]"));
+        assert_eq!(events.len(), 4, "h, e, the finish and DONE: {events:?}");
+        assert!(
+            events[0].contains("\\\"content\\\":\\\"h\\\""),
+            "{}",
+            events[0]
+        );
+        assert!(
+            events[1].contains("\\\"content\\\":\\\"e\\\""),
+            "{}",
+            events[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_fails_ends_the_stream_with_an_error_event() {
+        let (sender, streamer) = streamer(Vec::new());
+        sender.send(finished(FinishReason::ExecutorLost, 0));
+        let events = drain(streamer).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(events[0].contains("executor was lost"), "{}", events[0]);
+        assert!(events[0].contains("503"), "{}", events[0]);
+    }
+
+    #[tokio::test]
+    async fn a_channel_closed_without_a_finish_ends_the_stream_with_an_error_event() {
+        let (sender, streamer) = streamer(Vec::new());
+        for event in token_events("hi") {
+            sender.send(event);
+        }
+        drop(sender);
+        let events = drain(streamer).await;
+        assert!(
+            events.last().unwrap().contains(CLOSED_WITHOUT_FINISH),
+            "{events:?}"
         );
     }
 }
