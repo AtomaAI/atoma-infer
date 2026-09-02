@@ -128,7 +128,7 @@ impl KvGeometry {
         world_size: usize,
     ) -> Result<Self, DeviceError> {
         let kv_heads = config.num_key_value_heads;
-        if kv_heads % world_size != 0 {
+        if !kv_heads.is_multiple_of(world_size) {
             return Err(DeviceError::KvHeadsNotSplit {
                 kv_heads,
                 world_size,

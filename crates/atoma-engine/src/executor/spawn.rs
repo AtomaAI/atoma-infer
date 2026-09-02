@@ -69,6 +69,10 @@ struct RankPlan {
 ///
 /// Returns [`StartupError`] when no rank is configured, more than one is without NCCL, the
 /// collective cannot be opened, or any rank's thread cannot be spawned, pinned or built.
+///
+/// # Panics
+///
+/// Panics on a target whose pointer is narrower than the configured block count.
 pub fn spawn_ranks(
     engine: &EngineConfig,
     executor: &ExecutorConfig,
