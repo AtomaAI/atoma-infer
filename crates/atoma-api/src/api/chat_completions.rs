@@ -3,10 +3,13 @@
 use atoma_backends::{
     GenerateParameters, GenerateRequest, GenerateRequestOutput, GenerateStreamingOutput,
 };
+use atoma_core::request::SamplingParams;
+use atoma_core::types::TokenCount;
 use std::{
     collections::HashMap,
     time::{Instant, SystemTime},
 };
+use thiserror::Error;
 use utoipa::ToSchema;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -812,7 +815,106 @@ impl RequestBody {
     }
 }
 
+/// What the engine is asked on a chat completion's behalf, before the prompt is tokenized.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineRequest {
+    /// The conversation rendered through the model's chat template.
+    pub prompt: String,
+    pub sampling: SamplingParams,
+    /// The most tokens to generate when the request bounds it. When it does not, the bound is
+    /// the room left under the max model length, which is known only once the prompt is
+    /// tokenized.
+    pub max_new_tokens: Option<TokenCount>,
+    /// Strings that end generation where they appear; matched after detokenization.
+    pub stop: Vec<String>,
+    pub stream: bool,
+}
+
+/// A request the engine cannot serve as asked. Every variant answers with a 400.
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum Refused {
+    #[error("logprobs are not supported")]
+    Logprobs,
+    #[error("top_logprobs is not supported")]
+    TopLogprobs,
+    #[error("n must be 1; {n} choices are not supported")]
+    Choices { n: usize },
+    #[error("logit_bias is not supported")]
+    LogitBias,
+    #[error("temperature must be between 0 and 2, not {temperature}")]
+    Temperature { temperature: f32 },
+    #[error("top_p must be between 0 and 1, not {top_p}")]
+    TopP { top_p: f32 },
+    #[error("max_completion_tokens must be at least 1")]
+    NoCompletionTokens,
+}
+
 impl RequestBody {
+    /// The engine request this body asks for, or why it cannot be served.
+    ///
+    /// Sampling is on, as the API's default is the model's own distribution; a temperature of
+    /// zero is the request for greedy decoding, honoured by the sampler. `seed` is used when
+    /// given and `fresh_seed` otherwise, so an unseeded request is not reproducible by
+    /// accident. `frequency_penalty` is carried to the engine, which does not apply it yet;
+    /// `presence_penalty`, `tools` and `user` are accepted and not acted on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Refused`] for `logprobs`, `top_logprobs`, more than one choice, `logit_bias`, a
+    /// temperature outside 0 to 2, a `top_p` outside 0 to 1, or a completion budget of zero.
+    pub fn to_engine_request(&self, fresh_seed: u64) -> Result<EngineRequest, Refused> {
+        if self.logprobs == Some(true) {
+            return Err(Refused::Logprobs);
+        }
+        if self.top_logprobs.is_some() {
+            return Err(Refused::TopLogprobs);
+        }
+        if let Some(n) = self.n.filter(|&n| n != 1) {
+            return Err(Refused::Choices { n });
+        }
+        if self
+            .logit_bias
+            .as_ref()
+            .is_some_and(|bias| !bias.is_empty())
+        {
+            return Err(Refused::LogitBias);
+        }
+        let temperature = self.temperature.unwrap_or(1.0);
+        if !(0.0..=2.0).contains(&temperature) {
+            return Err(Refused::Temperature { temperature });
+        }
+        let top_p = self.top_p.unwrap_or(1.0);
+        if !(0.0..=1.0).contains(&top_p) {
+            return Err(Refused::TopP { top_p });
+        }
+        let max_new_tokens = match self.max_completion_tokens {
+            Some(budget) => {
+                Some(TokenCount::new(budget as usize).ok_or(Refused::NoCompletionTokens)?)
+            }
+            None => None,
+        };
+        let stop = match &self.stop {
+            Some(StopCondition::Array(strings)) => strings.clone(),
+            Some(StopCondition::String(string)) => vec![string.clone()],
+            None => Vec::new(),
+        };
+        Ok(EngineRequest {
+            prompt: self.model.messages_to_prompt(&self.messages),
+            sampling: SamplingParams {
+                temperature,
+                top_p,
+                do_sample: true,
+                seed: self.seed.unwrap_or(fresh_seed),
+                frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
+                ..SamplingParams::default()
+            },
+            max_new_tokens,
+            stop,
+            stream: self.stream.unwrap_or(false),
+        })
+    }
+
+    /// The request the previous engine took. Goes with that engine.
     pub fn to_generate_request(self, request_id: String) -> GenerateRequest {
         let model = self.model();
         let inputs = model.messages_to_prompt(self.messages());
@@ -1059,9 +1161,12 @@ impl TryFrom<(String, GenerateStreamingOutput)> for ChatCompletionChunk {
 pub mod tests {
     use serde_json::json;
 
+    use atoma_core::request::SamplingParams;
+    use atoma_core::types::TokenCount;
+
     use super::{
         messages, ChatCompletionChunk, ChatCompletionResponse, Choice, Delta, FinishReason,
-        Message, MessageContent, MessageContentPart, MessageContentPartImageUrl, Model,
+        Message, MessageContent, MessageContentPart, MessageContentPartImageUrl, Model, Refused,
         RequestBody, StreamChoice, ToolCall, ToolCallFunction, Usage,
     };
 
@@ -1103,11 +1208,119 @@ pub mod tests {
 
         let request_body: RequestBody =
             serde_json::from_str(json_request_body).expect("Harness body must deserialize");
-        let request = request_body.to_generate_request("request".to_string());
+        let request = request_body.to_engine_request(7).unwrap();
 
-        assert_eq!(request.parameters.temperature, Some(0.0));
-        assert_eq!(request.parameters.max_new_tokens, Some(128));
-        assert!(request.parameters.do_sample);
+        assert_eq!(request.sampling.temperature, 0.0);
+        assert!(request.sampling.do_sample);
+        assert_eq!(request.max_new_tokens, Some(TokenCount::new(128).unwrap()));
+        assert!(request.stream);
+        assert!(request.prompt.contains("Hello"));
+        assert!(request.stop.is_empty());
+    }
+
+    fn body(fields: serde_json::Value) -> RequestBody {
+        let mut body = json!({
+            "model": "meta-llama/Llama-3.2-1B-Instruct",
+            "messages": [{ "role": "user", "content": "Hi" }]
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn a_body_that_asks_for_nothing_samples_from_the_models_own_distribution() {
+        let request = body(json!({})).to_engine_request(42).unwrap();
+        assert_eq!(
+            request.sampling,
+            SamplingParams {
+                temperature: 1.0,
+                top_p: 1.0,
+                do_sample: true,
+                seed: 42,
+                frequency_penalty: 0.0,
+                ..SamplingParams::default()
+            }
+        );
+        assert_eq!(
+            request.max_new_tokens, None,
+            "the room left under the max model length"
+        );
+        assert!(!request.stream);
+        assert!(request.stop.is_empty());
+    }
+
+    #[test]
+    fn a_seed_given_is_kept_and_one_absent_is_the_fresh_one() {
+        assert_eq!(
+            body(json!({ "seed": 9 }))
+                .to_engine_request(42)
+                .unwrap()
+                .sampling
+                .seed,
+            9
+        );
+        assert_eq!(
+            body(json!({})).to_engine_request(42).unwrap().sampling.seed,
+            42
+        );
+    }
+
+    #[test]
+    fn stop_strings_arrive_as_one_or_several() {
+        assert_eq!(
+            body(json!({ "stop": "\n" }))
+                .to_engine_request(1)
+                .unwrap()
+                .stop,
+            ["\n"]
+        );
+        assert_eq!(
+            body(json!({ "stop": ["a", "b"] }))
+                .to_engine_request(1)
+                .unwrap()
+                .stop,
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn what_the_engine_cannot_honour_is_refused_by_name() {
+        let refused = |fields: serde_json::Value| body(fields).to_engine_request(1).unwrap_err();
+        assert_eq!(refused(json!({ "logprobs": true })), Refused::Logprobs);
+        assert_eq!(refused(json!({ "top_logprobs": 2 })), Refused::TopLogprobs);
+        assert_eq!(refused(json!({ "n": 2 })), Refused::Choices { n: 2 });
+        assert_eq!(
+            refused(json!({ "logit_bias": { "50256": -100 } })),
+            Refused::LogitBias
+        );
+        assert_eq!(
+            refused(json!({ "temperature": 2.5 })),
+            Refused::Temperature { temperature: 2.5 }
+        );
+        assert_eq!(
+            refused(json!({ "top_p": 1.5 })),
+            Refused::TopP { top_p: 1.5 }
+        );
+        assert_eq!(
+            refused(json!({ "max_completion_tokens": 0 })),
+            Refused::NoCompletionTokens
+        );
+        assert!(
+            refused(json!({ "n": 3 })).to_string().contains("3 choices"),
+            "the refusal names what was asked"
+        );
+    }
+
+    #[test]
+    fn the_unset_values_of_refusable_fields_are_accepted() {
+        assert!(body(json!({ "logprobs": false, "n": 1, "logit_bias": {} }))
+            .to_engine_request(1)
+            .is_ok());
+        assert!(body(json!({ "temperature": 0, "top_p": 0 }))
+            .to_engine_request(1)
+            .is_ok());
     }
 
     #[test]
