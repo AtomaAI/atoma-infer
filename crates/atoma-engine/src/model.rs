@@ -61,8 +61,8 @@ pub enum ModelError {
     /// The configured end-of-sequence ids are not the model's. Both are named so the
     /// configuration can be corrected.
     #[error(
-        "scheduler.eos_token_ids is {configured:?} but the model's {CONFIG_FILE} declares \
-         {model:?}; set scheduler.eos_token_ids to what the model declares"
+        "engine.scheduler.eos_token_ids is {configured:?} but the model's {CONFIG_FILE} declares \
+         {model:?}; set engine.scheduler.eos_token_ids to what the model declares"
     )]
     EosMismatch {
         configured: Vec<u32>,
