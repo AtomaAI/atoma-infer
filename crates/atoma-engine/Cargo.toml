@@ -13,8 +13,10 @@ candle-transformers = { workspace = true }
 core_affinity       = { workspace = true }
 crossbeam-utils     = { workspace = true }
 cudarc              = { workspace = true }
+hf-hub              = { workspace = true }
 rtrb                = { workspace = true }
 serde               = { workspace = true, features = [ "derive" ] }
+serde_json          = { workspace = true }
 thiserror           = { workspace = true }
 tracing             = { workspace = true }
 validator           = { workspace = true, features = [ "derive" ] }
@@ -22,6 +24,7 @@ validator           = { workspace = true, features = [ "derive" ] }
 [dev-dependencies]
 figment            = { workspace = true, features = [ "toml" ] }
 serde_json         = { workspace = true }
+tempfile           = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [lints.clippy]
