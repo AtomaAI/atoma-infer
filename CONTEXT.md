@@ -260,6 +260,13 @@ One row of a Scheduled: a sequence, its query length, and whether it samples. An
 only when its query reaches the sequence's total; a non-final prefill chunk does not.
 _Avoid_: scheduled tokens, scheduled sequence, batch item
 
+**Batch layout**:
+A step command laid out as the arrays the model forward takes: prefills first, then decodes,
+with every entry's tokens, positions and KV slots flattened in that order, the per-entry lengths
+and cumulative starts, the padded block tables, and the logits rows to select. Pure host
+arithmetic from the command; the forward re-derives nothing.
+_Avoid_: input metadata, model input, batch tensors (for the host arrays)
+
 **Uniform decode**:
 A Scheduled whose every entry has query length one. The condition full-graph replay requires.
 _Avoid_: decode-only, pure decode, all-decode
@@ -290,6 +297,12 @@ step command to every follower over a ring of its own; a follower runs the forwa
 produces nothing, since the leader alone reads logits back and samples. A follower going ends
 the leader, and the leader going ends every follower.
 _Avoid_: worker rank, replica, secondary
+
+**Feed**:
+The single-producer single-consumer ring from the leader to one follower, carrying each step
+command. A push wakes the follower and a pop wakes the leader, so the leader can wait on a full
+feed; either end dropping wakes the far side, which is how a rank's death is seen.
+_Avoid_: follower queue, broadcast channel, command channel
 
 **Ingress**:
 The bounded channel that carries requests into the engine thread. A refused send is overload.
