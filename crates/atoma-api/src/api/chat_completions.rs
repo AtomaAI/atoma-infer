@@ -3,7 +3,7 @@
 use atoma_backends::{
     GenerateParameters, GenerateRequest, GenerateRequestOutput, GenerateStreamingOutput,
 };
-use atoma_core::request::SamplingParams;
+use atoma_core::request::{SamplingParams, Usage as EngineUsage};
 use atoma_core::types::TokenCount;
 use std::{
     collections::HashMap,
@@ -978,12 +978,14 @@ pub struct Choice {
     pub finish_reason: FinishReason,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+/// Why a completion ended, in the API's own words: the model stopped, or the budget ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
-    Stopped,
-    LengthCapped,
-    ContentFilter,
+    /// The model emitted an end-of-sequence token, or a stop string was matched.
+    Stop,
+    /// The completion budget, or the max model length, was reached.
+    Length,
 }
 
 impl TryFrom<Option<&str>> for FinishReason {
@@ -991,20 +993,76 @@ impl TryFrom<Option<&str>> for FinishReason {
 
     fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
         match value {
-            Some("stopped") => Ok(FinishReason::Stopped),
-            Some("length_capped") => Ok(FinishReason::LengthCapped),
-            Some("content_filter") => Ok(FinishReason::ContentFilter),
-            None => Ok(FinishReason::Stopped),
-            _ => Err(format!("Invalid finish reason: {}", value.unwrap())),
+            Some("stopped") | None => Ok(FinishReason::Stop),
+            Some("length_capped") => Ok(FinishReason::Length),
+            Some(other) => Err(format!("Invalid finish reason: {other}")),
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+}
+
+impl Usage {
+    /// The usage of `prompt_tokens` and `completion_tokens`.
+    #[must_use]
+    pub fn new(prompt_tokens: usize, completion_tokens: usize) -> Self {
+        // A count past u32 is not a count this API will ever report; saturating names that
+        // rather than wrapping.
+        let prompt_tokens = u32::try_from(prompt_tokens).unwrap_or(u32::MAX);
+        let completion_tokens = u32::try_from(completion_tokens).unwrap_or(u32::MAX);
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        }
+    }
+}
+
+impl From<EngineUsage> for Usage {
+    fn from(usage: EngineUsage) -> Self {
+        Self::new(usage.prompt_tokens, usage.generated_tokens)
+    }
+}
+
+/// What this server reports as its configuration fingerprint.
+pub const SYSTEM_FINGERPRINT: &str = concat!("atoma-infer/", env!("CARGO_PKG_VERSION"));
+
+impl ChatCompletionResponse {
+    /// The one-choice response to a completed request.
+    #[must_use]
+    pub fn completed(
+        id: String,
+        model: String,
+        created: u64,
+        content: String,
+        finish_reason: FinishReason,
+        usage: Usage,
+    ) -> Self {
+        Self {
+            id,
+            object: "chat.completion".into(),
+            created,
+            model,
+            system_fingerprint: SYSTEM_FINGERPRINT.into(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text(content)),
+                    name: None,
+                    refusal: None,
+                    tool_calls: vec![],
+                },
+                logprobs: None,
+                finish_reason,
+            }],
+            usage,
+        }
+    }
 }
 
 impl TryFrom<(String, GenerateRequestOutput)> for ChatCompletionResponse {
@@ -1100,7 +1158,7 @@ pub struct StreamChoice {
     pub logprobs: Option<Value>,
     /// The reason why the model stopped generating tokens, if applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<String>,
+    pub finish_reason: Option<FinishReason>,
 }
 
 /// Represents the delta (incremental update) in a streaming chat completion response.
@@ -1142,7 +1200,11 @@ impl TryFrom<(String, GenerateStreamingOutput)> for ChatCompletionChunk {
                 serde_json::to_value(&value.logprobs)
                     .map_err(|e| format!("Failed to convert logprobs to JSON: {}", e))?,
             ),
-            finish_reason: value.finish_reason,
+            finish_reason: value
+                .finish_reason
+                .as_deref()
+                .map(|reason| FinishReason::try_from(Some(reason)))
+                .transpose()?,
         }];
         let chunk = ChatCompletionChunk {
             id,
@@ -1154,6 +1216,56 @@ impl TryFrom<(String, GenerateStreamingOutput)> for ChatCompletionChunk {
             usage,
         };
         Ok(chunk)
+    }
+}
+
+/// The chunks a streamed request is made of: the text as it comes, then the finish.
+impl ChatCompletionChunk {
+    /// A chunk carrying new text and nothing else.
+    #[must_use]
+    pub fn text(id: String, model: String, created: u64, content: String) -> Self {
+        Self::chunk(id, model, created, Some(content), None, Usage::new(0, 0))
+    }
+
+    /// The last chunk: no text, the finish reason and the usage.
+    #[must_use]
+    pub fn finished(
+        id: String,
+        model: String,
+        created: u64,
+        finish_reason: FinishReason,
+        usage: Usage,
+    ) -> Self {
+        Self::chunk(id, model, created, None, Some(finish_reason), usage)
+    }
+
+    fn chunk(
+        id: String,
+        model: String,
+        created: u64,
+        content: Option<String>,
+        finish_reason: Option<FinishReason>,
+        usage: Usage,
+    ) -> Self {
+        Self {
+            id,
+            object: "chat.completion.chunk".into(),
+            created,
+            model,
+            system_fingerprint: SYSTEM_FINGERPRINT.into(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: Delta {
+                    role: "assistant".into(),
+                    content,
+                    refusal: None,
+                    tool_calls: vec![],
+                },
+                logprobs: None,
+                finish_reason,
+            }],
+            usage,
+        }
     }
 }
 
@@ -2110,7 +2222,7 @@ pub mod tests {
                     "role": "assistant",
                     "content": "Hello, how can I help you today?"
                 },
-                "finish_reason": "stopped"
+                "finish_reason": "stop"
             }],
             "usage": {
                 "prompt_tokens": 9,
@@ -2139,7 +2251,7 @@ pub mod tests {
                 tool_calls: vec![],
             }
         );
-        assert_eq!(response.choices[0].finish_reason, FinishReason::Stopped);
+        assert_eq!(response.choices[0].finish_reason, FinishReason::Stop);
         assert_eq!(response.usage.prompt_tokens, 9);
         assert_eq!(response.usage.completion_tokens, 12);
         assert_eq!(response.usage.total_tokens, 21);
@@ -2153,30 +2265,75 @@ pub mod tests {
                 "role": "assistant",
                 "content": "Hello, how can I help you today?"
             },
-            "finish_reason": "stopped"
+            "finish_reason": "stop"
         });
 
         let choice: Choice = serde_json::from_value(json).unwrap();
 
         assert_eq!(choice.index, 0);
         assert!(matches!(choice.message, Message::Assistant { .. }));
-        assert!(matches!(choice.finish_reason, FinishReason::Stopped));
+        assert!(matches!(choice.finish_reason, FinishReason::Stop));
     }
 
     #[test]
     fn test_deserialize_finish_reason() {
         assert_eq!(
-            serde_json::from_str::<FinishReason>("\"stopped\"").unwrap(),
-            FinishReason::Stopped
+            serde_json::from_str::<FinishReason>("\"stop\"").unwrap(),
+            FinishReason::Stop
         );
         assert_eq!(
-            serde_json::from_str::<FinishReason>("\"length_capped\"").unwrap(),
-            FinishReason::LengthCapped
+            serde_json::from_str::<FinishReason>("\"length\"").unwrap(),
+            FinishReason::Length
         );
+        assert!(serde_json::from_str::<FinishReason>("\"content_filter\"").is_err());
+    }
+
+    #[test]
+    fn a_completed_response_is_one_assistant_choice_with_its_finish_and_usage() {
+        let response = ChatCompletionResponse::completed(
+            "chatcmpl-1".into(),
+            "llama".into(),
+            1_700_000_000,
+            "Hello!".into(),
+            FinishReason::Length,
+            Usage::new(9, 12),
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["object"], "chat.completion");
+        assert_eq!(json["created"], 1_700_000_000);
+        assert_eq!(json["choices"][0]["index"], 0);
+        assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(json["choices"][0]["message"]["content"], "Hello!");
+        assert_eq!(json["choices"][0]["finish_reason"], "length");
+        assert_eq!(json["usage"]["prompt_tokens"], 9);
+        assert_eq!(json["usage"]["completion_tokens"], 12);
+        assert_eq!(json["usage"]["total_tokens"], 21);
         assert_eq!(
-            serde_json::from_str::<FinishReason>("\"content_filter\"").unwrap(),
-            FinishReason::ContentFilter
+            serde_json::from_value::<ChatCompletionResponse>(json).unwrap(),
+            response
         );
+    }
+
+    #[test]
+    fn a_text_chunk_carries_the_text_alone_and_the_last_chunk_the_finish_and_usage() {
+        let text = ChatCompletionChunk::text("chatcmpl-1".into(), "llama".into(), 5, "Hel".into());
+        let json = serde_json::to_value(&text).unwrap();
+        assert_eq!(json["object"], "chat.completion.chunk");
+        assert_eq!(json["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(json["choices"][0]["delta"]["content"], "Hel");
+        assert!(json["choices"][0].get("finish_reason").is_none());
+
+        let last = ChatCompletionChunk::finished(
+            "chatcmpl-1".into(),
+            "llama".into(),
+            5,
+            FinishReason::Stop,
+            Usage::new(3, 2),
+        );
+        let json = serde_json::to_value(&last).unwrap();
+        assert!(json["choices"][0]["delta"].get("content").is_none());
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert_eq!(json["usage"]["total_tokens"], 5);
     }
 
     #[test]
@@ -2210,7 +2367,7 @@ pub mod tests {
                     {"can": -0.3, "may": -0.5}
                 ]
             },
-            "finish_reason": "stopped"
+            "finish_reason": "stop"
         });
 
         let choice: Choice = serde_json::from_value(json).unwrap();
@@ -2229,7 +2386,7 @@ pub mod tests {
                 ]
             })
         );
-        assert!(matches!(choice.finish_reason, FinishReason::Stopped));
+        assert!(matches!(choice.finish_reason, FinishReason::Stop));
     }
 
     #[test]

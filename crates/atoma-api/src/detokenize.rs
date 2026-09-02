@@ -102,9 +102,9 @@ impl Detokenizer {
     }
 
     /// Releases the held-back tail: what a request that finished without a stop still owes its
-    /// client.
+    /// client. Nothing is left to release after a stop, or a second time.
     #[must_use]
-    pub fn finish(mut self) -> String {
+    pub fn finish(&mut self) -> String {
         if self.stopped {
             return String::new();
         }
@@ -163,62 +163,10 @@ impl Detokenizer {
 mod tests {
     use std::sync::Arc;
 
-    use serde_json::json;
-    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
     use tokenizers::Tokenizer;
 
     use super::{Detokenizer, Emission};
-
-    /// A byte-level BPE tokenizer over every byte, with a few merges, built from the JSON a
-    /// `tokenizer.json` holds: no file, no Hub.
-    fn tokenizer() -> Arc<Tokenizer> {
-        let mut alphabet: Vec<char> = ByteLevel::alphabet().into_iter().collect();
-        alphabet.sort_unstable();
-        let mut vocab: Vec<(String, u32)> = alphabet
-            .iter()
-            .enumerate()
-            .map(|(id, &c)| (c.to_string(), u32::try_from(id).unwrap()))
-            .collect();
-        let merges = ["h e", "l l", "Ġ w", "o r"];
-        for merge in merges {
-            let merged = merge.replace(' ', "");
-            let id = u32::try_from(vocab.len()).unwrap();
-            vocab.push((merged, id));
-        }
-        let vocab: serde_json::Map<String, serde_json::Value> = vocab
-            .into_iter()
-            .map(|(token, id)| (token, json!(id)))
-            .collect();
-        let byte_level = json!({
-            "type": "ByteLevel",
-            "add_prefix_space": false,
-            "trim_offsets": true,
-            "use_regex": true
-        });
-        let spec = json!({
-            "version": "1.0",
-            "truncation": null,
-            "padding": null,
-            "added_tokens": [],
-            "normalizer": null,
-            "pre_tokenizer": byte_level,
-            "post_processor": null,
-            "decoder": byte_level,
-            "model": {
-                "type": "BPE",
-                "dropout": null,
-                "unk_token": null,
-                "continuing_subword_prefix": null,
-                "end_of_word_suffix": null,
-                "fuse_unk": false,
-                "byte_fallback": false,
-                "ignore_merges": false,
-                "vocab": vocab,
-                "merges": merges,
-            }
-        });
-        Arc::new(serde_json::from_value(spec).expect("a byte-level BPE tokenizer"))
-    }
+    use crate::test_support::tokenizer;
 
     fn ids(tokenizer: &Tokenizer, text: &str) -> Vec<u32> {
         tokenizer.encode(text, false).unwrap().get_ids().to_vec()

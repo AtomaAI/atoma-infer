@@ -11,6 +11,7 @@ use tokio::{net::TcpListener, sync::mpsc};
 use server::{run_server, AppState};
 
 pub mod api;
+pub mod completion;
 pub mod detokenize;
 pub mod server;
 pub mod stream;
@@ -74,4 +75,64 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(not(feature = "cuda"))]
 fn main() -> anyhow::Result<()> {
     anyhow::bail!("CUDA support is disabled; rebuild with `--features cuda`")
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+    use tokenizers::Tokenizer;
+
+    /// A byte-level BPE tokenizer over every byte, with a few merges, built from the JSON a
+    /// `tokenizer.json` holds: no file, no Hub.
+    pub(crate) fn tokenizer() -> Arc<Tokenizer> {
+        let mut alphabet: Vec<char> = ByteLevel::alphabet().into_iter().collect();
+        alphabet.sort_unstable();
+        let mut vocab: Vec<(String, u32)> = alphabet
+            .iter()
+            .enumerate()
+            .map(|(id, &c)| (c.to_string(), u32::try_from(id).unwrap()))
+            .collect();
+        let merges = ["h e", "l l", "Ġ w", "o r"];
+        for merge in merges {
+            let merged = merge.replace(' ', "");
+            let id = u32::try_from(vocab.len()).unwrap();
+            vocab.push((merged, id));
+        }
+        let vocab: serde_json::Map<String, serde_json::Value> = vocab
+            .into_iter()
+            .map(|(token, id)| (token, json!(id)))
+            .collect();
+        let byte_level = json!({
+            "type": "ByteLevel",
+            "add_prefix_space": false,
+            "trim_offsets": true,
+            "use_regex": true
+        });
+        let spec = json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": byte_level,
+            "post_processor": null,
+            "decoder": byte_level,
+            "model": {
+                "type": "BPE",
+                "dropout": null,
+                "unk_token": null,
+                "continuing_subword_prefix": null,
+                "end_of_word_suffix": null,
+                "fuse_unk": false,
+                "byte_fallback": false,
+                "ignore_merges": false,
+                "vocab": vocab,
+                "merges": merges,
+            }
+        });
+        Arc::new(serde_json::from_value(spec).expect("a byte-level BPE tokenizer"))
+    }
 }
