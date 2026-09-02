@@ -141,6 +141,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "serde",
  "serde_json",
+ "tokenizers",
  "tokio",
  "tower",
  "tracing",

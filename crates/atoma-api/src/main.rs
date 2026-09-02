@@ -11,6 +11,7 @@ use tokio::{net::TcpListener, sync::mpsc};
 use server::{run_server, AppState};
 
 pub mod api;
+pub mod detokenize;
 pub mod server;
 pub mod stream;
 
