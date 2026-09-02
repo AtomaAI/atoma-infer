@@ -16,12 +16,12 @@ use tracing::info;
 
 use crate::config::{DeviceOrdinal, ExecutorConfig, ModelConfig, Rank, RankConfig};
 use crate::device::forward::{Allocated, CudaForward};
-use crate::device::{read_config, Checkpoint, KvCache, KvGeometry, RankDevice, Weights};
+use crate::device::{Checkpoint, KvCache, KvGeometry, RankDevice, Weights};
 use crate::executor::{
     feed, launch, wait_all, Cause, Executor, ExecutorThread, Follower, FollowerRings, Launched,
     SpawnError,
 };
-use crate::model::ModelFiles;
+use crate::model::{llama_config, ModelFiles};
 use crate::readback::Readback;
 
 #[cfg(feature = "nccl")]
@@ -132,7 +132,7 @@ fn open_forward(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<C
     let context = RuntimeContext::new(ordinal.get())?;
     let allocation = Allocation::new(&context)?;
     let device = RankDevice::open(&allocation, ordinal)?;
-    let config = read_config(&plan.files.config)?;
+    let config = llama_config(&plan.files.config)?;
     #[cfg(feature = "nccl")]
     let communicator =
         Communicator::open(&allocation, &device, rank, plan.world_size, plan.collective)?;

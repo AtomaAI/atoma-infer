@@ -1,5 +1,5 @@
-//! Fetching the model's files from the Hub, and reading from them what is settled before any
-//! device is touched: the end-of-sequence ids the model declares.
+//! Fetching the model's files from the Hub, and reading what they declare: the end-of-sequence
+//! ids, settled before any device is touched, and the Llama configuration a device is built from.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
@@ -14,6 +14,9 @@ use thiserror::Error;
 use tracing::info;
 
 use crate::config::ModelConfig;
+
+#[cfg(feature = "cuda")]
+use models::llama::{Config, LlamaConfig};
 
 /// The environment variable a Hub token is read from.
 const HF_TOKEN: &str = "HF_TOKEN";
@@ -203,6 +206,17 @@ pub fn check_eos_token_ids(configured: &[u32], model: &[u32]) -> Result<(), Mode
         configured: configured.to_vec(),
         model: model.to_vec(),
     })
+}
+
+/// The model's Llama configuration as its `config.json` declares it.
+///
+/// # Errors
+///
+/// Returns [`ModelError`] when the file cannot be read or is not a Llama configuration.
+#[cfg(feature = "cuda")]
+pub fn llama_config(config: &Path) -> Result<Config, ModelError> {
+    let declared: LlamaConfig = read_json(config)?;
+    Ok(declared.into_config())
 }
 
 /// The JSON at `path`, read as `T`.

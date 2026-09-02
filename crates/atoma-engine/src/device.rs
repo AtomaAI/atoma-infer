@@ -9,7 +9,6 @@
 
 pub mod forward;
 
-use std::path::Path;
 use std::sync::Arc;
 
 use atoma_core::types::TokenCount;
@@ -17,13 +16,13 @@ use atoma_runtime::session::Allocation;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use cudarc::driver::CudaStream;
-use models::llama::{Config, LlamaConfig};
+use models::llama::Config;
 use models::FlashAttention;
 use thiserror::Error;
 use tracing::info;
 
 use crate::config::{DeviceOrdinal, Dtype};
-use crate::model::{read_json, ModelError, ModelFiles};
+use crate::model::ModelFiles;
 
 #[cfg(feature = "nccl")]
 use std::rc::Rc;
@@ -41,8 +40,6 @@ use crate::config::Rank;
 pub enum DeviceError {
     #[error(transparent)]
     Candle(#[from] candle_core::Error),
-    #[error(transparent)]
-    Model(#[from] ModelError),
     /// The key-value heads are shared out across the ranks whole, so their count must divide.
     #[error(
         "the model's {kv_heads} key-value heads do not split across {world_size} ranks; configure \
@@ -100,16 +97,6 @@ impl RankDevice {
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
     }
-}
-
-/// The model's configuration as its `config.json` declares it.
-///
-/// # Errors
-///
-/// Returns [`DeviceError::Model`] when the file cannot be read or is not a Llama configuration.
-pub fn read_config(config: &Path) -> Result<Config, DeviceError> {
-    let declared: LlamaConfig = read_json(config)?;
-    Ok(declared.into_config())
 }
 
 /// The KV cache's shape for one rank: how many blocks, of how many tokens, over how many of the
