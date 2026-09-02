@@ -4,7 +4,6 @@
 use std::any::Any;
 use std::error::Error;
 use std::io::ErrorKind;
-use std::mem;
 use std::panic::resume_unwind;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -99,6 +98,8 @@ enum Starting {
     Running,
     /// Could not start.
     Failed(SpawnError),
+    /// Dropped its report channel without reporting, which only a panic while starting does.
+    Panicked,
 }
 
 impl Launched {
@@ -125,27 +126,26 @@ impl Launched {
     }
 
     /// Looks once at whether the thread has reported.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the thread panicked while starting, carrying its panic on.
-    fn look(&mut self) -> Starting {
+    fn look(&self) -> Starting {
         match self.readiness.try_recv() {
             Ok(Ok(())) => Starting::Running,
             Ok(Err(error)) => Starting::Failed(error),
             Err(TryRecvError::Empty) => Starting::NotYet,
-            Err(TryRecvError::Disconnected) => {
-                // Only a panic drops the report channel without reporting; join to carry it on.
-                let join = thread::spawn(|| Ok(()));
-                let panicked = mem::replace(&mut self.join, join);
-                Self::resume_panic(panicked)
-            }
+            Err(TryRecvError::Disconnected) => Starting::Panicked,
+        }
+    }
+
+    /// The thread as running, once a look found it so.
+    fn running(self) -> ExecutorThread {
+        ExecutorThread {
+            rank: self.rank,
+            join: self.join,
         }
     }
 
     /// The thread reports before it returns, so a report that never came is a panic while
     /// starting; carries it on.
-    fn resume_panic<T>(join: JoinHandle<Result<(), ExecutorError>>) -> T {
+    fn resume_panic(join: JoinHandle<Result<(), ExecutorError>>) -> ! {
         let panic = join
             .join()
             .expect_err("the executor thread returned without reporting");
@@ -166,25 +166,26 @@ impl Launched {
 /// # Panics
 ///
 /// Panics when a thread panicked while starting, carrying its panic on.
-pub fn wait_all(mut launched: Vec<Launched>) -> Result<Vec<ExecutorThread>, SpawnError> {
-    let mut running: Vec<Option<ExecutorThread>> = (0..launched.len()).map(|_| None).collect();
-    while running.iter().any(Option::is_none) {
+pub fn wait_all(launched: Vec<Launched>) -> Result<Vec<ExecutorThread>, SpawnError> {
+    let mut starting: Vec<Option<Launched>> = launched.into_iter().map(Some).collect();
+    let mut running: Vec<Option<ExecutorThread>> = (0..starting.len()).map(|_| None).collect();
+    while starting.iter().any(Option::is_some) {
         let mut progressed = false;
-        for (slot, starting) in running.iter_mut().zip(launched.iter_mut()) {
-            if slot.is_some() {
+        for (slot, thread) in starting.iter_mut().zip(running.iter_mut()) {
+            let Some(launched) = slot else {
                 continue;
-            }
-            match starting.look() {
+            };
+            match launched.look() {
                 Starting::NotYet => {}
                 Starting::Failed(error) => return Err(error),
+                Starting::Panicked => {
+                    if let Some(panicked) = slot.take() {
+                        Launched::resume_panic(panicked.join);
+                    }
+                }
                 Starting::Running => {
                     progressed = true;
-                    let placeholder = thread::spawn(|| Ok(()));
-                    let join = mem::replace(&mut starting.join, placeholder);
-                    *slot = Some(ExecutorThread {
-                        rank: starting.rank,
-                        join,
-                    });
+                    *thread = slot.take().map(Launched::running);
                 }
             }
         }
