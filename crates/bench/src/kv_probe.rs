@@ -53,6 +53,20 @@ fn default_num_windows() -> usize {
     4
 }
 
+/// How often a stopped pool is read while it settles.
+///
+/// Deliberately not the sampling interval: an engine republishes its gauge on a tick of its own,
+/// and reading faster than it publishes would read the same stale value twice and call a pool
+/// settled that is still moving. A second covers the half-second tick `atoma-infer` publishes on.
+const SETTLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Readings that have to pass without the pool growing before it counts as settled.
+const SETTLED_READINGS: usize = 3;
+
+/// The most readings spent waiting for a pool to settle. A pool still climbing after this many is
+/// not lagging behind a run, and the drain check judges whatever it had reached.
+const SETTLE_READING_LIMIT: usize = 15;
+
 impl Default for KvProbeConfig {
     fn default() -> Self {
         Self {
@@ -293,8 +307,41 @@ impl KvProbe {
             }
         }
 
-        self.sample_into(&mut samples, started).await;
+        self.sample_settled(&mut samples, started).await;
         samples
+    }
+
+    /// Reads past the end of the run until the pool stops growing, leaving the settled reading
+    /// last for the drain check to judge.
+    ///
+    /// The last response reaching the harness is not the last block returning to the pool: the
+    /// request retires on the engine's own thread afterwards, and the engine republishes the gauge
+    /// on a tick of its own. Reading the count the instant the run ends therefore misses the
+    /// blocks of the batch that just finished, and reports a leak that settles moments later.
+    /// Waiting for the count to stop rising measures the pool instead of that lag, and cannot hide
+    /// a real leak: blocks that never come back never make the count rise, so the wait runs out at
+    /// [`SETTLE_READING_LIMIT`] with the shortfall still there for the drain check to fail on.
+    async fn sample_settled(&self, samples: &mut Vec<BlockSample>, started: Instant) {
+        let mut highest = 0;
+        let mut steady = 0;
+        for _ in 0..SETTLE_READING_LIMIT {
+            let taken = samples.len();
+            self.sample_into(samples, started).await;
+            match samples.last() {
+                Some(sample) if samples.len() > taken && sample.blocks > highest => {
+                    highest = sample.blocks;
+                    steady = 0;
+                }
+                Some(_) if samples.len() > taken => {
+                    steady += 1;
+                    if steady == SETTLED_READINGS {
+                        return;
+                    }
+                }
+                Some(_) | None => {}
+            }
+            tokio::time::sleep(SETTLE_INTERVAL).await;
+        }
     }
 
     /// Takes one sample, keeping it only if the gauge could be read.
