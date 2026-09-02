@@ -37,7 +37,7 @@ use uuid::Uuid;
 use crate::api::chat_completions::{
     ChatCompletionResponse, CompletionIdentity, EngineRequest, Refused, RequestBody,
 };
-use crate::completion::{Completion, Failed, Progress};
+use crate::completion::{Completion, ErrorKind, Failed, Progress};
 use crate::detokenize::Detokenizer;
 use crate::stream::Streamer;
 
@@ -276,16 +276,14 @@ async fn metrics_handler(State(prometheus_handle): State<PrometheusHandle>) -> i
 /// What a request that could not be served answers with.
 #[derive(Debug)]
 pub struct ApiError {
-    status: StatusCode,
-    kind: &'static str,
+    kind: ErrorKind,
     message: String,
     request_id: String,
 }
 
 impl ApiError {
-    fn new(status: StatusCode, kind: &'static str, message: String, request_id: &str) -> Self {
+    fn new(kind: ErrorKind, message: String, request_id: &str) -> Self {
         Self {
-            status,
             kind,
             message,
             request_id: request_id.to_owned(),
@@ -293,30 +291,15 @@ impl ApiError {
     }
 
     fn refused(refused: &Refused, request_id: &str) -> Self {
-        Self::new(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            refused.to_string(),
-            request_id,
-        )
+        Self::new(ErrorKind::InvalidRequest, refused.to_string(), request_id)
     }
 
     fn failed(failed: &Failed, request_id: &str) -> Self {
-        Self::new(
-            failed.status(),
-            failed.kind(),
-            failed.to_string(),
-            request_id,
-        )
+        Self::new(failed.kind(), failed.to_string(), request_id)
     }
 
     fn internal(message: String, request_id: &str) -> Self {
-        Self::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            message,
-            request_id,
-        )
+        Self::new(ErrorKind::Internal, message, request_id)
     }
 }
 
@@ -325,11 +308,11 @@ impl IntoResponse for ApiError {
         let body = Json(json!({
             "error": {
                 "message": self.message,
-                "type": self.kind,
+                "type": self.kind.as_str(),
                 "request_id": self.request_id,
             }
         }));
-        (self.status, body).into_response()
+        (self.kind.status(), body).into_response()
     }
 }
 
@@ -452,16 +435,14 @@ async fn submit(
         Ok(()) => {}
         Err(IngressRefused::Overload(_)) => {
             return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "overloaded",
+                ErrorKind::Overloaded,
                 "the engine cannot take another request right now".to_owned(),
                 request_id,
             ));
         }
         Err(IngressRefused::EngineGone(_)) => {
             return Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
+                ErrorKind::Unavailable,
                 "the engine is gone".to_owned(),
                 request_id,
             ));

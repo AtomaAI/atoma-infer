@@ -54,25 +54,53 @@ pub enum Failed {
     ExecutorLost,
 }
 
-impl Failed {
-    /// The status a request that failed this way answers with.
+/// The error type the client hears, in the API's words, and the status that goes with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    InvalidRequest,
+    Overloaded,
+    Unavailable,
+    Internal,
+}
+
+impl ErrorKind {
+    /// The `type` the error body carries.
     #[must_use]
-    pub fn status(&self) -> StatusCode {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::PromptTooLong { .. } | Self::EmptyPrompt => StatusCode::BAD_REQUEST,
-            Self::Backlogged { .. } | Self::Cancelled => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Shutdown | Self::ExecutorLost => StatusCode::SERVICE_UNAVAILABLE,
+            Self::InvalidRequest => "invalid_request_error",
+            Self::Overloaded => "overloaded",
+            Self::Unavailable => "unavailable",
+            Self::Internal => "internal_error",
         }
     }
 
-    /// The error type the client hears, in the API's words.
     #[must_use]
-    pub fn kind(&self) -> &'static str {
+    pub fn status(self) -> StatusCode {
         match self {
-            Self::PromptTooLong { .. } | Self::EmptyPrompt => "invalid_request_error",
-            Self::Backlogged { .. } | Self::Cancelled => "internal_error",
-            Self::Shutdown | Self::ExecutorLost => "unavailable",
+            Self::InvalidRequest => StatusCode::BAD_REQUEST,
+            Self::Overloaded => StatusCode::TOO_MANY_REQUESTS,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+}
+
+impl Failed {
+    /// The error type the client hears for a request that failed this way.
+    #[must_use]
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Self::PromptTooLong { .. } | Self::EmptyPrompt => ErrorKind::InvalidRequest,
+            Self::Backlogged { .. } | Self::Cancelled => ErrorKind::Internal,
+            Self::Shutdown | Self::ExecutorLost => ErrorKind::Unavailable,
+        }
+    }
+
+    /// The status a request that failed this way answers with.
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        self.kind().status()
     }
 }
 
@@ -340,12 +368,7 @@ mod tests {
                 panic!("{reason:?} is not a completion");
             };
             assert_eq!(failed.status(), status, "{failed}");
-            let kind = failed.kind();
-            assert!(
-                (status == StatusCode::BAD_REQUEST) == (kind == "invalid_request_error")
-                    && (status == StatusCode::SERVICE_UNAVAILABLE) == (kind == "unavailable"),
-                "{failed}: {status} as {kind}"
-            );
+            assert_eq!(failed.kind().status(), status, "{failed}");
         }
         assert!(Failed::PromptTooLong {
             prompt_tokens: 40,
