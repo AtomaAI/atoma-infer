@@ -14,8 +14,14 @@ _Avoid_: trace, record (as nouns)
 Launching a previously captured graph executable for one step.
 _Avoid_: playback, re-run
 
+**Capture session**:
+The value that carries one graph set through the three session phases, with consuming
+transitions between them. It lives and dies on the executor thread that runs it; the executor
+is the thread, never this value.
+_Avoid_: executor (for this value), executor session
+
 **Session phase**:
-One of the executor session's three — Allocation, Capture, Replay — each named for the
+One of the capture session's three — Allocation, Capture, Replay — each named for the
 operation it permits. Always written qualified: "phase" alone is ambiguous with request phase.
 _Avoid_: phase (unqualified), stage, mode
 
@@ -23,6 +29,17 @@ _Avoid_: phase (unqualified), stage, mode
 The first session phase. Allocation fixes every device address and binds every stream and
 communicator. Nothing is captured in it.
 _Avoid_: setup, init, startup
+
+**Descriptor**:
+A description of device work the capture session enqueues onto the capture stream. Its one
+implementation per backend — the descriptor seam — is the only place a raw stream handle
+appears.
+_Avoid_: launcher, enqueue callback, work item
+
+**Weight reload**:
+The explicit reload of model weights, and the one transition from Replay back to Allocation:
+new weights mean new baked addresses, so the graph set is torn down with the phase.
+_Avoid_: hot swap, weight refresh
 
 **Bucket**:
 One captured batch size. A live batch is padded up to the nearest bucket.

@@ -14,6 +14,8 @@ use cudarc::driver::sys::CUresult;
 use cudarc::driver::DriverError;
 use thiserror::Error;
 
+use crate::capture::CaptureState;
+
 /// Errors from the capture substrate, classified per driver status.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -117,6 +119,19 @@ pub enum RuntimeError {
     DiscardWithoutCapture,
 
     #[error(
+        "record with no warmup pass since the session's last recording; run the exact step at \
+         the graph's exact shape eagerly (Capture::warm_up) immediately before each record, so \
+         every lazy backend allocation lands outside the recording"
+    )]
+    RecordWithoutWarmup,
+
+    #[error(
+        "synchronize while the stream capture state is {0:?}: a synchronize would invalidate an \
+         active recording; end or discard the capture first"
+    )]
+    SyncWhileCapturing(CaptureState),
+
+    #[error(
         "dot-print path contains an interior NUL byte and cannot be passed to the driver; \
          choose a different output path"
     )]
@@ -209,6 +224,17 @@ mod tests {
 
         let wrong_thread = classified(CUresult::CUDA_ERROR_STREAM_CAPTURE_WRONG_THREAD);
         assert!(wrong_thread.to_string().contains("executor thread"));
+    }
+
+    #[test]
+    fn session_errors_direct_the_operator() {
+        let unwarmed = RuntimeError::RecordWithoutWarmup;
+        assert!(unwarmed.to_string().contains("warm_up"));
+        assert!(unwarmed.to_string().contains("exact shape"));
+
+        let mid_capture = RuntimeError::SyncWhileCapturing(CaptureState::Active);
+        assert!(mid_capture.to_string().contains("Active"));
+        assert!(mid_capture.to_string().contains("discard"));
     }
 
     #[test]

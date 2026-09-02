@@ -4,6 +4,8 @@
 use cudarc::driver::CudaSlice;
 
 use crate::capture::CapturedGraph;
+#[cfg(feature = "nccl")]
+use crate::communicator::Communicator;
 
 /// One captured graph together with every device buffer whose address is baked into it, so a
 /// dropped buffer cannot leave a dangling pointer in a live graph.
@@ -24,12 +26,13 @@ pub struct GraphEntry {
     graph: CapturedGraph,
     /// The communicator captured collectives run on. Last: abort blocks on live graphs.
     #[cfg(feature = "nccl")]
-    comm: Option<cudarc::nccl::Comm>,
+    comm: Option<Communicator>,
 }
 
 impl GraphEntry {
-    /// Takes ownership of the graph and every buffer it baked.
-    pub fn new(
+    /// Takes ownership of the graph and every buffer it baked. Entries are minted by the
+    /// session's record path alone.
+    pub(crate) fn new(
         inputs: Vec<CudaSlice<u8>>,
         outputs: Vec<CudaSlice<u8>>,
         workspaces: Vec<CudaSlice<u8>>,
@@ -48,15 +51,14 @@ impl GraphEntry {
     /// Attaches the communicator the captured collectives run on; it outlives the graph and is
     /// torn down after it.
     #[cfg(feature = "nccl")]
-    pub fn with_comm(mut self, comm: cudarc::nccl::Comm) -> Self {
+    pub(crate) fn attach_comm(&mut self, comm: Communicator) {
         self.comm = Some(comm);
-        self
     }
 
     /// The communicator the captured collectives run on, for eager (non-replay) steps that must
-    /// issue the same collective outside the graph.
+    /// issue the same collective outside the graph. It reaches no stream.
     #[cfg(feature = "nccl")]
-    pub fn comm(&self) -> Option<&cudarc::nccl::Comm> {
+    pub fn comm(&self) -> Option<&Communicator> {
         self.comm.as_ref()
     }
 
@@ -66,8 +68,8 @@ impl GraphEntry {
     }
 
     /// Input buffers, written before each replay.
-    pub fn inputs_mut(&mut self) -> &mut [CudaSlice<u8>] {
-        &mut self.inputs
+    pub fn inputs(&self) -> &[CudaSlice<u8>] {
+        &self.inputs
     }
 
     /// Output buffers, read after each replay.
@@ -76,7 +78,7 @@ impl GraphEntry {
     }
 
     /// Kernel workspaces, handed to kernels that declare a workspace requirement.
-    pub fn workspaces_mut(&mut self) -> &mut [CudaSlice<u8>] {
-        &mut self.workspaces
+    pub fn workspaces(&self) -> &[CudaSlice<u8>] {
+        &self.workspaces
     }
 }

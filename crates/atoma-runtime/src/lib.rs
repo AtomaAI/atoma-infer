@@ -24,14 +24,19 @@
 //! |---|---|
 //! | [`context`] | Device context: construction, global event-tracking disable, loud no-driver failure |
 //! | [`stream`] | The dedicated capture stream, whose surface has no synchronize and no allocate |
-//! | [`capture`] | Capture lifecycle, end-capture instantiate/discard, raw-sys graph wrappers |
+//! | [`capture`] | Capture lifecycle, end-capture instantiate/discard, the captured graph |
 //! | [`graph_entry`] | Graph-lifetime ownership with load-bearing teardown order |
+//! | [`session`] | The capture session: phase-typed Allocation, Capture and Replay of one graph set |
+//! | `communicator` | The NCCL communicator behind a surface that reaches no stream (`nccl` feature only) |
 //! | [`arena`] | Activation addresses as a pure function of (bucket, layer, role) |
 //! | [`error`] | Driver statuses classified into named errors with remediation text |
 
 pub mod arena;
 pub mod capture;
+#[cfg(feature = "nccl")]
+pub mod communicator;
 pub mod context;
 pub mod error;
 pub mod graph_entry;
+pub mod session;
 pub mod stream;
