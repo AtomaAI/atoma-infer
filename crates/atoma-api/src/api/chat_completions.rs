@@ -835,6 +835,12 @@ pub enum Refused {
     Choices { n: usize },
     #[error("logit_bias is not supported")]
     LogitBias,
+    #[error("tools are not supported")]
+    Tools,
+    #[error("frequency_penalty is not applied; it must be 0 or unset, not {frequency_penalty}")]
+    FrequencyPenalty { frequency_penalty: f32 },
+    #[error("presence_penalty is not applied; it must be 0 or unset, not {presence_penalty}")]
+    PresencePenalty { presence_penalty: f32 },
     #[error("temperature must be between 0 and 2, not {temperature}")]
     Temperature { temperature: f32 },
     #[error("top_p must be between 0 and 1, not {top_p}")]
@@ -849,14 +855,27 @@ impl RequestBody {
     /// Sampling is on, as the API's default is the model's own distribution; a temperature of
     /// zero is the request for greedy decoding, honoured by the sampler. `seed` is used when
     /// given and `fresh_seed` otherwise, so an unseeded request is not reproducible by
-    /// accident. `frequency_penalty` is carried to the engine, which does not apply it yet;
-    /// `presence_penalty`, `tools` and `user` are accepted and not acted on.
+    /// accident. `user` is the caller's own identifier and is accepted without being acted on.
     ///
     /// # Errors
     ///
-    /// Returns [`Refused`] for `logprobs`, `top_logprobs`, more than one choice, `logit_bias`, a
-    /// temperature outside 0 to 2, a `top_p` outside 0 to 1, or a completion budget of zero.
+    /// Returns [`Refused`] for what the engine does not serve — `logprobs`, `top_logprobs`,
+    /// more than one choice, `logit_bias`, `tools`, a non-zero `frequency_penalty` or
+    /// `presence_penalty` — and for a temperature outside 0 to 2, a `top_p` outside 0 to 1, or
+    /// a completion budget of zero.
     pub fn to_engine_request(&self, fresh_seed: u64) -> Result<EngineRequest, Refused> {
+        self.refuse_unserved()?;
+        Ok(EngineRequest {
+            prompt: self.model.messages_to_prompt(&self.messages),
+            sampling: self.sampling(fresh_seed)?,
+            max_new_tokens: self.max_new_tokens()?,
+            stop: self.stop_strings(),
+            stream: self.stream.unwrap_or(false),
+        })
+    }
+
+    /// Refuses what the engine does not serve at all, when set to anything but its unset value.
+    fn refuse_unserved(&self) -> Result<(), Refused> {
         if self.logprobs == Some(true) {
             return Err(Refused::Logprobs);
         }
@@ -873,6 +892,15 @@ impl RequestBody {
         {
             return Err(Refused::LogitBias);
         }
+        if self.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+            return Err(Refused::Tools);
+        }
+        Ok(())
+    }
+
+    /// The sampling parameters the engine applies, refusing those out of range and the
+    /// penalties the sampler does not apply.
+    fn sampling(&self, fresh_seed: u64) -> Result<SamplingParams, Refused> {
         let temperature = self.temperature.unwrap_or(1.0);
         if !(0.0..=2.0).contains(&temperature) {
             return Err(Refused::Temperature { temperature });
@@ -881,31 +909,33 @@ impl RequestBody {
         if !(0.0..=1.0).contains(&top_p) {
             return Err(Refused::TopP { top_p });
         }
-        let max_new_tokens = match self.max_completion_tokens {
-            Some(budget) => {
-                Some(TokenCount::new(budget as usize).ok_or(Refused::NoCompletionTokens)?)
-            }
-            None => None,
-        };
-        let stop = match &self.stop {
+        if let Some(frequency_penalty) = self.frequency_penalty.filter(|&penalty| penalty != 0.0) {
+            return Err(Refused::FrequencyPenalty { frequency_penalty });
+        }
+        if let Some(presence_penalty) = self.presence_penalty.filter(|&penalty| penalty != 0.0) {
+            return Err(Refused::PresencePenalty { presence_penalty });
+        }
+        Ok(SamplingParams {
+            temperature,
+            top_p,
+            do_sample: true,
+            seed: self.seed.unwrap_or(fresh_seed),
+            ..SamplingParams::default()
+        })
+    }
+
+    fn max_new_tokens(&self) -> Result<Option<TokenCount>, Refused> {
+        self.max_completion_tokens
+            .map(|budget| TokenCount::new(budget as usize).ok_or(Refused::NoCompletionTokens))
+            .transpose()
+    }
+
+    fn stop_strings(&self) -> Vec<String> {
+        match &self.stop {
             Some(StopCondition::Array(strings)) => strings.clone(),
             Some(StopCondition::String(string)) => vec![string.clone()],
             None => Vec::new(),
-        };
-        Ok(EngineRequest {
-            prompt: self.model.messages_to_prompt(&self.messages),
-            sampling: SamplingParams {
-                temperature,
-                top_p,
-                do_sample: true,
-                seed: self.seed.unwrap_or(fresh_seed),
-                frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
-                ..SamplingParams::default()
-            },
-            max_new_tokens,
-            stop,
-            stream: self.stream.unwrap_or(false),
-        })
+        }
     }
 }
 
@@ -1198,7 +1228,6 @@ pub mod tests {
                 top_p: 1.0,
                 do_sample: true,
                 seed: 42,
-                frequency_penalty: 0.0,
                 ..SamplingParams::default()
             }
         );
@@ -1255,6 +1284,22 @@ pub mod tests {
             Refused::LogitBias
         );
         assert_eq!(
+            refused(json!({ "tools": [{ "type": "function", "function": { "name": "f" } }] })),
+            Refused::Tools
+        );
+        assert_eq!(
+            refused(json!({ "frequency_penalty": 0.5 })),
+            Refused::FrequencyPenalty {
+                frequency_penalty: 0.5
+            }
+        );
+        assert_eq!(
+            refused(json!({ "presence_penalty": -0.5 })),
+            Refused::PresencePenalty {
+                presence_penalty: -0.5
+            }
+        );
+        assert_eq!(
             refused(json!({ "temperature": 2.5 })),
             Refused::Temperature { temperature: 2.5 }
         );
@@ -1274,12 +1319,20 @@ pub mod tests {
 
     #[test]
     fn the_unset_values_of_refusable_fields_are_accepted() {
-        assert!(body(json!({ "logprobs": false, "n": 1, "logit_bias": {} }))
-            .to_engine_request(1)
-            .is_ok());
-        assert!(body(json!({ "temperature": 0, "top_p": 0 }))
-            .to_engine_request(1)
-            .is_ok());
+        assert!(
+            body(json!({ "logprobs": false, "n": 1, "logit_bias": {}, "tools": [] }))
+                .to_engine_request(1)
+                .is_ok()
+        );
+        assert!(body(json!({
+            "temperature": 0,
+            "top_p": 0,
+            "frequency_penalty": 0,
+            "presence_penalty": 0.0,
+            "user": "someone"
+        }))
+        .to_engine_request(1)
+        .is_ok());
     }
 
     #[test]

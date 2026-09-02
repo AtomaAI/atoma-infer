@@ -5,7 +5,8 @@
 //! over. The state is replaced when a slot changes hands — the request id in the entry is not the
 //! one the state was built for. A greedy entry takes the largest logit straight off its row; the
 //! rest go through candle's `LogitsProcessor` for temperature, top-k and top-p. A request's
-//! `typical_p` and `frequency_penalty` are carried but not applied here.
+//! `typical_p` and `frequency_penalty` are not applied here, and the API refuses a request that
+//! sets them.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
