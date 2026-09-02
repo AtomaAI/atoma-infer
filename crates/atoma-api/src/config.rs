@@ -66,10 +66,12 @@ mod tests {
     // signature is figment's, so the size is not ours to change.
     #![allow(clippy::result_large_err)]
 
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use atoma_core::config::{load, ConfigError};
+    use atoma_engine::config::Dtype;
     use figment::Jail;
 
     use super::Config;
@@ -81,7 +83,7 @@ mod tests {
             .join("../../config.example.toml")
             .canonicalize()
             .expect("the example configuration is at the repository root");
-        let source = std::fs::read_to_string(example).expect("the example configuration reads");
+        let source = fs::read_to_string(example).expect("the example configuration reads");
         Jail::expect_with(|jail| {
             jail.create_file("config.toml", &source)?;
             test(jail, Path::new("config.toml"));
@@ -109,7 +111,7 @@ mod tests {
             jail.set_env("ATOMA_MODEL__DTYPE", "f16");
             let config: Config = load(path).expect("the overridden configuration loads");
             assert_eq!(config.server.bind.to_string(), "127.0.0.1:9000");
-            assert_eq!(config.model.dtype, atoma_engine::config::Dtype::F16);
+            assert_eq!(config.model.dtype, Dtype::F16);
         });
     }
 

@@ -32,5 +32,6 @@ cuda = [ "atoma-engine/cuda" ]
 nccl = [ "atoma-engine/nccl", "cuda" ]
 
 [dev-dependencies]
-figment = { workspace = true, features = [ "test" ] }
-tower   = { workspace = true, features = [ "util" ] }
+crossbeam-utils = { workspace = true }
+figment         = { workspace = true, features = [ "test" ] }
+tower           = { workspace = true, features = [ "util" ] }

@@ -61,8 +61,12 @@ mod startup {
         let files = fetch(&config.model)?;
         let model_eos = eos_token_ids(&files.config)?;
         check_eos_token_ids(&config.engine.scheduler.eos_token_ids, &model_eos)?;
-        let tokenizer = Tokenizer::from_file(&files.tokenizer)
-            .map_err(|error| anyhow!("the tokenizer could not be loaded: {error}"))?;
+        let tokenizer = Tokenizer::from_file(&files.tokenizer).map_err(|error| {
+            anyhow!(
+                "the tokenizer at {} could not be loaded: {error}",
+                files.tokenizer.display()
+            )
+        })?;
 
         let (handle, rings, engine) = Engine::spawn(&config.engine, &contract(&config.model.id))?;
         let executors = match spawn_ranks(
@@ -99,9 +103,12 @@ mod startup {
 }
 
 #[cfg(feature = "cuda")]
+use tracing_subscriber::fmt::init as init_tracing;
+
+#[cfg(feature = "cuda")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
     startup::run().await
 }
 

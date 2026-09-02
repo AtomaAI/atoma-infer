@@ -8,7 +8,8 @@
 //! the engine thread does, joining every executor thread and reporting why any of them stopped.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context};
 use atoma_core::engine::{Control, ControlSender, EngineHandle, EngineThread, IngressRefused};
@@ -28,12 +29,14 @@ use tokenizers::Tokenizer;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::{signal, task, time};
-use tracing::{error, info, instrument, warn};
+use tracing::{error, info, instrument, warn, Span};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
-use crate::api::chat_completions::{ChatCompletionResponse, EngineRequest, Refused, RequestBody};
+use crate::api::chat_completions::{
+    ChatCompletionResponse, CompletionIdentity, EngineRequest, Refused, RequestBody,
+};
 use crate::completion::{Completion, Failed, Progress};
 use crate::detokenize::Detokenizer;
 use crate::stream::Streamer;
@@ -48,6 +51,11 @@ pub const METRICS_PATH: &str = "/metrics";
 pub const FREE_BLOCKS_GAUGE: &str = "atoma_engine_free_blocks";
 /// How often the free-block gauge is sampled from the engine.
 const GAUGE_INTERVAL: Duration = Duration::from_millis(500);
+/// How long the shutdown waits for the executor threads to return: a follower caught inside a
+/// collective when the leader died has no way back, and must not hold the process open.
+const EXECUTOR_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often the shutdown looks again at executor threads still running.
+const EXECUTOR_JOIN_POLL: Duration = Duration::from_millis(50);
 
 /// What every handler shares.
 #[derive(Clone)]
@@ -127,39 +135,76 @@ pub async fn run_server(
     join_executors(executors)
 }
 
-/// Joins every executor thread, returning the first cause any of them stopped on.
-fn join_executors(executors: Vec<ExecutorThread>) -> anyhow::Result<()> {
+/// Joins every executor thread that returns within [`EXECUTOR_JOIN_TIMEOUT`], reporting the
+/// first cause any of them stopped on, and giving up on any still running at the deadline.
+fn join_executors(mut executors: Vec<ExecutorThread>) -> anyhow::Result<()> {
+    let deadline = Instant::now() + EXECUTOR_JOIN_TIMEOUT;
     let mut failure = None;
-    for executor in executors {
-        let rank = executor.rank();
-        match executor.join() {
-            Ok(()) => info!(%rank, "executor thread returned"),
-            Err(cause) => {
-                error!(%rank, %cause, "executor thread failed");
-                failure.get_or_insert_with(|| anyhow!("executor rank {rank} failed: {cause}"));
+    while !executors.is_empty() {
+        let (finished, still_running): (Vec<_>, Vec<_>) =
+            executors.into_iter().partition(ExecutorThread::is_finished);
+        executors = still_running;
+        for executor in finished {
+            let rank = executor.rank();
+            match executor.join() {
+                Ok(()) => info!(%rank, "executor thread returned"),
+                Err(cause) => {
+                    error!(%rank, %cause, "executor thread failed");
+                    failure.get_or_insert_with(|| anyhow!("executor rank {rank} failed: {cause}"));
+                }
             }
         }
+        if executors.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let ranks: Vec<String> = executors.iter().map(|e| e.rank().to_string()).collect();
+            error!(ranks = ?ranks, "executor threads did not return; giving up on them");
+            failure.get_or_insert_with(|| {
+                anyhow!(
+                    "executor ranks {} did not return within {:?}",
+                    ranks.join(", "),
+                    EXECUTOR_JOIN_TIMEOUT
+                )
+            });
+            break;
+        }
+        thread::sleep(EXECUTOR_JOIN_POLL);
     }
     failure.map_or(Ok(()), Err)
 }
 
-/// Asks the engine for its state every [`GAUGE_INTERVAL`] and publishes the free block count,
-/// until the engine is gone.
+/// Publishes the engine's free block count every [`GAUGE_INTERVAL`], until the engine is gone.
 async fn publish_free_blocks(control: ControlSender) {
     let mut ticks = time::interval(GAUGE_INTERVAL);
     loop {
         ticks.tick().await;
-        let (reply, answer) = flume::bounded(1);
-        if control.try_send(Control::State { reply }).is_err() {
-            if control.engine_gone() {
-                return;
-            }
-            continue;
+        if control.engine_gone() {
+            return;
         }
-        if let Ok(state) = answer.recv_async().await {
-            gauge!(FREE_BLOCKS_GAUGE).set(state.free_blocks as f64);
+        if let Some(free_blocks) = sample_free_blocks(&control).await {
+            record_free_blocks(free_blocks);
         }
     }
+}
+
+/// Asks the engine for its state and returns its free block count, or nothing when the engine
+/// did not take the query or answer it.
+async fn sample_free_blocks(control: &ControlSender) -> Option<usize> {
+    let (reply, answer) = flume::bounded(1);
+    if control.try_send(Control::State { reply }).is_err() {
+        return None;
+    }
+    answer
+        .recv_async()
+        .await
+        .ok()
+        .map(|state| state.free_blocks)
+}
+
+/// Records `free_blocks` on the gauge the pool's watchers read.
+fn record_free_blocks(free_blocks: usize) {
+    gauge!(FREE_BLOCKS_GAUGE).set(free_blocks as f64);
 }
 
 /// Builds the HTTP router the server serves: the OpenAI-compatible endpoint, the operational
@@ -177,9 +222,9 @@ pub fn build_router(state: AppState, prometheus_handle: PrometheusHandle) -> Rou
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
 }
 
-/// Reports whether this node can still serve requests: the engine thread is there and its
-/// heartbeat is recent. Liveness is read from the thread that could wedge, not from this
-/// process being able to answer.
+/// Reports whether this node can still serve requests: the engine thread is there, has passed at
+/// least once, and its heartbeat is recent. Liveness is read from the thread that could wedge,
+/// not from this process being able to answer.
 #[instrument(skip_all)]
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     if state.engine.control.engine_gone() {
@@ -189,6 +234,15 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         );
     }
     let beat = state.engine.heartbeat.read();
+    if beat.pass == 0 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unavailable",
+                "reason": "the engine thread has not completed a pass yet",
+            })),
+        );
+    }
     let age = SystemTime::now()
         .duration_since(beat.at)
         .unwrap_or_default();
@@ -247,12 +301,12 @@ impl ApiError {
     }
 
     fn failed(failed: &Failed, request_id: &str) -> Self {
-        let kind = match failed.status() {
-            StatusCode::BAD_REQUEST => "invalid_request_error",
-            StatusCode::SERVICE_UNAVAILABLE => "unavailable",
-            _ => "internal_error",
-        };
-        Self::new(failed.status(), kind, failed.to_string(), request_id)
+        Self::new(
+            failed.status(),
+            failed.kind(),
+            failed.to_string(),
+            request_id,
+        )
     }
 
     fn internal(message: String, request_id: &str) -> Self {
@@ -300,8 +354,8 @@ fn unix_now() -> u64 {
     path = CHAT_COMPLETIONS_PATH,
     request_body = RequestBody,
     responses(
-        (status = 200, description = "The completion, whole or as server-sent events", body = ChatCompletionResponse),
-        (status = 400, description = "The request asks for what the engine cannot honour", body = serde_json::Value),
+        (status = 200, description = "The completion, whole or streamed", body = ChatCompletionResponse),
+        (status = 400, description = "Asks for what the engine cannot honour", body = serde_json::Value),
         (status = 429, description = "The engine is overloaded", body = serde_json::Value),
         (status = 503, description = "The engine is gone", body = serde_json::Value)
     ),
@@ -312,7 +366,7 @@ pub async fn completion_handler(
     Json(request): Json<RequestBody>,
 ) -> Result<Response, ApiError> {
     let request_id = next_request_id().to_string();
-    tracing::Span::current().record("request_id", request_id.as_str());
+    Span::current().record("request_id", request_id.as_str());
     let model = request.model().to_string();
     let engine_request = request
         .to_engine_request(rand::random())
@@ -405,14 +459,15 @@ async fn submit(
         }
     }
     let detokenizer = Detokenizer::new(Arc::clone(&state.tokenizer), stop);
-    let completion = Completion::new(
-        request_id.to_owned(),
+    let identity = CompletionIdentity {
+        id: request_id.to_owned(),
         model,
-        unix_now(),
-        detokenizer,
-        prompt_tokens,
-    );
-    Ok((receiver, completion))
+        created: unix_now(),
+    };
+    Ok((
+        receiver,
+        Completion::new(identity, detokenizer, prompt_tokens),
+    ))
 }
 
 /// Reads a request's events until it finishes and answers with the whole completion. Dropping
@@ -446,15 +501,15 @@ async fn collect(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::convert::Infallible;
-    use std::thread;
     use std::time::Duration;
 
     use atoma_core::attention::{
         BackendDeclaration, CaptureContract, ModelDeclaration, SupportLevel,
     };
     use atoma_core::dispatch::{BucketLadder, DispatchConfig};
-    use atoma_core::engine::{Engine, EngineConfig, EngineThread};
+    use atoma_core::engine::{control, heartbeat, ingress, Engine, EngineConfig, EngineThread};
     use atoma_core::kv::HashAlgorithm;
     use atoma_core::scheduler::{AdmissionPolicy, SchedulerConfig};
     use atoma_core::step::StepCommand;
@@ -465,6 +520,7 @@ mod tests {
     use atoma_engine::logits::Logits;
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Method, Request};
+    use crossbeam_utils::sync::Parker;
     use metrics_exporter_prometheus::PrometheusBuilder;
     use serde_json::{json, Value};
     use tokenizers::Tokenizer;
@@ -476,6 +532,8 @@ mod tests {
     const MAX_MODEL_LEN: usize = 512;
     const BLOCK_SIZE: usize = 16;
     const MAX_BATCH: usize = 4;
+    /// How long a test waits on the engine thread before calling it wedged.
+    const WAIT: Duration = Duration::from_secs(30);
 
     /// A forward whose every selected row peaks at one token, so greedy sampling returns it.
     struct ConstantForward {
@@ -554,6 +612,12 @@ mod tests {
         };
         let executor = Executor::new(rings, forward, TokenCount::new(BLOCK_SIZE).unwrap());
         let executor = thread::spawn(move || executor.run());
+        // Health reads the heartbeat, which the thread publishes after its first pass.
+        let started = Instant::now();
+        while handle.heartbeat.read().pass == 0 {
+            assert!(started.elapsed() < WAIT, "the engine thread never passed");
+            thread::sleep(Duration::from_millis(1));
+        }
         let state = AppState {
             engine: handle,
             tokenizer: Arc::clone(&tokenizer),
@@ -750,46 +814,68 @@ mod tests {
         assert!(body.contains("exited"), "{body}");
     }
 
+    /// An engine thread that is there but never passes again: its channels stay open and its
+    /// heartbeat stops. Health must read the beat, not the thread being there.
     #[tokio::test]
-    async fn a_stale_heartbeat_is_unhealthy() {
-        let served = serve("a", Duration::from_millis(1));
-        let router = served.router();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        // The engine passes at its idle deadline of a millisecond, so the beat is fresh; only a
-        // wedged thread would let it age. Age is measured against a threshold the beat can
-        // only fail by wedging, so a fresh beat passes even the tightest one here.
-        let (status, body) = get(router.clone(), HEALTHZ_PATH).await;
-        assert!(
-            status == StatusCode::OK || body.contains("ms old"),
-            "a beat is either fresh or reported stale by age: {status} {body}"
-        );
-        served.shutdown();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        let (status, _) = get(router, HEALTHZ_PATH).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    async fn a_wedged_engine_is_unhealthy_by_its_heartbeat_age() {
+        let parker = Parker::new();
+        let (ingress_sender, _ingress) = ingress(8, parker.unparker().clone());
+        let (control_sender, _control) = control(parker.unparker().clone());
+        let (publisher, reader) = heartbeat();
+        publisher.publish(1);
+        let state = AppState {
+            engine: EngineHandle {
+                ingress: ingress_sender,
+                control: control_sender,
+                heartbeat: reader,
+            },
+            tokenizer: tokenizer(),
+            max_model_len: MAX_MODEL_LEN,
+            keep_alive: Duration::from_millis(100),
+            heartbeat_stale_after: Duration::from_millis(5),
+        };
+        let router = build_router(state, PrometheusBuilder::new().build_recorder().handle());
+        time::sleep(Duration::from_millis(20)).await;
+        let (status, body) = get(router, HEALTHZ_PATH).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("ms old"), "{body}");
     }
 
     #[tokio::test]
-    async fn the_free_block_gauge_is_published_from_the_engines_state() {
+    async fn the_free_block_gauge_is_sampled_from_the_engine_and_recorded() {
         let served = serve("a", Duration::from_secs(30));
+        let free_blocks = sample_free_blocks(&served.state.engine.control)
+            .await
+            .expect("the engine answers a state query");
+        assert!(free_blocks > 0);
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
-        let control = served.state.engine.control.clone();
-        metrics::with_local_recorder(&recorder, || {
-            let (reply, answer) = flume::bounded(1);
-            control.try_send(Control::State { reply }).unwrap();
-            let state = answer.recv().unwrap();
-            gauge!(FREE_BLOCKS_GAUGE).set(state.free_blocks as f64);
-        });
+        metrics::with_local_recorder(&recorder, || record_free_blocks(free_blocks));
         let router = build_router(served.state.clone(), handle);
         let (status, body) = get(router, METRICS_PATH).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains(FREE_BLOCKS_GAUGE), "{body}");
+        assert!(
+            body.contains(&format!("{FREE_BLOCKS_GAUGE} {free_blocks}")),
+            "{body}"
+        );
         served.shutdown();
+        assert_eq!(
+            sample_free_blocks(&served_control_after_shutdown()).await,
+            None,
+            "a gone engine answers nothing"
+        );
+    }
+
+    /// A control sender whose engine has exited.
+    fn served_control_after_shutdown() -> ControlSender {
+        let parker = Parker::new();
+        let (sender, receiver) = control(parker.unparker().clone());
+        drop(receiver);
+        sender
     }
 
     #[tokio::test]
-    async fn test_chat_completions_is_mounted_as_a_post_route() {
+    async fn chat_completions_is_mounted_as_a_post_route() {
         let served = serve("a", Duration::from_secs(30));
         let (status, _) = get(served.router(), CHAT_COMPLETIONS_PATH).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
@@ -801,16 +887,16 @@ mod tests {
     /// Two requests must never share an id: ids key the engine's client channels, and a
     /// collision hands one client another's tokens.
     #[test]
-    fn test_request_ids_are_unique() {
+    fn request_ids_are_unique() {
         const NUM_IDS: usize = 1024;
         let ids = (0..NUM_IDS)
             .map(|_| next_request_id())
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<HashSet<_>>();
         assert_eq!(ids.len(), NUM_IDS);
     }
 
     #[test]
-    fn test_request_ids_carry_their_arrival_time() {
+    fn request_ids_carry_their_arrival_time() {
         let before = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards");
@@ -828,9 +914,9 @@ mod tests {
     /// Ids issued in different milliseconds sort by arrival, which is what makes them useful for
     /// ordering a log. Within one millisecond UUIDv7 makes no such promise.
     #[test]
-    fn test_request_ids_sort_by_arrival() {
+    fn request_ids_sort_by_arrival() {
         let earlier = next_request_id().to_string();
-        std::thread::sleep(Duration::from_millis(2));
+        thread::sleep(Duration::from_millis(2));
         let later = next_request_id().to_string();
         assert!(earlier < later, "{earlier} should sort before {later}");
     }

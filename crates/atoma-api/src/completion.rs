@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use thiserror::Error;
 
 use crate::api::chat_completions::{
-    ChatCompletionChunk, ChatCompletionResponse, FinishReason, Usage,
+    ChatCompletionChunk, ChatCompletionResponse, CompletionIdentity, FinishReason, Usage,
 };
 use crate::detokenize::{Detokenizer, Emission};
 
@@ -64,32 +64,36 @@ impl Failed {
             Self::Shutdown | Self::ExecutorLost => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
+
+    /// The error type the client hears, in the API's words.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::PromptTooLong { .. } | Self::EmptyPrompt => "invalid_request_error",
+            Self::Backlogged { .. } | Self::Cancelled => "internal_error",
+            Self::Shutdown | Self::ExecutorLost => "unavailable",
+        }
+    }
 }
 
 /// One request on its way from the engine's events to the client's response.
 pub struct Completion {
-    id: String,
-    model: String,
-    created: u64,
+    identity: CompletionIdentity,
     detokenizer: Detokenizer,
     prompt_tokens: usize,
     generated: usize,
 }
 
 impl Completion {
-    /// A completion known to the client as `id`, over `prompt_tokens` of prompt.
+    /// A completion known to the client by `identity`, over `prompt_tokens` of prompt.
     #[must_use]
     pub fn new(
-        id: String,
-        model: String,
-        created: u64,
+        identity: CompletionIdentity,
         detokenizer: Detokenizer,
         prompt_tokens: usize,
     ) -> Self {
         Self {
-            id,
-            model,
-            created,
+            identity,
             detokenizer,
             prompt_tokens,
             generated: 0,
@@ -129,32 +133,20 @@ impl Completion {
     /// A chunk of new text.
     #[must_use]
     pub fn chunk(&self, text: String) -> ChatCompletionChunk {
-        ChatCompletionChunk::text(self.id.clone(), self.model.clone(), self.created, text)
+        ChatCompletionChunk::text(&self.identity, text)
     }
 
     /// The last chunk.
     #[must_use]
     pub fn last_chunk(&self, finish_reason: FinishReason, usage: Usage) -> ChatCompletionChunk {
-        ChatCompletionChunk::finished(
-            self.id.clone(),
-            self.model.clone(),
-            self.created,
-            finish_reason,
-            usage,
-        )
+        ChatCompletionChunk::finished(&self.identity, finish_reason, usage)
     }
 
     /// The whole response, once finished.
     #[must_use]
     pub fn response(self, finish_reason: FinishReason, usage: Usage) -> ChatCompletionResponse {
-        ChatCompletionResponse::completed(
-            self.id,
-            self.model,
-            self.created,
-            self.detokenizer.text().to_owned(),
-            finish_reason,
-            usage,
-        )
+        let content = self.detokenizer.text().to_owned();
+        ChatCompletionResponse::completed(self.identity, content, finish_reason, usage)
     }
 }
 
@@ -191,7 +183,9 @@ mod tests {
     use axum::http::StatusCode;
 
     use super::{Completion, Failed, Progress};
-    use crate::api::chat_completions::{FinishReason, Usage};
+    use crate::api::chat_completions::{
+        CompletionIdentity, FinishReason, Message, MessageContent, Usage,
+    };
     use crate::detokenize::Detokenizer;
     use crate::test_support::tokenizer;
 
@@ -215,14 +209,12 @@ mod tests {
     }
 
     fn completion(stop: Vec<String>) -> Completion {
-        let tokenizer = tokenizer();
-        Completion::new(
-            "chatcmpl-1".into(),
-            "llama".into(),
-            17,
-            Detokenizer::new(tokenizer, stop),
-            3,
-        )
+        let identity = CompletionIdentity {
+            id: "chatcmpl-1".into(),
+            model: "llama".into(),
+            created: 17,
+        };
+        Completion::new(identity, Detokenizer::new(tokenizer(), stop), 3)
     }
 
     fn ids(text: &str) -> Vec<u32> {
@@ -311,14 +303,11 @@ mod tests {
         assert!(usage.completion_tokens >= 1);
         assert_eq!(
             completion.response(finish_reason, usage).choices[0].message,
-            {
-                use crate::api::chat_completions::{Message, MessageContent};
-                Message::Assistant {
-                    content: Some(MessageContent::Text("he".into())),
-                    name: None,
-                    refusal: None,
-                    tool_calls: vec![],
-                }
+            Message::Assistant {
+                content: Some(MessageContent::Text("he".into())),
+                name: None,
+                refusal: None,
+                tool_calls: vec![],
             }
         );
     }
@@ -351,6 +340,12 @@ mod tests {
                 panic!("{reason:?} is not a completion");
             };
             assert_eq!(failed.status(), status, "{failed}");
+            let kind = failed.kind();
+            assert!(
+                (status == StatusCode::BAD_REQUEST) == (kind == "invalid_request_error")
+                    && (status == StatusCode::SERVICE_UNAVAILABLE) == (kind == "unavailable"),
+                "{failed}: {status} as {kind}"
+            );
         }
         assert!(Failed::PromptTooLong {
             prompt_tokens: 40,

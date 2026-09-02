@@ -41,12 +41,6 @@ impl Streamer {
         }
     }
 
-    /// Whether the request is over and everything owed has been yielded.
-    #[must_use]
-    pub fn is_done(&self) -> bool {
-        self.events.is_none() && self.pending.is_empty()
-    }
-
     /// Queues `event` and, when it ends the request, drops the engine's channel.
     fn handle(&mut self, event: RequestEvent) {
         match self.completion.apply(event) {
@@ -122,6 +116,7 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
+    use crate::api::chat_completions::CompletionIdentity;
     use crate::detokenize::Detokenizer;
     use crate::test_support::tokenizer;
 
@@ -138,13 +133,12 @@ mod tests {
 
     fn streamer(stop: Vec<String>) -> (EgressSender, Streamer) {
         let (sender, receiver) = egress();
-        let completion = Completion::new(
-            "chatcmpl-1".into(),
-            "llama".into(),
-            17,
-            Detokenizer::new(tokenizer(), stop),
-            3,
-        );
+        let identity = CompletionIdentity {
+            id: "chatcmpl-1".into(),
+            model: "llama".into(),
+            created: 17,
+        };
+        let completion = Completion::new(identity, Detokenizer::new(tokenizer(), stop), 3);
         (sender, Streamer::new(receiver, completion))
     }
 
@@ -246,7 +240,6 @@ mod tests {
             sender.is_cancelled(),
             "the receiver was dropped at the match, which is the cancel"
         );
-        assert!(streamer.is_done());
         let last_chunk = &events[events.len() - 2];
         assert!(
             last_chunk.contains("\\\"finish_reason\\\":\\\"stop\\\""),

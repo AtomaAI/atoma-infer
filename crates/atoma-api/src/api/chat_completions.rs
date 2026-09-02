@@ -970,17 +970,25 @@ impl From<EngineUsage> for Usage {
 /// What this server reports as its configuration fingerprint.
 pub const SYSTEM_FINGERPRINT: &str = concat!("atoma-infer/", env!("CARGO_PKG_VERSION"));
 
+/// What identifies one completion in its response and in every chunk of its stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionIdentity {
+    pub id: String,
+    pub model: String,
+    /// Seconds since the Unix epoch when the request arrived.
+    pub created: u64,
+}
+
 impl ChatCompletionResponse {
     /// The one-choice response to a completed request.
     #[must_use]
     pub fn completed(
-        id: String,
-        model: String,
-        created: u64,
+        identity: CompletionIdentity,
         content: String,
         finish_reason: FinishReason,
         usage: Usage,
     ) -> Self {
+        let CompletionIdentity { id, model, created } = identity;
         Self {
             id,
             object: "chat.completion".into(),
@@ -1058,35 +1066,31 @@ pub struct Delta {
 impl ChatCompletionChunk {
     /// A chunk carrying new text and nothing else.
     #[must_use]
-    pub fn text(id: String, model: String, created: u64, content: String) -> Self {
-        Self::chunk(id, model, created, Some(content), None, Usage::new(0, 0))
+    pub fn text(identity: &CompletionIdentity, content: String) -> Self {
+        Self::chunk(identity, Some(content), None, Usage::new(0, 0))
     }
 
     /// The last chunk: no text, the finish reason and the usage.
     #[must_use]
     pub fn finished(
-        id: String,
-        model: String,
-        created: u64,
+        identity: &CompletionIdentity,
         finish_reason: FinishReason,
         usage: Usage,
     ) -> Self {
-        Self::chunk(id, model, created, None, Some(finish_reason), usage)
+        Self::chunk(identity, None, Some(finish_reason), usage)
     }
 
     fn chunk(
-        id: String,
-        model: String,
-        created: u64,
+        identity: &CompletionIdentity,
         content: Option<String>,
         finish_reason: Option<FinishReason>,
         usage: Usage,
     ) -> Self {
         Self {
-            id,
+            id: identity.id.clone(),
             object: "chat.completion.chunk".into(),
-            created,
-            model,
+            created: identity.created,
+            model: identity.model.clone(),
             system_fingerprint: SYSTEM_FINGERPRINT.into(),
             choices: vec![StreamChoice {
                 index: 0,
@@ -1112,10 +1116,18 @@ pub mod tests {
     use atoma_core::types::TokenCount;
 
     use super::{
-        messages, ChatCompletionChunk, ChatCompletionResponse, Choice, Delta, FinishReason,
-        Message, MessageContent, MessageContentPart, MessageContentPartImageUrl, Model, Refused,
-        RequestBody, StreamChoice, ToolCall, ToolCallFunction, Usage,
+        messages, ChatCompletionChunk, ChatCompletionResponse, Choice, CompletionIdentity, Delta,
+        FinishReason, Message, MessageContent, MessageContentPart, MessageContentPartImageUrl,
+        Model, Refused, RequestBody, StreamChoice, ToolCall, ToolCallFunction, Usage,
     };
+
+    fn identity(created: u64) -> CompletionIdentity {
+        CompletionIdentity {
+            id: "chatcmpl-1".into(),
+            model: "llama".into(),
+            created,
+        }
+    }
 
     #[test]
     fn deserialize_request_body_basic() {
@@ -2126,9 +2138,7 @@ pub mod tests {
     #[test]
     fn a_completed_response_is_one_assistant_choice_with_its_finish_and_usage() {
         let response = ChatCompletionResponse::completed(
-            "chatcmpl-1".into(),
-            "llama".into(),
-            1_700_000_000,
+            identity(1_700_000_000),
             "Hello!".into(),
             FinishReason::Length,
             Usage::new(9, 12),
@@ -2151,20 +2161,15 @@ pub mod tests {
 
     #[test]
     fn a_text_chunk_carries_the_text_alone_and_the_last_chunk_the_finish_and_usage() {
-        let text = ChatCompletionChunk::text("chatcmpl-1".into(), "llama".into(), 5, "Hel".into());
+        let text = ChatCompletionChunk::text(&identity(5), "Hel".into());
         let json = serde_json::to_value(&text).unwrap();
         assert_eq!(json["object"], "chat.completion.chunk");
         assert_eq!(json["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(json["choices"][0]["delta"]["content"], "Hel");
         assert!(json["choices"][0].get("finish_reason").is_none());
 
-        let last = ChatCompletionChunk::finished(
-            "chatcmpl-1".into(),
-            "llama".into(),
-            5,
-            FinishReason::Stop,
-            Usage::new(3, 2),
-        );
+        let last =
+            ChatCompletionChunk::finished(&identity(5), FinishReason::Stop, Usage::new(3, 2));
         let json = serde_json::to_value(&last).unwrap();
         assert!(json["choices"][0]["delta"].get("content").is_none());
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
