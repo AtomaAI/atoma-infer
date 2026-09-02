@@ -125,7 +125,7 @@ impl FollowerRings {
 pub struct Follower<F> {
     rings: FollowerRings,
     forward: F,
-    block_size: usize,
+    block_size: TokenCount,
 }
 
 impl<F: Forward> Follower<F> {
@@ -134,7 +134,7 @@ impl<F: Forward> Follower<F> {
         Self {
             rings,
             forward,
-            block_size: block_size.get(),
+            block_size,
         }
     }
 

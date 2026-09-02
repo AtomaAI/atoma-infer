@@ -12,6 +12,7 @@ pub mod forward;
 use std::path::Path;
 use std::sync::Arc;
 
+use atoma_core::types::TokenCount;
 use atoma_runtime::session::Allocation;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -133,7 +134,7 @@ impl KvGeometry {
     pub fn new(
         config: &Config,
         block_count: usize,
-        block_size: usize,
+        block_size: TokenCount,
         world_size: usize,
     ) -> Result<Self, DeviceError> {
         let kv_heads = config.num_key_value_heads;
@@ -145,7 +146,7 @@ impl KvGeometry {
         }
         Ok(Self {
             block_count,
-            block_size,
+            block_size: block_size.get(),
             kv_heads: kv_heads / world_size,
             head_dim: config.hidden_size / config.num_attention_heads,
         })

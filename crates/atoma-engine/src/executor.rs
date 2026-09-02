@@ -66,7 +66,7 @@ pub struct Executor<F> {
     rings: ExecutorRings,
     forward: F,
     sampler: Sampler,
-    block_size: usize,
+    block_size: TokenCount,
     followers: Vec<FollowerFeed>,
 }
 
@@ -78,7 +78,7 @@ impl<F: Forward> Executor<F> {
             rings,
             forward,
             sampler: Sampler::new(),
-            block_size: block_size.get(),
+            block_size,
             followers: Vec::new(),
         }
     }

@@ -8,7 +8,7 @@
 //! and no tensor: what is laid out here is uploaded as it stands.
 
 use atoma_core::step::{CommandEntry, StepCommand};
-use atoma_core::types::RequestId;
+use atoma_core::types::{RequestId, TokenCount};
 use thiserror::Error;
 
 /// A step command that cannot be laid out. Each is the engine breaking the step protocol, not a
@@ -74,7 +74,8 @@ impl BatchLayout {
     ///
     /// Returns [`LayoutError`] when the command has no entries, an entry computes no tokens, or
     /// an entry's block table does not cover its sequence length.
-    pub fn lay_out(command: &StepCommand, block_size: usize) -> Result<Self, LayoutError> {
+    pub fn lay_out(command: &StepCommand, block_size: TokenCount) -> Result<Self, LayoutError> {
+        let block_size = block_size.get();
         if command.entries.is_empty() {
             return Err(LayoutError::NoEntries);
         }
@@ -212,12 +213,12 @@ fn fits_i64(value: usize) -> i64 {
 mod tests {
     use atoma_core::request::PADDING_TOKEN;
     use atoma_core::step::StepCommand;
-    use atoma_core::types::RequestId;
+    use atoma_core::types::{RequestId, TokenCount};
 
     use super::{BatchLayout, LayoutError};
     use crate::test_support::{command, dummy, entry};
 
-    const BLOCK_SIZE: usize = 4;
+    const BLOCK_SIZE: TokenCount = TokenCount::new(4).expect("nonzero");
 
     /// A decode, a prefill, a dummy and another decode, in the engine's order.
     fn mixed() -> StepCommand {

@@ -7,6 +7,7 @@
 //! joins.
 
 use atoma_core::engine::{EngineConfig, ExecutorRings};
+use atoma_core::types::{RequestCount, TokenCount};
 use atoma_runtime::context::RuntimeContext;
 use atoma_runtime::session::Allocation;
 use candle_core::DType;
@@ -53,8 +54,8 @@ pub enum StartupError {
 struct RankPlan {
     world_size: usize,
     block_count: usize,
-    block_size: usize,
-    max_batch: usize,
+    block_size: TokenCount,
+    max_batch: RequestCount,
     dtype: DType,
     files: ModelFiles,
     #[cfg(feature = "nccl")]
@@ -86,14 +87,13 @@ pub fn spawn_ranks(
     let plan = RankPlan {
         world_size,
         block_count: usize::try_from(engine.block_count).expect("a u32 block count fits usize"),
-        block_size: engine.scheduler.block_size.get(),
-        max_batch: engine.scheduler.max_batch.get(),
+        block_size: engine.scheduler.block_size,
+        max_batch: engine.scheduler.max_batch,
         dtype: model.dtype.into(),
         files: files.clone(),
         #[cfg(feature = "nccl")]
         collective: Id::new().map_err(|error| StartupError::Collective { status: error.0 })?,
     };
-    let block_size = engine.scheduler.block_size;
     let mut feeds = Vec::with_capacity(world_size - 1);
     let mut followers: Vec<(Rank, RankConfig, FollowerRings)> = Vec::with_capacity(world_size - 1);
     for (index, &config) in executor.ranks.iter().enumerate().skip(1) {
@@ -107,7 +107,7 @@ pub fn spawn_ranks(
     let leader_plan = plan.clone();
     launched.push(launch(Rank::ZERO, leader.core, move || {
         let forward = open_forward(Rank::ZERO, leader.device, &leader_plan)?;
-        let mut executor = Executor::new(rings, forward, block_size);
+        let mut executor = Executor::new(rings, forward, leader_plan.block_size);
         for leader_end in feeds {
             executor.follow(leader_end);
         }
@@ -117,7 +117,7 @@ pub fn spawn_ranks(
         let plan = plan.clone();
         launched.push(launch(rank, config.core, move || {
             let forward = open_forward(rank, config.device, &plan)?;
-            Ok(Follower::new(follower_end, forward, block_size))
+            Ok(Follower::new(follower_end, forward, plan.block_size))
         })?);
     }
     let threads = wait_all(launched)?;
@@ -151,7 +151,7 @@ fn open_forward(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<C
         Some(Readback::new(
             &allocation,
             device.stream().context(),
-            plan.max_batch,
+            plan.max_batch.get(),
             config.vocab_size,
         )?)
     } else {

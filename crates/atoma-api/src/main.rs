@@ -95,7 +95,7 @@ mod startup {
         let state = AppState {
             engine: handle,
             tokenizer: Arc::new(tokenizer),
-            max_model_len: config.engine.scheduler.max_model_len.get(),
+            max_model_len: config.engine.scheduler.max_model_len,
             keep_alive: config.server.keep_alive,
             heartbeat_stale_after: config.server.heartbeat_stale_after,
         };

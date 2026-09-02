@@ -63,7 +63,7 @@ pub struct AppState {
     pub engine: EngineHandle,
     pub tokenizer: Arc<Tokenizer>,
     /// The longest sequence the model serves: the bound on prompt plus completion.
-    pub max_model_len: usize,
+    pub max_model_len: TokenCount,
     /// How often a keep-alive comment is written to a stream with nothing to say.
     pub keep_alive: Duration,
     /// How old the heartbeat may be before the node reports itself unhealthy.
@@ -409,11 +409,12 @@ async fn submit(
     let max_new_tokens = match max_new_tokens {
         Some(budget) => budget,
         None => {
-            TokenCount::new(state.max_model_len.saturating_sub(prompt_tokens)).ok_or_else(|| {
+            let room = state.max_model_len.get().saturating_sub(prompt_tokens);
+            TokenCount::new(room).ok_or_else(|| {
                 ApiError::failed(
                     &Failed::PromptTooLong {
                         prompt_tokens,
-                        max_model_length: state.max_model_len,
+                        max_model_length: state.max_model_len.get(),
                     },
                     request_id,
                 )
@@ -518,7 +519,7 @@ mod tests {
     use super::*;
     use crate::test_support::tokenizer;
 
-    const MAX_MODEL_LEN: usize = 512;
+    const MAX_MODEL_LEN: TokenCount = TokenCount::new(512).expect("nonzero");
     const BLOCK_SIZE: usize = 16;
     const MAX_BATCH: usize = 4;
     /// How long a test waits on the engine thread before calling it wedged.
@@ -553,7 +554,7 @@ mod tests {
             scheduler: SchedulerConfig {
                 token_budget: nonzero(2048),
                 max_batch: requests(MAX_BATCH),
-                max_model_len: nonzero(MAX_MODEL_LEN),
+                max_model_len: MAX_MODEL_LEN,
                 block_size: nonzero(BLOCK_SIZE),
                 window: requests(8),
                 admission: AdmissionPolicy::Fcfs,
@@ -566,7 +567,8 @@ mod tests {
                 bucket_ladder: BucketLadder::new(vec![1, 2, 4]).unwrap(),
                 captured_max_requests: requests(MAX_BATCH),
             },
-            block_count: u32::try_from(slots * MAX_MODEL_LEN / BLOCK_SIZE + MAX_BATCH).unwrap(),
+            block_count: u32::try_from(slots * MAX_MODEL_LEN.get() / BLOCK_SIZE + MAX_BATCH)
+                .unwrap(),
             ingress_capacity: requests(8),
             idle_deadline: Duration::from_millis(1),
         }
@@ -769,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn a_prompt_with_no_room_left_is_a_400() {
         let served = serve("a", Duration::from_secs(30));
-        let long = "word ".repeat(MAX_MODEL_LEN);
+        let long = "word ".repeat(MAX_MODEL_LEN.get());
         let (status, body) = post(
             served.router(),
             json!({
