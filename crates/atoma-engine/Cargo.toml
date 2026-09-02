@@ -7,10 +7,12 @@ version     = { workspace = true }
 
 [dependencies]
 atoma-core          = { workspace = true }
+atoma-runtime       = { workspace = true }
 candle-core         = { workspace = true }
 candle-transformers = { workspace = true }
 core_affinity       = { workspace = true }
 crossbeam-utils     = { workspace = true }
+cudarc              = { workspace = true }
 rtrb                = { workspace = true }
 serde               = { workspace = true, features = [ "derive" ] }
 thiserror           = { workspace = true }

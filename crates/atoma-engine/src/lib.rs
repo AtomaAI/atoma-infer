@@ -10,6 +10,7 @@ pub mod config;
 pub mod executor;
 pub mod forward;
 pub mod logits;
+pub mod readback;
 pub mod sampler;
 
 #[cfg(test)]

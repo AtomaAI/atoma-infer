@@ -206,10 +206,12 @@ name = "atoma-engine"
 version = "0.1.0"
 dependencies = [
  "atoma-core",
+ "atoma-runtime",
  "candle-core",
  "candle-transformers",
  "core_affinity",
  "crossbeam-utils",
+ "cudarc 0.19.8",
  "figment",
  "rtrb",
  "serde",
