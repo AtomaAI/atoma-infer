@@ -7,6 +7,8 @@
 //! stream, so nothing is enqueued through the session's descriptor seam; the session orders
 //! startup and nothing else.
 
+pub mod forward;
+
 use std::path::Path;
 use std::sync::Arc;
 
