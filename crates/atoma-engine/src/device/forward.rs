@@ -118,19 +118,25 @@ impl Forward for CudaForward {
             selected,
             metadata,
         } = self.upload(layout)?;
-        let kv_caches = self.kv_cache.layers_mut();
-        let logits = self
-            .weights
+        let Allocated {
+            device,
+            weights,
+            kv_cache,
+            readback,
+            vocab,
+        } = &mut self.allocated;
+        let kv_caches = kv_cache.layers_mut();
+        let logits = weights
             .llama_mut()
             .forward(&tokens, &positions, &selected, &kv_caches, metadata)?;
         let rows = layout.selected.len();
-        let Some(readback) = &mut self.readback else {
-            return Ok(Logits::new(&[], self.vocab));
+        let Some(readback) = readback else {
+            return Ok(Logits::new(&[], *vocab));
         };
         if rows == 0 {
-            return Ok(Logits::new(&[], self.vocab));
+            return Ok(Logits::new(&[], *vocab));
         }
-        read_back(readback, self.device.stream(), &logits, rows)
+        read_back(readback, device.stream(), &logits, rows)
     }
 }
 
