@@ -11,6 +11,7 @@ candle-core         = { workspace = true }
 candle-transformers = { workspace = true }
 core_affinity       = { workspace = true }
 crossbeam-utils     = { workspace = true }
+rtrb                = { workspace = true }
 serde               = { workspace = true, features = [ "derive" ] }
 thiserror           = { workspace = true }
 tracing             = { workspace = true }

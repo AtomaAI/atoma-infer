@@ -117,16 +117,21 @@ pub(crate) mod test_support {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Error)]
-    #[error("the fake forward was told to fail at step {step}")]
+    #[error("the fake forward was told to fail on its command number {command}")]
     pub(crate) struct FakeForwardError {
-        pub(crate) step: u64,
+        pub(crate) command: usize,
     }
 
     /// A forward whose every selected row peaks at one chosen token, so greedy sampling returns
-    /// it; it can be told to fail at a step, and it keeps every command it served.
+    /// it; it can be told to fail on its n-th command, and it keeps every command it served.
+    ///
+    /// Commands are counted rather than matched by step id: the scheduler mints a step id on
+    /// every pass, empty ones included, so the first served step's id depends on whether the
+    /// engine passed before the request arrived.
     pub(crate) struct FakeForward {
         token: u32,
-        fail_at_step: Option<u64>,
+        fail_on_command: Option<usize>,
+        seen: usize,
         logits: Vec<f32>,
         served: Arc<Mutex<Vec<StepCommand>>>,
     }
@@ -135,14 +140,16 @@ pub(crate) mod test_support {
         pub(crate) fn constant(token: u32) -> Self {
             Self {
                 token,
-                fail_at_step: None,
+                fail_on_command: None,
+                seen: 0,
                 logits: Vec::new(),
                 served: Arc::default(),
             }
         }
 
-        pub(crate) fn failing_at_step(mut self, step: u64) -> Self {
-            self.fail_at_step = Some(step);
+        /// Fails on the `command`-th command it is given, counting from one.
+        pub(crate) fn failing_on_command(mut self, command: usize) -> Self {
+            self.fail_on_command = Some(command);
             self
         }
 
@@ -160,10 +167,9 @@ pub(crate) mod test_support {
             command: &StepCommand,
             layout: &BatchLayout,
         ) -> Result<Logits<'_>, FakeForwardError> {
-            if self.fail_at_step == Some(command.step.get()) {
-                return Err(FakeForwardError {
-                    step: command.step.get(),
-                });
+            self.seen += 1;
+            if self.fail_on_command == Some(self.seen) {
+                return Err(FakeForwardError { command: self.seen });
             }
             self.served
                 .lock()

@@ -143,6 +143,12 @@ impl ExecutorRings {
     pub fn park(&self) {
         self.parker.park();
     }
+
+    /// An unparker for the executor thread, for whatever else must wake it from its park.
+    #[must_use]
+    pub fn unparker(&self) -> Unparker {
+        self.parker.unparker().clone()
+    }
 }
 
 #[cfg(test)]
@@ -313,5 +319,18 @@ mod tests {
             !executor.engine_gone(),
             "returned by the wake, not the loss"
         );
+    }
+
+    #[test]
+    fn the_executors_unparker_wakes_its_park_from_anywhere() {
+        let parker = Parker::new();
+        let (_engine, executor) = rings(parker.unparker().clone());
+        let wake = executor.unparker();
+        let executor_thread = thread::spawn(move || executor.park());
+        thread::sleep(Duration::from_millis(10));
+        assert!(!executor_thread.is_finished(), "parked until woken");
+
+        wake.unpark();
+        executor_thread.join().unwrap();
     }
 }
