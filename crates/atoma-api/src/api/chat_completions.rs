@@ -884,9 +884,9 @@ pub enum Refused {
     #[error("top_p must be between 0 and 1, not {top_p}")]
     TopP { top_p: f32 },
     #[error("max_completion_tokens must be at least 1")]
-    NoCompletionTokens,
+    ZeroCompletionTokens,
     #[error("max_tokens must be at least 1")]
-    NoMaxTokens,
+    ZeroMaxTokens,
 }
 
 impl RequestBody {
@@ -972,12 +972,12 @@ impl RequestBody {
         if let Some(budget) = self.max_completion_tokens {
             return TokenCount::new(budget as usize)
                 .map(Some)
-                .ok_or(Refused::NoCompletionTokens);
+                .ok_or(Refused::ZeroCompletionTokens);
         }
         if let Some(budget) = self.max_tokens {
             return TokenCount::new(budget as usize)
                 .map(Some)
-                .ok_or(Refused::NoMaxTokens);
+                .ok_or(Refused::ZeroMaxTokens);
         }
         Ok(None)
     }
@@ -1379,9 +1379,9 @@ pub mod tests {
         );
         assert_eq!(
             refused(json!({ "max_completion_tokens": 0 })),
-            Refused::NoCompletionTokens
+            Refused::ZeroCompletionTokens
         );
-        assert_eq!(refused(json!({ "max_tokens": 0 })), Refused::NoMaxTokens);
+        assert_eq!(refused(json!({ "max_tokens": 0 })), Refused::ZeroMaxTokens);
         assert!(
             refused(json!({ "n": 3 })).to_string().contains("3 choices"),
             "the refusal names what was asked"
