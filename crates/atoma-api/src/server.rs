@@ -423,7 +423,7 @@ async fn submit(
         stream: _,
     } = request;
     let tokenizer = Arc::clone(&state.tokenizer);
-    let prompt_ids = task::spawn_blocking(move || prompt_ids(&tokenizer, prompt))
+    let prompt_ids = task::spawn_blocking(move || tokenize_prompt(&tokenizer, prompt))
         .await
         .map_err(|join| ApiError::internal(format!("tokenization panicked: {join}"), request_id))?
         .map_err(|error| {
@@ -490,7 +490,7 @@ async fn submit(
 
 /// The token ids of a templated prompt, with special tokens off: the template writes the BOS
 /// token itself, and the tokenizer's post-processor would prepend a second one.
-fn prompt_ids(tokenizer: &Tokenizer, prompt: String) -> Result<Vec<u32>, TokenizerError> {
+fn tokenize_prompt(tokenizer: &Tokenizer, prompt: String) -> Result<Vec<u32>, TokenizerError> {
     tokenizer
         .encode(prompt, false)
         .map(|encoding| encoding.get_ids().to_vec())
@@ -751,7 +751,7 @@ mod tests {
         let bos = tokenizer.token_to_id(BOS).unwrap();
         let hermes = json!({ "model": "NousResearch/Hermes-3-Llama-3.1-8B" });
         for body in [completion_body(json!({})), completion_body(hermes)] {
-            let ids = prompt_ids(&tokenizer, rendered_prompt(body)).unwrap();
+            let ids = tokenize_prompt(&tokenizer, rendered_prompt(body)).unwrap();
             assert_eq!(ids.first(), Some(&bos), "{ids:?}");
             assert_eq!(ids.iter().filter(|&&id| id == bos).count(), 1, "{ids:?}");
         }
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(body["choices"][0]["finish_reason"], "length");
         assert_eq!(body["usage"]["completion_tokens"], 4);
         let prompt = rendered_prompt(completion_body(json!({})));
-        let prompt_tokens = prompt_ids(&served.tokenizer, prompt).unwrap().len();
+        let prompt_tokens = tokenize_prompt(&served.tokenizer, prompt).unwrap().len();
         assert_eq!(
             body["usage"]["prompt_tokens"].as_u64().unwrap(),
             u64::try_from(prompt_tokens).unwrap(),
