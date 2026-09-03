@@ -298,6 +298,19 @@ The pinned per-rank thread that owns the device and runs the session. It acts on
 and re-derives nothing in it.
 _Avoid_: worker, model thread, runner
 
+**Follower**:
+An executor rank other than zero. Rank zero, the leader, owns the engine's rings and feeds each
+step command to every follower over a ring of its own; a follower runs the forward for it and
+produces nothing, since the leader alone reads logits back and samples. A follower going ends
+the leader, and the leader going ends every follower.
+_Avoid_: worker rank, replica, secondary
+
+**Feed**:
+The single-producer single-consumer ring from the leader to one follower, carrying each step
+command. A push wakes the follower and a pop wakes the leader, so the leader can wait on a full
+feed; either end dropping wakes the far side, which is how a rank's death is seen.
+_Avoid_: follower queue, broadcast channel, command channel
+
 **Ingress**:
 The bounded channel that carries requests into the engine thread. A refused send is overload.
 _Avoid_: request queue, inbound, input channel
