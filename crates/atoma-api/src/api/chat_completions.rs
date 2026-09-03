@@ -723,9 +723,9 @@ fn write_python_float<W>(writer: &mut W, written: &[u8]) -> std::io::Result<()>
 where
     W: ?Sized + std::io::Write,
 {
-    // serde_json writes a float as ASCII digits, so nothing is lost in the conversion.
-    let written = String::from_utf8_lossy(written);
-    writer.write_all(python_float_notation(&written).as_bytes())
+    // serde_json writes a float as ASCII digits, so this fails only if it wrote something else.
+    let written = str::from_utf8(written).map_err(std::io::Error::other)?;
+    writer.write_all(python_float_notation(written).as_bytes())
 }
 
 impl Formatter for JsonDumpsFormatter {
