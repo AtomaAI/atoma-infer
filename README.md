@@ -81,17 +81,20 @@ protocol and the procedure are in
 [docs/benchmarks/rung0-baseline.md](docs/benchmarks/rung0-baseline.md) and the table it produces in
 [docs/benchmarks/rung0-baseline-table.md](docs/benchmarks/rung0-baseline-table.md); no measurements
 have been taken yet.
-
 ## Configuration and running
 
-The server runs on the vLLM backend, whose example configuration sits beside it. Copy it and
-provide the Hugging Face API key, model, cache path, and GPU device IDs for your environment:
+The example configuration at the repository root holds everything the server is built from: the
+engine, the executor's ranks, the model and the server itself. Copy it and set the model, the
+device and core of each rank, and where to listen:
 
 ```shell
-cp crates/backends/vllm/config.example.toml config.toml
+cp config.example.toml config.toml
 ```
 
-`config.toml` is ignored by Git. The server requires the opt-in `cuda` feature and accepts the configuration path through `--config-path`:
+`config.toml` is ignored by Git. Every field can be overridden by an environment variable under
+`ATOMA_`, nesting with `__`, and a Hugging Face token is read from `HF_TOKEN`. The server requires
+the opt-in `cuda` feature, `nccl` as well for more than one rank, and accepts the configuration
+path through `--config-path`:
 
 ```shell
 RUST_LOG=info cargo run --release --features cuda --bin atoma-api -- --config-path config.toml

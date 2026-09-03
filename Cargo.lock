@@ -132,15 +132,21 @@ name = "atoma-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "atoma-backends",
+ "atoma-core",
+ "atoma-engine",
  "axum",
  "clap",
+ "crossbeam-utils",
+ "figment",
  "flume",
  "futures",
  "metrics",
  "metrics-exporter-prometheus",
+ "rand",
  "serde",
  "serde_json",
+ "thiserror 2.0.19",
+ "tokenizers",
  "tokio",
  "tower",
  "tracing",
@@ -148,6 +154,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "validator",
 ]
 
 [[package]]
