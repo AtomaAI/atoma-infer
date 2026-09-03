@@ -12,10 +12,12 @@
 //! | [`layer`] | A layer class: the op order and the roles each op reads and writes; Llama's one class |
 //! | [`attention`] | Paged decode attention: the per-bucket plan and the calls it assembles |
 //! | [`gemm`] | The step's multiplications, through a cuBLAS handle bound to the capture stream |
+//! | [`kernels`] | The step's own kernels, each call assembled from checked tensor views |
 //! | [`rope`] | The rotary embedding's cosine and sine tables, computed on the host once |
 
 pub mod attention;
 pub mod dims;
 pub mod gemm;
+pub mod kernels;
 pub mod layer;
 pub mod rope;
