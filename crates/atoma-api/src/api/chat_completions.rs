@@ -383,21 +383,20 @@ pub(crate) mod messages {
                 } => {
                     push_llama3_header(&mut prompt, name.as_deref().unwrap_or("assistant"));
                     if !tool_calls.is_empty() {
-                        prompt.push_str("<|python_tag|>[");
+                        // Every Llama 3 model renders a tool call the same way, so one variant
+                        // stands for the family.
                         let tool_calls_str = tool_calls
                             .iter()
-                            .map(|tc| tc.function_call_string(Model::Llama318bInstruct)) // all llama3 model versions have the same functionality
+                            .map(|tc| tc.function_call_string(Model::Llama318bInstruct))
                             .collect::<Vec<_>>()
                             .join(", ");
+                        prompt.push_str("<|python_tag|>[");
                         prompt.push_str(&tool_calls_str);
-                        prompt.push_str("]<|eot_id|>");
+                        prompt.push(']');
                     } else if let Some(content) = content {
                         prompt.push_str(&content.to_string());
-                        prompt.push_str("<|eot_id|>");
-                    } else {
-                        // If both content and tool_calls are empty, just add <|eot_id|>
-                        prompt.push_str("<|eot_id|>");
                     }
+                    prompt.push_str("<|eot_id|>");
                 }
                 Message::Tool {
                     content,
