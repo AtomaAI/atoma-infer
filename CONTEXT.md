@@ -267,6 +267,13 @@ One row of a Scheduled: a sequence, its query length, and whether it samples. An
 only when its query reaches the sequence's total; a non-final prefill chunk does not.
 _Avoid_: scheduled tokens, scheduled sequence, batch item
 
+**Batch layout**:
+A step command laid out as the arrays the model forward takes: prefills first, then decodes,
+with every entry's tokens, positions and KV slots flattened in that order, the per-entry lengths
+and cumulative starts, the padded block tables, and the logits rows to select. Pure host
+arithmetic from the command; the forward re-derives nothing.
+_Avoid_: input metadata, model input, batch tensors (for the host arrays)
+
 **Uniform decode**:
 A Scheduled whose every entry has query length one. The condition full-graph replay requires.
 _Avoid_: decode-only, pure decode, all-decode
