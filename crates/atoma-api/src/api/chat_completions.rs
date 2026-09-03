@@ -3,10 +3,12 @@
 use atoma_core::request::{SamplingParams, Usage as EngineUsage};
 use atoma_core::types::TokenCount;
 use std::collections::HashMap;
+use std::io;
 use thiserror::Error;
 use utoipa::ToSchema;
 
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::ser::{CompactFormatter, Formatter};
 use serde_json::Value;
 
 // TODO: fields that are named `r#type` should have values that represent
@@ -268,6 +270,12 @@ impl Message {
             }
         }
     }
+
+    /// Whether this is a tool message. The Hermes 3 `tool_use` template gives a run of
+    /// consecutive tool messages one turn, so rendering one asks this of its neighbours.
+    fn is_tool(&self) -> bool {
+        matches!(self, Message::Tool { .. })
+    }
 }
 
 pub(crate) mod messages {
@@ -422,10 +430,16 @@ pub(crate) mod messages {
         prompt.push('\n');
     }
 
-    /// Closes one Hermes 3 turn. The template writes the end-of-turn token straight after the
-    /// turn's content, so nothing separates them.
+    /// The token that ends one Hermes 3 turn.
+    const HERMES3_END_OF_TURN: &str = "<|im_end|>";
+
+    /// Closes one Hermes 3 turn: the end-of-turn token straight after the turn's content, with
+    /// nothing between them, and the newline the template writes before the next turn.
+    ///
+    /// A run of tool messages departs from both, and closes its own turn.
     fn push_hermes3_end_of_turn(prompt: &mut String) {
-        prompt.push_str("<|im_end|>\n");
+        prompt.push_str(HERMES3_END_OF_TURN);
+        prompt.push('\n');
     }
 
     /// Writes one Hermes 3 turn whose content is text alone: the role line, the content if any,
@@ -460,6 +474,66 @@ pub(crate) mod messages {
         push_hermes3_end_of_turn(prompt);
     }
 
+    /// Where one tool message sits among its neighbours, which is all the `tool_use` template's
+    /// tool branch asks of the conversation around one.
+    struct ToolRunPosition {
+        /// Whether a message of another role comes before it, which is when the template writes
+        /// the role line.
+        opens_a_turn: bool,
+        /// Whether another tool message follows, which is when the turn stays open for it.
+        run_continues: bool,
+        /// Whether anything follows at all, which is when the block takes a trailing newline.
+        conversation_continues: bool,
+    }
+
+    impl ToolRunPosition {
+        /// Reads the position of the message at `index` from the messages either side of it.
+        fn of(messages: &[Message], index: usize) -> Self {
+            let previous = index.checked_sub(1).map(|previous| &messages[previous]);
+            let next = messages.get(index + 1);
+            Self {
+                opens_a_turn: previous.is_some_and(|previous| !previous.is_tool()),
+                run_continues: next.is_some_and(|next| next.is_tool()),
+                conversation_continues: next.is_some(),
+            }
+        }
+    }
+
+    /// Writes one Hermes 3 tool message as the `<tool_response>` block the `tool_use` template
+    /// frames it in, where a message of any other role is a turn of its own content.
+    ///
+    /// Two details of that template come with the shape. The role line is written only when a
+    /// message of another role comes before this one, so a conversation opening with a tool
+    /// message gets none. And the turn ends in the bare end-of-turn token: the newline every
+    /// other role's turn ends in is written inside the run instead, after every block but the
+    /// conversation's last.
+    fn push_hermes3_tool_response(
+        prompt: &mut String,
+        content: Option<&MessageContent>,
+        position: ToolRunPosition,
+    ) {
+        let ToolRunPosition {
+            opens_a_turn,
+            run_continues,
+            conversation_continues,
+        } = position;
+
+        if opens_a_turn {
+            push_hermes3_header(prompt, "tool");
+        }
+        prompt.push_str("<tool_response>\n");
+        if let Some(content) = content {
+            prompt.push_str(&content.to_string());
+        }
+        prompt.push_str("\n</tool_response>");
+        if conversation_continues {
+            prompt.push('\n');
+        }
+        if !run_continues {
+            prompt.push_str(HERMES3_END_OF_TURN);
+        }
+    }
+
     /// The system turn the Hermes 3 template writes ahead of a conversation that does not open
     /// with one of its own.
     const HERMES3_DEFAULT_SYSTEM_TURN: &str =
@@ -480,7 +554,7 @@ pub(crate) mod messages {
             prompt.push_str(HERMES3_DEFAULT_SYSTEM_TURN);
         }
 
-        for message in messages {
+        for (index, message) in messages.iter().enumerate() {
             match message {
                 Message::System { content, .. } => {
                     push_hermes3_turn(&mut prompt, "system", content.as_ref());
@@ -500,7 +574,11 @@ pub(crate) mod messages {
                     }
                 }
                 Message::Tool { content, .. } => {
-                    push_hermes3_turn(&mut prompt, "tool", content.as_ref());
+                    push_hermes3_tool_response(
+                        &mut prompt,
+                        content.as_ref(),
+                        ToolRunPosition::of(messages, index),
+                    );
                 }
             }
         }
@@ -646,15 +724,45 @@ pub struct ToolCall {
 /// `json.dumps` with `ensure_ascii=False`. Its spacing is part of the prompt, so a server that
 /// writes the compact form sends the model a different token sequence for the same tool call.
 ///
-/// One difference is left: a float whose exponent is -5 or below is written as `serde_json`
-/// writes it — `0.00001` and `1e-6` against `json.dumps`' `1e-05` and `1e-06`. Every other
-/// magnitude, and every other type, matches.
+/// Floats are written in Python's notation for the same reason.
 struct JsonDumpsFormatter;
 
-impl serde_json::ser::Formatter for JsonDumpsFormatter {
-    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+/// Rewrites a float `serde_json` has written into the notation `json.dumps` uses, which is
+/// Python's `repr`. The digits are left as they are.
+///
+/// `repr` writes an exponent of two digits at least, and turns to scientific notation below
+/// `1e-4` where `serde_json` waits until `1e-5`. So the magnitudes the two write in different
+/// notations are the ones in `[1e-5, 1e-4)`, which `serde_json` writes with four zeros after the
+/// point and the first significant digit straight behind them.
+fn python_float_notation(written: &str) -> String {
+    if let Some((mantissa, exponent)) = written.split_once('e') {
+        let (sign, digits) = match exponent.strip_prefix('-') {
+            Some(digits) => ('-', digits),
+            None => ('+', exponent.trim_start_matches('+')),
+        };
+        return format!("{mantissa}e{sign}{digits:0>2}");
+    }
+
+    let (sign, magnitude) = match written.strip_prefix('-') {
+        Some(magnitude) => ("-", magnitude),
+        None => ("", written),
+    };
+    let Some(fraction) = magnitude.strip_prefix("0.0000") else {
+        return written.to_string();
+    };
+    let mut digits = fraction.chars();
+    let Some(first) = digits.next() else {
+        return written.to_string();
+    };
+    let rest = digits.as_str();
+    let point = if rest.is_empty() { "" } else { "." };
+    format!("{sign}{first}{point}{rest}e-05")
+}
+
+impl Formatter for JsonDumpsFormatter {
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
     where
-        W: ?Sized + std::io::Write,
+        W: ?Sized + io::Write,
     {
         if first {
             Ok(())
@@ -663,22 +771,46 @@ impl serde_json::ser::Formatter for JsonDumpsFormatter {
         }
     }
 
-    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> io::Result<()>
     where
-        W: ?Sized + std::io::Write,
+        W: ?Sized + io::Write,
     {
         writer.write_all(b": ")
     }
 
-    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
     where
-        W: ?Sized + std::io::Write,
+        W: ?Sized + io::Write,
     {
         if first {
             Ok(())
         } else {
             writer.write_all(b", ")
         }
+    }
+
+    fn write_f64<W>(&mut self, writer: &mut W, value: f64) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        let mut written = Vec::new();
+        CompactFormatter.write_f64(&mut written, value)?;
+        // serde_json writes a float as ASCII digits, so this fails only if it wrote something
+        // else.
+        let written = str::from_utf8(&written).map_err(|error| {
+            io::Error::other(format!(
+                "serde_json wrote the float {value} as bytes that are not UTF-8: {error}"
+            ))
+        })?;
+        writer.write_all(python_float_notation(written).as_bytes())
+    }
+
+    /// Python has one float type, so a template renders an `f32` as the double it widens to.
+    fn write_f32<W>(&mut self, writer: &mut W, value: f32) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        self.write_f64(writer, f64::from(value))
     }
 }
 
@@ -692,7 +824,7 @@ fn json_dumps(value: &Value) -> String {
     let mut serializer = serde_json::Serializer::with_formatter(&mut written, JsonDumpsFormatter);
     value
         .serialize(&mut serializer)
-        .expect("a Value serializes into a Vec without failing");
+        .expect("a Value serializes into a Vec, and serde_json writes every float as ASCII");
     String::from_utf8(written).expect("serde_json writes UTF-8")
 }
 
@@ -1233,10 +1365,13 @@ pub mod tests {
     use atoma_core::request::SamplingParams;
     use atoma_core::types::TokenCount;
 
+    use serde::Serialize;
+
     use super::{
-        messages, ChatCompletionChunk, ChatCompletionResponse, Choice, CompletionIdentity, Delta,
-        FinishReason, Message, MessageContent, MessageContentPart, MessageContentPartImageUrl,
-        Model, Refused, RequestBody, StreamChoice, ToolCall, ToolCallFunction, Usage,
+        json_dumps, messages, ChatCompletionChunk, ChatCompletionResponse, Choice,
+        CompletionIdentity, Delta, FinishReason, JsonDumpsFormatter, Message, MessageContent,
+        MessageContentPart, MessageContentPartImageUrl, Model, Refused, RequestBody, StreamChoice,
+        ToolCall, ToolCallFunction, Usage,
     };
 
     fn identity(created: u64) -> CompletionIdentity {
@@ -1887,6 +2022,22 @@ pub mod tests {
         assert_eq!(result, expected);
     }
 
+    /// A user message carrying `text`, which the Hermes 3 prompt tests build over and over.
+    fn user_message(text: &str) -> Message {
+        Message::User {
+            content: Some(MessageContent::Text(text.to_string())),
+            name: None,
+        }
+    }
+
+    /// A tool message carrying `content`, answering a call the tests do not otherwise name.
+    fn tool_message(content: &str) -> Message {
+        Message::Tool {
+            content: Some(MessageContent::Text(content.to_string())),
+            tool_call_id: "1".to_string(),
+        }
+    }
+
     /// One conversation per trailing role, the assistant's two ways of speaking, and the empty
     /// one.
     fn every_trailing_role() -> [Vec<Message>; 6] {
@@ -1897,10 +2048,7 @@ pub mod tests {
                 content: text("Be brief."),
                 name: None,
             }],
-            vec![Message::User {
-                content: text("Hi"),
-                name: None,
-            }],
+            vec![user_message("Hi")],
             vec![Message::Assistant {
                 content: text("Hello"),
                 name: None,
@@ -1920,10 +2068,7 @@ pub mod tests {
                     },
                 }],
             }],
-            vec![Message::Tool {
-                content: text("25 C"),
-                tool_call_id: "1".to_string(),
-            }],
+            vec![tool_message("25 C")],
         ]
     }
 
@@ -2006,7 +2151,8 @@ pub mod tests {
         let expected = concat!(
             "<|begin_of_text|>",
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
-            "<|im_start|>tool\nTool response here.<|im_end|>\n<|im_start|>assistant\n",
+            "<tool_response>\nTool response here.\n</tool_response><|im_end|>",
+            "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
     }
@@ -2143,11 +2289,10 @@ pub mod tests {
         );
     }
 
-    /// Where `serde_json` and `json.dumps` disagree, and the magnitudes where they do not. A
-    /// float whose exponent is -5 or below is the one value this builder still writes differently
-    /// from the template: `json.dumps` would write `1e-05` and `1e-06` for the first two.
+    /// `json.dumps` writes a float as Python's `repr` does, which `serde_json` departs from twice:
+    /// it writes `0.00001` where `repr` turns to scientific notation, and pads no exponent.
     #[test]
-    fn a_float_argument_is_written_as_serde_json_writes_it() {
+    fn a_float_argument_is_written_as_the_template_writes_it() {
         let arguments = |arguments: serde_json::Value| {
             let call = ToolCall {
                 id: "1".to_string(),
@@ -2162,14 +2307,43 @@ pub mod tests {
 
         assert_eq!(
             arguments(json!({ "a": 1e-5, "b": 1e-6 })),
-            "{\"name\": \"f\", \"arguments\": {\"a\": 0.00001, \"b\": 1e-6}}",
-            "the departure this builder still carries"
+            "{\"name\": \"f\", \"arguments\": {\"a\": 1e-05, \"b\": 1e-06}}",
+            "the two values serde_json writes differently"
         );
         assert_eq!(
-            arguments(json!({ "a": 0.0001, "b": 1.5, "c": 1e16 })),
-            "{\"name\": \"f\", \"arguments\": {\"a\": 0.0001, \"b\": 1.5, \"c\": 1e+16}}",
-            "every other magnitude matches json.dumps"
+            arguments(json!({ "a": 0.0001, "b": 1.5, "c": 1e16, "d": -1.25e-7 })),
+            "{\"name\": \"f\", \"arguments\": \
+             {\"a\": 0.0001, \"b\": 1.5, \"c\": 1e+16, \"d\": -1.25e-07}}",
+            "the magnitudes on either side of each boundary"
         );
+        assert_eq!(
+            arguments(json!({ "a": 1e15, "b": 1e-100, "c": 0.0, "d": 5e-324 })),
+            "{\"name\": \"f\", \"arguments\": \
+             {\"a\": 1000000000000000.0, \"b\": 1e-100, \"c\": 0.0, \"d\": 5e-324}}",
+            "an exponent of three digits is not padded, and nothing else is rewritten"
+        );
+    }
+
+    /// The digits are `serde_json`'s, whatever the notation: where two shortest representations
+    /// round-trip, `repr` and `serde_json` pick the same one and `f64`'s own `Display` does not.
+    #[test]
+    fn a_float_argument_keeps_the_digits_serde_json_writes() {
+        let value = f64::from_bits(0xc30a_a61f_a224_75ca);
+        assert_eq!(format!("{value}"), "-937625523621561.3");
+        assert_eq!(json_dumps(&json!(value)), "-937625523621561.2");
+    }
+
+    /// Python has one float type, so a narrower float is written as the double it widens to
+    /// rather than in its own shortest digits, which would be `1e-06` here. A `Value` holds only
+    /// doubles, so nothing routes an `f32` through `json_dumps` today.
+    #[test]
+    fn a_float_argument_narrower_than_a_double_is_widened_first() {
+        let mut written = Vec::new();
+        let mut serializer =
+            serde_json::Serializer::with_formatter(&mut written, JsonDumpsFormatter);
+        1e-6f32.serialize(&mut serializer).unwrap();
+
+        assert_eq!(String::from_utf8(written).unwrap(), "9.999999974752427e-07");
     }
 
     /// The Llama 3 tool call renders its arguments in the caller's order too, which is
@@ -2248,9 +2422,133 @@ pub mod tests {
         let expected = concat!(
             "<|begin_of_text|>",
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
-            "<|im_start|>tool\nStock data for TSLA<|im_end|>\n<|im_start|>assistant\n",
+            "<tool_response>\nStock data for TSLA\n</tool_response><|im_end|>",
+            "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
+    }
+
+    /// The `tool_use` template frames a tool message in `<tool_response>` tags rather than writing
+    /// its content as a turn. The role line comes from the previous message, so a conversation
+    /// opening with a tool message gets none.
+    #[test]
+    fn a_hermes3_tool_message_is_framed_as_a_tool_response_block() {
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[user_message("Weather?"), tool_message("25 C")]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<|im_start|>user\nWeather?<|im_end|>\n",
+                "<|im_start|>tool\n<tool_response>\n25 C\n</tool_response><|im_end|>",
+                "<|im_start|>assistant\n",
+            ),
+            "a tool message after a message of another role opens a turn of its own"
+        );
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[tool_message("25 C"), user_message("Weather?")]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<tool_response>\n25 C\n</tool_response>\n<|im_end|>",
+                "<|im_start|>user\nWeather?<|im_end|>\n",
+                "<|im_start|>assistant\n",
+            ),
+            "a tool message with nothing before it gets no role line"
+        );
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[
+                Message::Assistant {
+                    content: None,
+                    name: None,
+                    refusal: None,
+                    tool_calls: vec![ToolCall {
+                        id: "1".to_string(),
+                        r#type: "function".to_string(),
+                        function: ToolCallFunction {
+                            name: "get_weather".to_string(),
+                            arguments: json!({ "city": "Lisbon" }),
+                        },
+                    }],
+                },
+                tool_message("25 C"),
+                user_message("Weather?"),
+            ]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<|im_start|>assistant\n<tool_call>\n",
+                "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Lisbon\"}}",
+                "\n</tool_call><|im_end|>\n",
+                "<|im_start|>tool\n<tool_response>\n25 C\n</tool_response>\n<|im_end|>",
+                "<|im_start|>user\nWeather?<|im_end|>\n",
+                "<|im_start|>assistant\n",
+            ),
+            "the conversation a tool call makes: the answer to the call, then the next turn"
+        );
+    }
+
+    /// A run of consecutive tool messages is one turn: one role line, one block per message, one
+    /// end-of-turn token.
+    #[test]
+    fn consecutive_hermes3_tool_messages_are_one_turn() {
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[
+                user_message("Weather?"),
+                tool_message("25 C"),
+                tool_message("Cloudy"),
+            ]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<|im_start|>user\nWeather?<|im_end|>\n",
+                "<|im_start|>tool\n",
+                "<tool_response>\n25 C\n</tool_response>\n",
+                "<tool_response>\nCloudy\n</tool_response>",
+                "<|im_end|>",
+                "<|im_start|>assistant\n",
+            ),
+            "two blocks in one turn"
+        );
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[
+                tool_message("25 C"),
+                tool_message("Cloudy"),
+                user_message("Weather?"),
+            ]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<tool_response>\n25 C\n</tool_response>\n",
+                "<tool_response>\nCloudy\n</tool_response>\n",
+                "<|im_end|>",
+                "<|im_start|>user\nWeather?<|im_end|>\n",
+                "<|im_start|>assistant\n",
+            ),
+            "the run ends where the tool messages end"
+        );
+    }
+
+    /// A tool message with no content renders the block around nothing, as every other role
+    /// renders a turn around nothing: the tags and the newlines between them are the template's,
+    /// and only the content is missing.
+    #[test]
+    fn a_hermes3_tool_message_with_no_content_renders_an_empty_block() {
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[
+                user_message("Weather?"),
+                Message::Tool {
+                    content: None,
+                    tool_call_id: "1".to_string(),
+                },
+            ]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<|im_start|>user\nWeather?<|im_end|>\n",
+                "<|im_start|>tool\n<tool_response>\n\n</tool_response><|im_end|>",
+                "<|im_start|>assistant\n",
+            )
+        );
     }
 
     #[test]
@@ -2319,6 +2617,8 @@ pub mod tests {
 
     /// The template writes `<|im_end|>` straight after a turn's content. The builder wrote a
     /// newline between the two, so every turn carried a token the model's own template does not.
+    ///
+    /// A tool run that something follows is the template's one exception, pinned below.
     #[test]
     fn a_hermes3_turn_ends_in_the_end_of_turn_token_with_nothing_before_it() {
         for messages in every_trailing_role() {
@@ -2329,12 +2629,14 @@ pub mod tests {
             );
         }
         assert!(
-            messages::messages_to_hermes3_prompt(&[Message::User {
-                content: Some(MessageContent::Text("Hi".to_string())),
-                name: None,
-            }])
-            .contains("<|im_start|>user\nHi<|im_end|>\n"),
+            messages::messages_to_hermes3_prompt(&[user_message("Hi")])
+                .contains("<|im_start|>user\nHi<|im_end|>\n"),
             "the content runs straight into the tag, rather than the tag being absent"
+        );
+        assert!(
+            messages::messages_to_hermes3_prompt(&[tool_message("25 C"), user_message("Hi")])
+                .contains("</tool_response>\n<|im_end|>"),
+            "the exception: a tool run that something follows closes its last block with a newline"
         );
     }
 
