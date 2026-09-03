@@ -2022,6 +2022,22 @@ pub mod tests {
         assert_eq!(result, expected);
     }
 
+    /// A user message carrying `text`, which the Hermes 3 prompt tests build over and over.
+    fn user_message(text: &str) -> Message {
+        Message::User {
+            content: Some(MessageContent::Text(text.to_string())),
+            name: None,
+        }
+    }
+
+    /// A tool message carrying `content`, answering a call the tests do not otherwise name.
+    fn tool_message(content: &str) -> Message {
+        Message::Tool {
+            content: Some(MessageContent::Text(content.to_string())),
+            tool_call_id: "1".to_string(),
+        }
+    }
+
     /// One conversation per trailing role, the assistant's two ways of speaking, and the empty
     /// one.
     fn every_trailing_role() -> [Vec<Message>; 6] {
@@ -2032,10 +2048,7 @@ pub mod tests {
                 content: text("Be brief."),
                 name: None,
             }],
-            vec![Message::User {
-                content: text("Hi"),
-                name: None,
-            }],
+            vec![user_message("Hi")],
             vec![Message::Assistant {
                 content: text("Hello"),
                 name: None,
@@ -2055,10 +2068,7 @@ pub mod tests {
                     },
                 }],
             }],
-            vec![Message::Tool {
-                content: text("25 C"),
-                tool_call_id: "1".to_string(),
-            }],
+            vec![tool_message("25 C")],
         ]
     }
 
@@ -2423,17 +2433,8 @@ pub mod tests {
     /// opening with a tool message gets none.
     #[test]
     fn a_hermes3_tool_message_is_framed_as_a_tool_response_block() {
-        let user = || Message::User {
-            content: Some(MessageContent::Text("Weather?".to_string())),
-            name: None,
-        };
-        let tool = || Message::Tool {
-            content: Some(MessageContent::Text("25 C".to_string())),
-            tool_call_id: "1".to_string(),
-        };
-
         assert_eq!(
-            messages::messages_to_hermes3_prompt(&[user(), tool()]),
+            messages::messages_to_hermes3_prompt(&[user_message("Weather?"), tool_message("25 C")]),
             concat!(
                 "<|begin_of_text|>",
                 "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
@@ -2444,7 +2445,7 @@ pub mod tests {
             "a tool message after a message of another role opens a turn of its own"
         );
         assert_eq!(
-            messages::messages_to_hermes3_prompt(&[tool(), user()]),
+            messages::messages_to_hermes3_prompt(&[tool_message("25 C"), user_message("Weather?")]),
             concat!(
                 "<|begin_of_text|>",
                 "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
@@ -2469,8 +2470,8 @@ pub mod tests {
                         },
                     }],
                 },
-                tool(),
-                user(),
+                tool_message("25 C"),
+                user_message("Weather?"),
             ]),
             concat!(
                 "<|begin_of_text|>",
@@ -2490,17 +2491,12 @@ pub mod tests {
     /// end-of-turn token.
     #[test]
     fn consecutive_hermes3_tool_messages_are_one_turn() {
-        let user = || Message::User {
-            content: Some(MessageContent::Text("Weather?".to_string())),
-            name: None,
-        };
-        let tool = |content: &str| Message::Tool {
-            content: Some(MessageContent::Text(content.to_string())),
-            tool_call_id: "1".to_string(),
-        };
-
         assert_eq!(
-            messages::messages_to_hermes3_prompt(&[user(), tool("25 C"), tool("Cloudy")]),
+            messages::messages_to_hermes3_prompt(&[
+                user_message("Weather?"),
+                tool_message("25 C"),
+                tool_message("Cloudy"),
+            ]),
             concat!(
                 "<|begin_of_text|>",
                 "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
@@ -2514,7 +2510,11 @@ pub mod tests {
             "two blocks in one turn"
         );
         assert_eq!(
-            messages::messages_to_hermes3_prompt(&[tool("25 C"), tool("Cloudy"), user()]),
+            messages::messages_to_hermes3_prompt(&[
+                tool_message("25 C"),
+                tool_message("Cloudy"),
+                user_message("Weather?"),
+            ]),
             concat!(
                 "<|begin_of_text|>",
                 "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
@@ -2525,6 +2525,29 @@ pub mod tests {
                 "<|im_start|>assistant\n",
             ),
             "the run ends where the tool messages end"
+        );
+    }
+
+    /// A tool message with no content renders the block around nothing, as every other role
+    /// renders a turn around nothing: the tags and the newlines between them are the template's,
+    /// and only the content is missing.
+    #[test]
+    fn a_hermes3_tool_message_with_no_content_renders_an_empty_block() {
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[
+                user_message("Weather?"),
+                Message::Tool {
+                    content: None,
+                    tool_call_id: "1".to_string(),
+                },
+            ]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<|im_start|>user\nWeather?<|im_end|>\n",
+                "<|im_start|>tool\n<tool_response>\n\n</tool_response><|im_end|>",
+                "<|im_start|>assistant\n",
+            )
         );
     }
 
@@ -2606,25 +2629,13 @@ pub mod tests {
             );
         }
         assert!(
-            messages::messages_to_hermes3_prompt(&[Message::User {
-                content: Some(MessageContent::Text("Hi".to_string())),
-                name: None,
-            }])
-            .contains("<|im_start|>user\nHi<|im_end|>\n"),
+            messages::messages_to_hermes3_prompt(&[user_message("Hi")])
+                .contains("<|im_start|>user\nHi<|im_end|>\n"),
             "the content runs straight into the tag, rather than the tag being absent"
         );
         assert!(
-            messages::messages_to_hermes3_prompt(&[
-                Message::Tool {
-                    content: Some(MessageContent::Text("25 C".to_string())),
-                    tool_call_id: "1".to_string(),
-                },
-                Message::User {
-                    content: Some(MessageContent::Text("Hi".to_string())),
-                    name: None,
-                },
-            ])
-            .contains("</tool_response>\n<|im_end|>"),
+            messages::messages_to_hermes3_prompt(&[tool_message("25 C"), user_message("Hi")])
+                .contains("</tool_response>\n<|im_end|>"),
             "the exception: a tool run that something follows closes its last block with a newline"
         );
     }
