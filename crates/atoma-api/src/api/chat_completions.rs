@@ -410,12 +410,18 @@ pub(crate) mod messages {
         prompt
     }
 
-    /// Writes one Hermes 3 turn whose content is text alone: the role line, the content if any,
-    /// and the end-of-turn line.
-    fn push_hermes3_turn(prompt: &mut String, role: &str, content: Option<&MessageContent>) {
+    /// Writes one Hermes 3 role line: the start-of-turn token, the role, and the newline the
+    /// template puts before a turn's content.
+    fn push_hermes3_header(prompt: &mut String, role: &str) {
         prompt.push_str("<|im_start|>");
         prompt.push_str(role);
         prompt.push('\n');
+    }
+
+    /// Writes one Hermes 3 turn whose content is text alone: the role line, the content if any,
+    /// and the end-of-turn line.
+    fn push_hermes3_turn(prompt: &mut String, role: &str, content: Option<&MessageContent>) {
+        push_hermes3_header(prompt, role);
         if let Some(content) = content {
             prompt.push_str(&content.to_string());
         }
@@ -442,7 +448,7 @@ pub(crate) mod messages {
                     tool_calls,
                     ..
                 } => {
-                    prompt.push_str("<|im_start|>assistant\n");
+                    push_hermes3_header(&mut prompt, "assistant");
                     if !tool_calls.is_empty() {
                         prompt.push_str("<tool_call>");
                         let tool_calls_str = tool_calls
@@ -463,7 +469,7 @@ pub(crate) mod messages {
             }
         }
 
-        prompt.push_str("<|im_start|>assistant\n");
+        push_hermes3_header(&mut prompt, "assistant");
         prompt
     }
 }
