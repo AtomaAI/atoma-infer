@@ -35,10 +35,19 @@ pub enum CudaForwardError {
     Readback(#[from] ReadbackError),
     #[cfg(not(feature = "nccl"))]
     #[error(transparent)]
-    DecodeStep(#[from] DecodeStepError),
+    DecodeStep(Box<DecodeStepError>),
     /// The forward's logits came back on the host, which no device forward should produce.
     #[error("the logits are not on the device")]
     LogitsNotOnDevice,
+}
+
+/// The step's error is boxed: it carries the operand report of whichever op refused, and every
+/// forward returns this result on its hot path.
+#[cfg(not(feature = "nccl"))]
+impl From<DecodeStepError> for CudaForwardError {
+    fn from(error: DecodeStepError) -> Self {
+        Self::DecodeStep(Box::new(error))
+    }
 }
 
 /// What the Allocation session phase produced for one rank.
