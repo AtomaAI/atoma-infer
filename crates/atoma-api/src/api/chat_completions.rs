@@ -406,7 +406,8 @@ pub(crate) mod messages {
         prompt
     }
 
-    /// Function to convert a list of messages to a prompt string in Hermes3 format.
+    /// Renders a conversation in the Hermes 3 chat format, ending in the assistant header so that
+    /// generation starts inside the assistant turn.
     pub(crate) fn messages_to_hermes3_prompt(messages: &[Message]) -> String {
         let mut prompt = String::new();
 
@@ -456,6 +457,7 @@ pub(crate) mod messages {
             }
         }
 
+        prompt.push_str("<|im_start|>assistant\n");
         prompt
     }
 }
@@ -1830,7 +1832,10 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.\n<|im_end|>\n";
+        let expected = concat!(
+            "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1842,7 +1847,7 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>user\nHello, who are you?\n<|im_end|>\n";
+        let expected = "<|im_start|>user\nHello, who are you?\n<|im_end|>\n<|im_start|>assistant\n";
         assert_eq!(prompt, expected);
     }
 
@@ -1858,7 +1863,10 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>assistant\nI am Hermes 3, a superintelligent AI.\n<|im_end|>\n";
+        let expected = concat!(
+            "<|im_start|>assistant\nI am Hermes 3, a superintelligent AI.\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1870,7 +1878,7 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>tool\nTool response here.\n<|im_end|>\n";
+        let expected = "<|im_start|>tool\nTool response here.\n<|im_end|>\n<|im_start|>assistant\n";
         assert_eq!(prompt, expected);
     }
 
@@ -1893,7 +1901,12 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>assistant\n<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, \"name\": \"get_stock_fundamentals\"}</tool_call>\n<|im_end|>\n";
+        let expected = concat!(
+            "<|im_start|>assistant\n",
+            "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, \"name\": \"get_stock_fundamentals\"}</tool_call>",
+            "\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1924,7 +1937,8 @@ pub mod tests {
         let expected = concat!(
             "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.\n<|im_end|>\n",
             "<|im_start|>user\nFetch stock data for TSLA.\n<|im_end|>\n",
-            "<|im_start|>assistant\nFetching stock data...\n<|im_end|>\n"
+            "<|im_start|>assistant\nFetching stock data...\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
     }
@@ -1934,8 +1948,7 @@ pub mod tests {
         let messages: Vec<Message> = vec![];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = ""; // Empty messages should result in an empty prompt
-        assert_eq!(prompt, expected);
+        assert_eq!(prompt, "<|im_start|>assistant\n");
     }
 
     #[test]
@@ -1946,7 +1959,8 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>user\n\n<|im_end|>\n"; // Handle missing content as an empty string
+        // Missing content is an empty string.
+        let expected = "<|im_start|>user\n\n<|im_end|>\n<|im_start|>assistant\n";
         assert_eq!(prompt, expected);
     }
 
@@ -1978,7 +1992,13 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>assistant\n<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, \"name\": \"get_stock_fundamentals\"}, {\"arguments\": {\"symbol\": \"BTC\"}, \"name\": \"get_crypto_data\"}</tool_call>\n<|im_end|>\n";
+        let expected = concat!(
+            "<|im_start|>assistant\n",
+            "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, \"name\": \"get_stock_fundamentals\"}, ",
+            "{\"arguments\": {\"symbol\": \"BTC\"}, \"name\": \"get_crypto_data\"}</tool_call>",
+            "\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1990,7 +2010,7 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>tool\nStock data for TSLA\n<|im_end|>\n";
+        let expected = "<|im_start|>tool\nStock data for TSLA\n<|im_end|>\n<|im_start|>assistant\n";
         assert_eq!(prompt, expected);
     }
 
@@ -2008,8 +2028,47 @@ pub mod tests {
         ];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>system\n\n<|im_end|>\n<|im_start|>user\n\n<|im_end|>\n";
+        let expected = concat!(
+            "<|im_start|>system\n\n<|im_end|>\n",
+            "<|im_start|>user\n\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
+    }
+
+    /// The same omission as the Llama 3 builder had: the Hermes 3 template ends in
+    /// `<|im_start|>assistant` and a newline under its generation prompt.
+    #[test]
+    fn a_hermes3_prompt_ends_in_the_assistant_header_whatever_the_trailing_role() {
+        let text = |text: &str| Some(MessageContent::Text(text.to_string()));
+        let conversations = [
+            vec![],
+            vec![Message::System {
+                content: text("Be brief."),
+                name: None,
+            }],
+            vec![Message::User {
+                content: text("Hi"),
+                name: None,
+            }],
+            vec![Message::Assistant {
+                content: text("Hello"),
+                name: None,
+                refusal: None,
+                tool_calls: vec![],
+            }],
+            vec![Message::Tool {
+                content: text("25 C"),
+                tool_call_id: "1".to_string(),
+            }],
+        ];
+        for messages in conversations {
+            let prompt = messages::messages_to_hermes3_prompt(&messages);
+            assert!(
+                prompt.ends_with("<|im_start|>assistant\n"),
+                "{messages:?} rendered as {prompt:?}"
+            );
+        }
     }
 
     #[test]
