@@ -465,24 +465,19 @@ pub(crate) mod messages {
         push_hermes3_end_of_turn(prompt);
     }
 
-    /// Whether a message is a tool message, which is what a tool turn's run is made of.
-    fn is_hermes3_tool_message(message: &Message) -> bool {
-        matches!(message, Message::Tool { .. })
-    }
-
-    /// Writes one Hermes 3 tool message as the `tool_use` template does: a `<tool_response>`
-    /// block, with a run of consecutive tool messages sharing one turn.
+    /// Writes one Hermes 3 tool message as a `<tool_response>` block, the way the `tool_use`
+    /// template writes it. Consecutive tool messages share one turn.
     ///
-    /// Two shapes are the template's own. The role line is written only when there is a previous
-    /// message and it is not a tool message, so a conversation opening with a tool message gets
-    /// none. And the end-of-turn token carries no newline, unlike every other role's.
+    /// The role line is written only when the message before this one is not a tool message, so a
+    /// conversation that opens with a tool message gets none. The end-of-turn token is written
+    /// without the newline every other role's turn ends in.
     fn push_hermes3_tool_response(
         prompt: &mut String,
         content: Option<&MessageContent>,
         previous: Option<&Message>,
         next: Option<&Message>,
     ) {
-        if previous.is_some_and(|previous| !is_hermes3_tool_message(previous)) {
+        if previous.is_some_and(|previous| !matches!(previous, Message::Tool { .. })) {
             push_hermes3_header(prompt, "tool");
         }
         prompt.push_str("<tool_response>\n");
@@ -493,7 +488,7 @@ pub(crate) mod messages {
         if next.is_some() {
             prompt.push('\n');
         }
-        if !next.is_some_and(is_hermes3_tool_message) {
+        if !next.is_some_and(|next| matches!(next, Message::Tool { .. })) {
             prompt.push_str(HERMES3_END_OF_TURN);
         }
     }
@@ -692,11 +687,11 @@ pub struct ToolCall {
 /// Floats are written in Python's notation for the same reason.
 struct JsonDumpsFormatter;
 
-/// Rewrites what `serde_json` writes for a float into the notation `json.dumps` writes it in,
-/// which is Python's `repr`. The digits are `serde_json`'s own; only the notation moves.
+/// Rewrites a float `serde_json` has written into the notation `json.dumps` uses, which is
+/// Python's `repr`. The digits are left as they are.
 ///
-/// The two differ in two places. `repr` writes an exponent of two digits at least, and it turns to
-/// scientific notation below `1e-4` where `serde_json` holds out until `1e-5`.
+/// `repr` writes an exponent of two digits at least, and turns to scientific notation below
+/// `1e-4` where `serde_json` waits until `1e-5`.
 fn python_float_notation(written: &str) -> String {
     if let Some((mantissa, exponent)) = written.split_once('e') {
         let (sign, digits) = match exponent.strip_prefix('-') {
@@ -723,7 +718,7 @@ fn python_float_notation(written: &str) -> String {
     format!("{sign}{first}{point}{rest}e-{:02}", zeros + 5)
 }
 
-/// Writes one float in `repr`'s notation, given what `serde_json` writes for it.
+/// Writes one float in `repr`'s notation, from what `serde_json` wrote for it.
 fn write_python_float<W>(writer: &mut W, written: &[u8]) -> std::io::Result<()>
 where
     W: ?Sized + std::io::Write,
@@ -2264,7 +2259,7 @@ pub mod tests {
         assert_eq!(
             arguments(json!({ "a": 1e-5, "b": 1e-6 })),
             "{\"name\": \"f\", \"arguments\": {\"a\": 1e-05, \"b\": 1e-06}}",
-            "the two departures, one value each"
+            "the two values serde_json writes differently"
         );
         assert_eq!(
             arguments(json!({ "a": 0.0001, "b": 1.5, "c": 1e16, "d": -1.25e-7 })),
@@ -2405,8 +2400,7 @@ pub mod tests {
                 "<|im_start|>user\nWeather?<|im_end|>\n",
                 "<|im_start|>assistant\n",
             ),
-            "a tool message with nothing before it is written no role line, and the turn it never \
-             opened is closed all the same"
+            "a tool message with nothing before it gets no role line"
         );
     }
 
@@ -2435,7 +2429,7 @@ pub mod tests {
                 "<|im_end|>",
                 "<|im_start|>assistant\n",
             ),
-            "two responses, one turn"
+            "two blocks in one turn"
         );
         assert_eq!(
             messages::messages_to_hermes3_prompt(&[tool("25 C"), tool("Cloudy"), user()]),
@@ -2448,7 +2442,7 @@ pub mod tests {
                 "<|im_start|>user\nWeather?<|im_end|>\n",
                 "<|im_start|>assistant\n",
             ),
-            "the run ends where the tool messages do, whatever follows"
+            "the run ends where the tool messages end"
         );
     }
 
