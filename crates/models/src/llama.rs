@@ -1,6 +1,7 @@
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{embedding, Embedding, VarBuilder};
-use candle_transformers::models::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
+use candle_nn::{
+    embedding, linear_no_bias as linear, rms_norm, Embedding, Linear, RmsNorm, VarBuilder,
+};
 use serde::Deserialize;
 use std::f32::consts::PI;
 
@@ -413,8 +414,8 @@ impl Block {
         let span = tracing::span!(tracing::Level::TRACE, "block");
         let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg, dtype, device)?;
         let mlp = Mlp::load(&vb.pp("mlp"), cfg)?;
-        let rms_1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let rms_2 = RmsNorm::new(
+        let rms_1 = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let rms_2 = rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
@@ -480,11 +481,11 @@ impl Llama {
     pub fn load(vb: VarBuilder, cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
         let wte = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::from_weights(wte.embeddings().clone(), None)
+            Linear::new(wte.embeddings().clone(), None)
         } else {
             linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
-        let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
+        let ln_f = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)
             .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), cfg, dtype, device).unwrap())
             .collect();
@@ -501,6 +502,56 @@ impl Llama {
     pub fn get_config(&self) -> &Config {
         &self.cfg
     }
+
+    /// The token embedding table, `[vocab, hidden]`.
+    pub fn embeddings(&self) -> &Tensor {
+        self.wte.embeddings()
+    }
+
+    /// Every layer's weights, in layer order.
+    pub fn layer_weights(&self) -> Vec<LayerWeights<'_>> {
+        self.blocks
+            .iter()
+            .map(|block| LayerWeights {
+                input_norm: block.rms_1.weight(),
+                q_proj: block.attn.q_proj.weight(),
+                k_proj: block.attn.k_proj.weight(),
+                v_proj: block.attn.v_proj.weight(),
+                o_proj: block.attn.o_proj.weight(),
+                post_attention_norm: block.rms_2.weight(),
+                gate_proj: block.mlp.c_fc1.weight(),
+                up_proj: block.mlp.c_fc2.weight(),
+                down_proj: block.mlp.c_proj.weight(),
+            })
+            .collect()
+    }
+
+    /// The final norm's gain, `[hidden]`.
+    pub fn final_norm(&self) -> &Tensor {
+        self.ln_f.weight()
+    }
+
+    /// The head projection, `[vocab, hidden]`; the embedding table itself when the checkpoint
+    /// ties them.
+    pub fn lm_head(&self) -> &Tensor {
+        self.lm_head.weight()
+    }
+}
+
+/// One layer's weights as candle holds them: each projection `[out_features, in_features]`,
+/// each norm's gain `[hidden]`. Borrowed views of the loaded tensors, so their device addresses
+/// are the loaded weights' own.
+#[derive(Debug, Clone, Copy)]
+pub struct LayerWeights<'a> {
+    pub input_norm: &'a Tensor,
+    pub q_proj: &'a Tensor,
+    pub k_proj: &'a Tensor,
+    pub v_proj: &'a Tensor,
+    pub o_proj: &'a Tensor,
+    pub post_attention_norm: &'a Tensor,
+    pub gate_proj: &'a Tensor,
+    pub up_proj: &'a Tensor,
+    pub down_proj: &'a Tensor,
 }
 
 #[cfg(test)]
