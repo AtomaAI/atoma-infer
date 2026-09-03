@@ -20,6 +20,8 @@ use std::fmt;
 
 use thiserror::Error;
 
+pub use crate::tensor::Dtype;
+
 /// Index into the bucket ladder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BucketIdx(pub usize);
@@ -39,31 +41,6 @@ pub struct TensorRole(pub usize);
 /// device allocations, so a slot can back any tensor a kernel would otherwise get from
 /// `cuMemAlloc`.
 pub const SLOT_ALIGN: usize = 256;
-
-/// Element type of an activation, used only to turn per-token element counts into byte widths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dtype {
-    F32,
-    Bf16,
-    F16,
-    F8,
-}
-
-impl Dtype {
-    /// Size of one element in bytes.
-    pub fn size_in_bytes(self) -> usize {
-        match self {
-            Dtype::F32 => 4,
-            Dtype::Bf16 | Dtype::F16 => 2,
-            Dtype::F8 => 1,
-        }
-    }
-
-    /// Per-token width in bytes of a role holding `elements_per_token` elements of this type.
-    pub fn width_bytes(self, elements_per_token: usize) -> usize {
-        elements_per_token * self.size_in_bytes()
-    }
-}
 
 /// Half-open range `[first_use, last_use)` of a layer's op order in which a role's slot holds
 /// live data.
