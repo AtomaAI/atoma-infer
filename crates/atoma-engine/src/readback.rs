@@ -8,6 +8,11 @@
 //!
 //! The buffer is pinned as cacheable host memory, never write-combined: the sampler reads every
 //! value of every row, and reads from write-combined memory are uncached.
+//!
+//! Two paths reach the buffer. The candle forward copies from a device tensor on candle's stream
+//! and waits in one call. The tensor path enqueues the copy through the descriptor seam, as the
+//! last descriptor of a step on the capture stream, and waits on it separately once the step is
+//! enqueued.
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -15,9 +20,9 @@ use std::slice;
 use std::sync::Arc;
 
 use atoma_runtime::error::RuntimeError;
-use atoma_runtime::session::Allocation;
-use cudarc::driver::result::{free_host, malloc_host, memcpy_dtoh_async};
-use cudarc::driver::sys::CUevent_flags;
+use atoma_runtime::session::{Allocation, Descriptor};
+use cudarc::driver::result::{event, free_host, malloc_host, memcpy_dtoh_async};
+use cudarc::driver::sys::{self, CUevent_flags};
 use cudarc::driver::{CudaContext, CudaEvent, CudaStream, DevicePtr};
 use thiserror::Error;
 use tracing::warn;
@@ -25,7 +30,7 @@ use tracing::warn;
 use crate::logits::Logits;
 
 /// `cuMemHostAlloc` flags: pinned, cacheable, mapped for this context alone.
-const CACHEABLE_PINNED: u32 = 0;
+pub(crate) const CACHEABLE_PINNED: u32 = 0;
 
 /// Why a step's logits could not be read back.
 #[derive(Debug, Error)]
@@ -40,6 +45,9 @@ pub enum ReadbackError {
         rows: usize,
         vocab: usize,
     },
+    /// A wait with no copy described before it.
+    #[error("no readback copy is pending; describe one with `copy` before waiting on it")]
+    NoCopyPending,
     #[error(transparent)]
     Driver(#[from] RuntimeError),
 }
@@ -53,6 +61,8 @@ pub struct Readback {
     event: CudaEvent,
     vocab: usize,
     max_rows: usize,
+    /// Values the copy described by [`Readback::copy`] brings back, until waited on.
+    pending: Option<usize>,
 }
 
 impl Readback {
@@ -83,7 +93,49 @@ impl Readback {
             event,
             vocab,
             max_rows,
+            pending: None,
         })
+    }
+
+    /// The descriptor that copies `rows` rows of the f32 logits at `device` back on the stream
+    /// it is enqueued on, and records the event behind the copy for [`Readback::wait`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadbackError::TooManyRows`] when `rows` is more than the readback holds.
+    pub fn copy(&mut self, device: u64, rows: usize) -> Result<ReadbackCopy<'_>, ReadbackError> {
+        if rows > self.max_rows {
+            return Err(ReadbackError::TooManyRows {
+                rows,
+                max_rows: self.max_rows,
+            });
+        }
+        let len = rows * self.vocab;
+        self.pending = Some(len);
+        Ok(ReadbackCopy {
+            host: self.buffer,
+            len,
+            device,
+            event: &self.event,
+        })
+    }
+
+    /// Waits for the copy the last [`Readback::copy`] described, and that copy alone, and
+    /// returns its rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadbackError::NoCopyPending`] when no copy was described since the last wait,
+    /// or [`ReadbackError::Driver`] when the wait fails.
+    pub fn wait(&mut self) -> Result<Logits<'_>, ReadbackError> {
+        let Some(len) = self.pending.take() else {
+            return Err(ReadbackError::NoCopyPending);
+        };
+        self.event.synchronize().map_err(RuntimeError::from)?;
+        // SAFETY: `len` values lie within the buffer, the copy into them has completed, and
+        // nothing writes them while this borrow is live.
+        let host = unsafe { slice::from_raw_parts(self.buffer, len) };
+        Ok(Logits::new(host, self.vocab))
     }
 
     /// Copies `rows` rows of `logits` back on `stream` and waits for that copy alone.
@@ -99,6 +151,7 @@ impl Readback {
         rows: usize,
     ) -> Result<Logits<'_>, ReadbackError> {
         let len = selected_len(rows, self.vocab, self.max_rows, logits.len())?;
+        self.pending = None;
         stream
             .context()
             .bind_to_thread()
@@ -128,6 +181,31 @@ impl Drop for Readback {
         if let Err(error) = unsafe { free_host(self.buffer.cast::<c_void>()) } {
             warn!(%error, "the readback's pinned buffer could not be freed");
         }
+    }
+}
+
+/// One step's copy of its selected logits, enqueued on the capture stream as the step's last
+/// descriptor.
+pub struct ReadbackCopy<'a> {
+    host: *mut f32,
+    len: usize,
+    device: u64,
+    event: &'a CudaEvent,
+}
+
+impl Descriptor for ReadbackCopy<'_> {
+    type Error = ReadbackError;
+
+    unsafe fn enqueue(&mut self, stream: sys::CUstream) -> Result<(), ReadbackError> {
+        // SAFETY: `len` values lie within the pinned buffer and nothing else touches them until
+        // the wait; `device` addresses the values the stream's earlier work wrote; the session
+        // hands a live stream; and the event recorded behind the copy is what the wait fences.
+        unsafe {
+            let host = slice::from_raw_parts_mut(self.host, self.len);
+            memcpy_dtoh_async(host, self.device, stream).map_err(RuntimeError::from)?;
+            event::record(self.event.cu_event(), stream).map_err(RuntimeError::from)?;
+        }
+        Ok(())
     }
 }
 
