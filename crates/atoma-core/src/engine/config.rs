@@ -29,6 +29,26 @@ pub struct EngineConfig {
     /// empty schedule can never wedge it. Written in milliseconds wherever configuration is.
     #[serde(rename = "idle_deadline_millis", with = "millis")]
     pub idle_deadline: Duration,
+    /// How long a step may be out with the executor before the executor is treated as lost and
+    /// every live request fails. An executor held inside a step never drops its rings, so this
+    /// is what ends the wait. Written in milliseconds wherever configuration is.
+    #[serde(rename = "step_deadline_millis", with = "millis")]
+    #[validate(custom(function = "step_deadline_is_positive"))]
+    pub step_deadline: Duration,
+}
+
+/// A zero step deadline would fail every step before its result could arrive.
+fn step_deadline_is_positive(deadline: &Duration) -> Result<(), ValidationError> {
+    if !deadline.is_zero() {
+        return Ok(());
+    }
+    let mut error = ValidationError::new("zero_step_deadline");
+    error.message = Some(
+        "step_deadline_millis is 0, which would fail every step before its result arrived; \
+         set it well above the longest step"
+            .into(),
+    );
+    Err(error)
 }
 
 /// Dispatch falls back to eager execution for any batch holding more requests than the captured

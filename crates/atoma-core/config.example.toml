@@ -11,6 +11,8 @@ block_count = 4096
 ingress_capacity = 256
 # How long the thread parks with nothing to do before re-examining its queues.
 idle_deadline_millis = 5
+# How long a step may be out with the executor before the executor is treated as lost.
+step_deadline_millis = 60000
 
 [scheduler]
 # Query tokens one step may compute, summed over entries.
