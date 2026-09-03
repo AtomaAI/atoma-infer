@@ -7,6 +7,7 @@ use thiserror::Error;
 use utoipa::ToSchema;
 
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::ser::{CompactFormatter, Formatter};
 use serde_json::Value;
 
 // TODO: fields that are named `r#type` should have values that represent
@@ -688,12 +689,51 @@ pub struct ToolCall {
 /// `json.dumps` with `ensure_ascii=False`. Its spacing is part of the prompt, so a server that
 /// writes the compact form sends the model a different token sequence for the same tool call.
 ///
-/// One difference is left: a float whose exponent is -5 or below is written as `serde_json`
-/// writes it — `0.00001` and `1e-6` against `json.dumps`' `1e-05` and `1e-06`. Every other
-/// magnitude, and every other type, matches.
+/// Floats are written in Python's notation for the same reason.
 struct JsonDumpsFormatter;
 
-impl serde_json::ser::Formatter for JsonDumpsFormatter {
+/// Rewrites what `serde_json` writes for a float into the notation `json.dumps` writes it in,
+/// which is Python's `repr`. The digits are `serde_json`'s own; only the notation moves.
+///
+/// The two differ in two places. `repr` writes an exponent of two digits at least, and it turns to
+/// scientific notation below `1e-4` where `serde_json` holds out until `1e-5`.
+fn python_float_notation(written: &str) -> String {
+    if let Some((mantissa, exponent)) = written.split_once('e') {
+        let (sign, digits) = match exponent.strip_prefix('-') {
+            Some(digits) => ('-', digits),
+            None => ('+', exponent.trim_start_matches('+')),
+        };
+        return format!("{mantissa}e{sign}{digits:0>2}");
+    }
+
+    let (sign, magnitude) = match written.strip_prefix('-') {
+        Some(magnitude) => ("-", magnitude),
+        None => ("", written),
+    };
+    let Some(fraction) = magnitude.strip_prefix("0.0000") else {
+        return written.to_string();
+    };
+    let zeros = fraction.len() - fraction.trim_start_matches('0').len();
+    let mut digits = fraction[zeros..].chars();
+    let Some(first) = digits.next() else {
+        return written.to_string();
+    };
+    let rest = digits.as_str();
+    let point = if rest.is_empty() { "" } else { "." };
+    format!("{sign}{first}{point}{rest}e-{:02}", zeros + 5)
+}
+
+/// Writes one float in `repr`'s notation, given what `serde_json` writes for it.
+fn write_python_float<W>(writer: &mut W, written: &[u8]) -> std::io::Result<()>
+where
+    W: ?Sized + std::io::Write,
+{
+    // serde_json writes a float as ASCII digits, so nothing is lost in the conversion.
+    let written = String::from_utf8_lossy(written);
+    writer.write_all(python_float_notation(&written).as_bytes())
+}
+
+impl Formatter for JsonDumpsFormatter {
     fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
     where
         W: ?Sized + std::io::Write,
@@ -721,6 +761,24 @@ impl serde_json::ser::Formatter for JsonDumpsFormatter {
         } else {
             writer.write_all(b", ")
         }
+    }
+
+    fn write_f64<W>(&mut self, writer: &mut W, value: f64) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        let mut written = Vec::new();
+        CompactFormatter.write_f64(&mut written, value)?;
+        write_python_float(writer, &written)
+    }
+
+    fn write_f32<W>(&mut self, writer: &mut W, value: f32) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        let mut written = Vec::new();
+        CompactFormatter.write_f32(&mut written, value)?;
+        write_python_float(writer, &written)
     }
 }
 
@@ -1276,9 +1334,10 @@ pub mod tests {
     use atoma_core::types::TokenCount;
 
     use super::{
-        messages, ChatCompletionChunk, ChatCompletionResponse, Choice, CompletionIdentity, Delta,
-        FinishReason, Message, MessageContent, MessageContentPart, MessageContentPartImageUrl,
-        Model, Refused, RequestBody, StreamChoice, ToolCall, ToolCallFunction, Usage,
+        json_dumps, messages, ChatCompletionChunk, ChatCompletionResponse, Choice,
+        CompletionIdentity, Delta, FinishReason, Message, MessageContent, MessageContentPart,
+        MessageContentPartImageUrl, Model, Refused, RequestBody, StreamChoice, ToolCall,
+        ToolCallFunction, Usage,
     };
 
     fn identity(created: u64) -> CompletionIdentity {
@@ -2186,11 +2245,10 @@ pub mod tests {
         );
     }
 
-    /// Where `serde_json` and `json.dumps` disagree, and the magnitudes where they do not. A
-    /// float whose exponent is -5 or below is the one value this builder still writes differently
-    /// from the template: `json.dumps` would write `1e-05` and `1e-06` for the first two.
+    /// `json.dumps` writes a float as Python's `repr` does, which `serde_json` departs from twice:
+    /// it writes `0.00001` where `repr` turns to scientific notation, and pads no exponent.
     #[test]
-    fn a_float_argument_is_written_as_serde_json_writes_it() {
+    fn a_float_argument_is_written_as_the_template_writes_it() {
         let arguments = |arguments: serde_json::Value| {
             let call = ToolCall {
                 id: "1".to_string(),
@@ -2205,14 +2263,30 @@ pub mod tests {
 
         assert_eq!(
             arguments(json!({ "a": 1e-5, "b": 1e-6 })),
-            "{\"name\": \"f\", \"arguments\": {\"a\": 0.00001, \"b\": 1e-6}}",
-            "the departure this builder still carries"
+            "{\"name\": \"f\", \"arguments\": {\"a\": 1e-05, \"b\": 1e-06}}",
+            "the two departures, one value each"
         );
         assert_eq!(
-            arguments(json!({ "a": 0.0001, "b": 1.5, "c": 1e16 })),
-            "{\"name\": \"f\", \"arguments\": {\"a\": 0.0001, \"b\": 1.5, \"c\": 1e+16}}",
-            "every other magnitude matches json.dumps"
+            arguments(json!({ "a": 0.0001, "b": 1.5, "c": 1e16, "d": -1.25e-7 })),
+            "{\"name\": \"f\", \"arguments\": \
+             {\"a\": 0.0001, \"b\": 1.5, \"c\": 1e+16, \"d\": -1.25e-07}}",
+            "the magnitudes on either side of each boundary"
         );
+        assert_eq!(
+            arguments(json!({ "a": 1e15, "b": 1e-100, "c": 0.0, "d": 5e-324 })),
+            "{\"name\": \"f\", \"arguments\": \
+             {\"a\": 1000000000000000.0, \"b\": 1e-100, \"c\": 0.0, \"d\": 5e-324}}",
+            "an exponent of three digits is not padded, and nothing else is rewritten"
+        );
+    }
+
+    /// The digits are `serde_json`'s, whatever the notation: where two shortest representations
+    /// round-trip, `repr` and `serde_json` pick the same one and `f64`'s own `Display` does not.
+    #[test]
+    fn a_float_argument_keeps_the_digits_serde_json_writes() {
+        let value = f64::from_bits(0xc30a_a61f_a224_75ca);
+        assert_eq!(format!("{value}"), "-937625523621561.3");
+        assert_eq!(json_dumps(&json!(value)), "-937625523621561.2");
     }
 
     /// The Llama 3 tool call renders its arguments in the caller's order too, which is
