@@ -1832,12 +1832,10 @@ pub mod tests {
         assert_eq!(result, expected);
     }
 
-    /// Generation starts inside the assistant turn whatever the last message was: without the
-    /// header the model writes one itself, and the role name is decoded and served as content.
-    #[test]
-    fn a_llama3_prompt_ends_in_the_assistant_header_whatever_the_trailing_role() {
+    /// One conversation per trailing role, and the empty one.
+    fn every_trailing_role() -> [Vec<Message>; 5] {
         let text = |text: &str| Some(MessageContent::Text(text.to_string()));
-        let conversations = [
+        [
             vec![],
             vec![Message::System {
                 content: text("Be brief."),
@@ -1857,8 +1855,14 @@ pub mod tests {
                 content: text("25 C"),
                 tool_call_id: "1".to_string(),
             }],
-        ];
-        for messages in conversations {
+        ]
+    }
+
+    /// Generation starts inside the assistant turn whatever the last message was: without the
+    /// header the model writes one itself, and the role name is decoded and served as content.
+    #[test]
+    fn a_llama3_prompt_ends_in_the_assistant_header_whatever_the_trailing_role() {
+        for messages in every_trailing_role() {
             let prompt = messages::messages_to_llama3_prompt(&messages);
             assert!(
                 prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"),
@@ -2083,33 +2087,11 @@ pub mod tests {
         assert_eq!(prompt, expected);
     }
 
-    /// The same omission as the Llama 3 builder had: the Hermes 3 template ends in
-    /// `<|im_start|>assistant` and a newline under its generation prompt.
+    /// The Hermes 3 template ends in `<|im_start|>assistant` and a newline under its generation
+    /// prompt, so generation starts inside the assistant turn whatever the last message was.
     #[test]
     fn a_hermes3_prompt_ends_in_the_assistant_header_whatever_the_trailing_role() {
-        let text = |text: &str| Some(MessageContent::Text(text.to_string()));
-        let conversations = [
-            vec![],
-            vec![Message::System {
-                content: text("Be brief."),
-                name: None,
-            }],
-            vec![Message::User {
-                content: text("Hi"),
-                name: None,
-            }],
-            vec![Message::Assistant {
-                content: text("Hello"),
-                name: None,
-                refusal: None,
-                tool_calls: vec![],
-            }],
-            vec![Message::Tool {
-                content: text("25 C"),
-                tool_call_id: "1".to_string(),
-            }],
-        ];
-        for messages in conversations {
+        for messages in every_trailing_role() {
             let prompt = messages::messages_to_hermes3_prompt(&messages);
             assert!(
                 prompt.ends_with("<|im_start|>assistant\n"),
