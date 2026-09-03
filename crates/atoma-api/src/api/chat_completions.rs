@@ -422,10 +422,12 @@ pub(crate) mod messages {
         prompt.push_str("\n<|im_end|>\n");
     }
 
-    /// Renders a conversation in the Hermes 3 chat format, ending in the assistant header so that
-    /// generation starts inside the assistant turn.
+    /// Renders a conversation in the Hermes 3 chat format: the BOS token its template starts
+    /// with, each turn, and the assistant header so that generation starts inside the assistant
+    /// turn.
     pub(crate) fn messages_to_hermes3_prompt(messages: &[Message]) -> String {
         let mut prompt = String::new();
+        prompt.push_str("<|begin_of_text|>");
 
         for message in messages {
             match message {
@@ -1878,6 +1880,7 @@ pub mod tests {
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
+            "<|begin_of_text|>",
             "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.\n<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
@@ -1892,7 +1895,10 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>user\nHello, who are you?\n<|im_end|>\n<|im_start|>assistant\n";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>user\nHello, who are you?\n<|im_end|>\n<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1909,6 +1915,7 @@ pub mod tests {
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
+            "<|begin_of_text|>",
             "<|im_start|>assistant\nI am Hermes 3, a superintelligent AI.\n<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
@@ -1923,7 +1930,10 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>tool\nTool response here.\n<|im_end|>\n<|im_start|>assistant\n";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>tool\nTool response here.\n<|im_end|>\n<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1947,6 +1957,7 @@ pub mod tests {
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
+            "<|begin_of_text|>",
             "<|im_start|>assistant\n",
             "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
             "\"name\": \"get_stock_fundamentals\"}</tool_call>",
@@ -1981,6 +1992,7 @@ pub mod tests {
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
+            "<|begin_of_text|>",
             "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.\n<|im_end|>\n",
             "<|im_start|>user\nFetch stock data for TSLA.\n<|im_end|>\n",
             "<|im_start|>assistant\nFetching stock data...\n<|im_end|>\n",
@@ -1994,7 +2006,11 @@ pub mod tests {
         let messages: Vec<Message> = vec![];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        assert_eq!(prompt, "<|im_start|>assistant\n");
+        assert_eq!(
+            prompt,
+            "<|begin_of_text|><|im_start|>assistant
+"
+        );
     }
 
     #[test]
@@ -2006,7 +2022,10 @@ pub mod tests {
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         // Missing content is an empty string.
-        let expected = "<|im_start|>user\n\n<|im_end|>\n<|im_start|>assistant\n";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>user\n\n<|im_end|>\n<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -2039,6 +2058,7 @@ pub mod tests {
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
+            "<|begin_of_text|>",
             "<|im_start|>assistant\n",
             "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
             "\"name\": \"get_stock_fundamentals\"}, ",
@@ -2057,7 +2077,10 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>tool\nStock data for TSLA\n<|im_end|>\n<|im_start|>assistant\n";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>tool\nStock data for TSLA\n<|im_end|>\n<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -2076,6 +2099,7 @@ pub mod tests {
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
+            "<|begin_of_text|>",
             "<|im_start|>system\n\n<|im_end|>\n",
             "<|im_start|>user\n\n<|im_end|>\n",
             "<|im_start|>assistant\n",
