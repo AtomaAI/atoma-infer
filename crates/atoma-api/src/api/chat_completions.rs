@@ -433,12 +433,25 @@ pub(crate) mod messages {
         push_hermes3_end_of_turn(prompt);
     }
 
+    /// The system turn the Hermes 3 template writes ahead of a conversation that does not open
+    /// with one of its own.
+    const HERMES3_DEFAULT_SYSTEM_TURN: &str =
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n";
+
     /// Renders a conversation in the Hermes 3 chat format: the BOS token its template starts
-    /// with, each turn, and the assistant header so that generation starts inside the assistant
-    /// turn.
+    /// with, the default system turn where the template writes one, each turn, and the assistant
+    /// header so that generation starts inside the assistant turn.
     pub(crate) fn messages_to_hermes3_prompt(messages: &[Message]) -> String {
         let mut prompt = String::new();
         prompt.push_str("<|begin_of_text|>");
+        // The template's injection sits inside its own loop over the messages, so an empty
+        // conversation is left alone rather than given a system turn to itself.
+        if messages
+            .first()
+            .is_some_and(|first| !matches!(first, Message::System { .. }))
+        {
+            prompt.push_str(HERMES3_DEFAULT_SYSTEM_TURN);
+        }
 
         for message in messages {
             match message {
@@ -1870,6 +1883,7 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
             "<|im_start|>user\nHello, who are you?<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -1889,6 +1903,7 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
             "<|im_start|>assistant\nI am Hermes 3, a superintelligent AI.<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
@@ -1905,6 +1920,7 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
             "<|im_start|>tool\nTool response here.<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -1931,6 +1947,7 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
             "<|im_start|>assistant\n",
             "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
             "\"name\": \"get_stock_fundamentals\"}</tool_call>",
@@ -1993,6 +2010,7 @@ pub mod tests {
         // Missing content is an empty string.
         let expected = concat!(
             "<|begin_of_text|>",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
             "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -2028,6 +2046,7 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
             "<|im_start|>assistant\n",
             "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
             "\"name\": \"get_stock_fundamentals\"}, ",
@@ -2048,6 +2067,7 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
             "<|im_start|>tool\nStock data for TSLA<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -2074,6 +2094,27 @@ pub mod tests {
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
+    }
+
+    /// A conversation that does not open with a system message is given the template's own, so
+    /// the model is addressed under the same system prompt on either server. The template writes
+    /// it from inside its loop over the messages, so an empty conversation gets none.
+    #[test]
+    fn a_hermes3_conversation_is_given_the_templates_system_turn_where_it_writes_one() {
+        let system_turn = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n";
+        for messages in every_trailing_role() {
+            let prompt = messages::messages_to_hermes3_prompt(&messages);
+            let expected = !matches!(messages.first(), None | Some(Message::System { .. }));
+            assert_eq!(
+                prompt.contains(system_turn),
+                expected,
+                "{messages:?} rendered as {prompt:?}"
+            );
+        }
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[]),
+            "<|begin_of_text|><|im_start|>assistant\n"
+        );
     }
 
     /// The template writes `<|im_end|>` straight after a turn's content. The builder wrote a
