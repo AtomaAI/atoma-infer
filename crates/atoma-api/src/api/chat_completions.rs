@@ -271,7 +271,7 @@ impl Message {
 }
 
 pub(crate) mod messages {
-    use super::{Message, Model};
+    use super::{Message, MessageContent, Model};
     use tracing::warn;
 
     /// Function to convert a list of messages to a prompt string in Llama2 format.
@@ -343,6 +343,16 @@ pub(crate) mod messages {
         prompt.push_str("<|end_header_id|>\n\n");
     }
 
+    /// Writes one Llama 3 turn whose content is text alone: the role header, the content if any,
+    /// and the end-of-turn token.
+    fn push_llama3_turn(prompt: &mut String, role: &str, content: Option<&MessageContent>) {
+        push_llama3_header(prompt, role);
+        if let Some(content) = content {
+            prompt.push_str(&content.to_string());
+        }
+        prompt.push_str("<|eot_id|>");
+    }
+
     /// Renders a conversation in the Llama 3 chat format, ending in the assistant header so that
     /// generation starts inside the assistant turn.
     pub(crate) fn messages_to_llama3_prompt(messages: &[Message]) -> String {
@@ -352,18 +362,18 @@ pub(crate) mod messages {
         for message in messages {
             match message {
                 Message::System { content, name } => {
-                    push_llama3_header(&mut prompt, name.as_deref().unwrap_or("system"));
-                    if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
-                    }
-                    prompt.push_str("<|eot_id|>");
+                    push_llama3_turn(
+                        &mut prompt,
+                        name.as_deref().unwrap_or("system"),
+                        content.as_ref(),
+                    );
                 }
                 Message::User { content, name } => {
-                    push_llama3_header(&mut prompt, name.as_deref().unwrap_or("user"));
-                    if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
-                    }
-                    prompt.push_str("<|eot_id|>");
+                    push_llama3_turn(
+                        &mut prompt,
+                        name.as_deref().unwrap_or("user"),
+                        content.as_ref(),
+                    );
                 }
                 Message::Assistant {
                     content,
@@ -392,18 +402,24 @@ pub(crate) mod messages {
                 Message::Tool {
                     content,
                     tool_call_id: _,
-                } => {
-                    push_llama3_header(&mut prompt, "ipython");
-                    if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
-                    }
-                    prompt.push_str("<|eot_id|>");
-                }
+                } => push_llama3_turn(&mut prompt, "ipython", content.as_ref()),
             }
         }
 
         push_llama3_header(&mut prompt, "assistant");
         prompt
+    }
+
+    /// Writes one Hermes 3 turn whose content is text alone: the role line, the content if any,
+    /// and the end-of-turn line.
+    fn push_hermes3_turn(prompt: &mut String, role: &str, content: Option<&MessageContent>) {
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        if let Some(content) = content {
+            prompt.push_str(&content.to_string());
+        }
+        prompt.push_str("\n<|im_end|>\n");
     }
 
     /// Renders a conversation in the Hermes 3 chat format, ending in the assistant header so that
@@ -414,18 +430,10 @@ pub(crate) mod messages {
         for message in messages {
             match message {
                 Message::System { content, .. } => {
-                    prompt.push_str("<|im_start|>system\n");
-                    if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
-                    }
-                    prompt.push_str("\n<|im_end|>\n");
+                    push_hermes3_turn(&mut prompt, "system", content.as_ref());
                 }
                 Message::User { content, .. } => {
-                    prompt.push_str("<|im_start|>user\n");
-                    if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
-                    }
-                    prompt.push_str("\n<|im_end|>\n");
+                    push_hermes3_turn(&mut prompt, "user", content.as_ref());
                 }
                 Message::Assistant {
                     content,
@@ -448,11 +456,7 @@ pub(crate) mod messages {
                     prompt.push_str("\n<|im_end|>\n");
                 }
                 Message::Tool { content, .. } => {
-                    prompt.push_str("<|im_start|>tool\n");
-                    if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
-                    }
-                    prompt.push_str("\n<|im_end|>\n");
+                    push_hermes3_turn(&mut prompt, "tool", content.as_ref());
                 }
             }
         }
