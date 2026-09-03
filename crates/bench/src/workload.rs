@@ -75,6 +75,9 @@ pub trait Vocabulary {
 pub struct HfVocabulary {
     /// The loaded tokenizer.
     tokenizer: tokenizers::Tokenizer,
+    /// How many ids it holds, read once: `get_vocab_size` builds the whole vocabulary map to
+    /// count it, and the count cannot change after loading.
+    size: usize,
 }
 
 impl HfVocabulary {
@@ -103,7 +106,8 @@ impl HfVocabulary {
         let tokenizer = tokenizers::Tokenizer::from_file(&path).map_err(|error| {
             BenchError::Tokenizer(format!("Failed to load {}: {error}", path.display()))
         })?;
-        Ok(Self { tokenizer })
+        let size = tokenizer.get_vocab_size(true);
+        Ok(Self { tokenizer, size })
     }
 }
 
@@ -122,7 +126,7 @@ impl Vocabulary for HfVocabulary {
     }
 
     fn size(&self) -> usize {
-        self.tokenizer.get_vocab_size(true)
+        self.size
     }
 }
 
@@ -346,10 +350,12 @@ pub fn long_context_requests(
     let arrivals = arrivals(plan)?;
     let mut requests = Vec::with_capacity(plan.num_requests);
 
+    let vocabulary_size = vocabulary.size() as u32;
+
     for (index, arrival) in arrivals.into_iter().enumerate() {
         let num_tokens = rng.random_range(shortest..=longest);
         let token_ids = (0..num_tokens)
-            .map(|_| rng.random_range(0..vocabulary.size() as u32))
+            .map(|_| rng.random_range(0..vocabulary_size))
             .collect::<Vec<_>>();
         let prompt = vocabulary.decode(&token_ids)?;
 
@@ -394,6 +400,8 @@ fn arrivals(plan: &LoadPlan) -> Result<Vec<Duration>> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     fn sharegpt_json(conversations: &[(&str, &str)]) -> serde_json::Value {
@@ -565,6 +573,52 @@ mod tests {
             );
             assert_eq!(request.max_tokens, 128);
         }
+    }
+
+    /// A vocabulary that counts what the generator asks of it.
+    struct CountingVocabulary {
+        inner: WordVocabulary,
+        size_calls: Cell<usize>,
+    }
+
+    impl Vocabulary for CountingVocabulary {
+        fn count_tokens(&self, text: &str) -> Result<usize> {
+            self.inner.count_tokens(text)
+        }
+
+        fn decode(&self, token_ids: &[u32]) -> Result<String> {
+            self.inner.decode(token_ids)
+        }
+
+        fn size(&self) -> usize {
+            self.size_calls.set(self.size_calls.get() + 1);
+            self.inner.size()
+        }
+    }
+
+    /// A real tokenizer counts its ids by building its whole vocabulary map, so asking it once per
+    /// token turns minting a long-context prompt into minutes of work. The size is a constant of
+    /// the tokenizer, and the generator has to read it as one.
+    #[test]
+    fn test_the_vocabulary_size_is_read_once_not_once_per_token() {
+        let vocabulary = CountingVocabulary {
+            inner: WordVocabulary,
+            size_calls: Cell::new(0),
+        };
+        let spec = LongContextSpec {
+            input_tokens: 2_000,
+            output_tokens: 16,
+            range_ratio: 0.0,
+        };
+
+        long_context_requests(&vocabulary, &spec, &load_plan(8))
+            .expect("Failed to build the long-context workload");
+
+        assert_eq!(
+            vocabulary.size_calls.get(),
+            1,
+            "16,000 tokens were minted, and the vocabulary size was asked for once"
+        );
     }
 
     /// The recorded prompt length is the measured one: sampled token ids are decoded to text, and

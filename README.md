@@ -74,13 +74,16 @@ into the tracking ticket.
 
 `crates/bench` holds the benchmark harness (`atoma-bench`). It offers an open-loop Poisson workload
 over the OpenAI surface, records TTFT, inter-token and end-to-end latency as hdrhistogram
-distributions, reports goodput at a fixed SLO, samples the engine's free-KV-block gauge for leaks,
-and drives a pinned vLLM baseline over the same workload on the same host for comparison. Copy
+distributions, reports goodput at a fixed SLO, samples the engine's available-KV-block gauge for
+leaks, and drives a pinned vLLM baseline over the same workload on the same host for comparison. Copy
 `crates/bench/bench.example.toml`, then run `cargo run --release -p atoma-bench -- --help`. The
 protocol and the procedure are in
-[docs/benchmarks/rung0-baseline.md](docs/benchmarks/rung0-baseline.md) and the table it produces in
-[docs/benchmarks/rung0-baseline-table.md](docs/benchmarks/rung0-baseline-table.md); no measurements
-have been taken yet.
+[docs/benchmarks/rung0-baseline.md](docs/benchmarks/rung0-baseline.md), and the tables it produced
+on one H100 PCIe against vLLM `v0.26.0` are
+[docs/benchmarks/rung0-baseline-table.md](docs/benchmarks/rung0-baseline-table.md) (ShareGPT) and
+[docs/benchmarks/rung0-baseline-table-long-context.md](docs/benchmarks/rung0-baseline-table-long-context.md)
+(8k input tokens).
+
 ## Configuration and running
 
 The example configuration at the repository root holds everything the server is built from: the

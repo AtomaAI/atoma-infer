@@ -323,8 +323,8 @@ mod tests {
 
     fn passed() -> Option<KvProbeVerdict> {
         Some(KvProbeVerdict::Pass {
-            baseline_free_blocks: 4_096,
-            final_free_blocks: 4_096,
+            baseline_blocks: 4_096,
+            final_blocks: 4_096,
             samples: 20,
         })
     }
@@ -344,8 +344,8 @@ mod tests {
             run_with(passed()),
             run_with(Some(KvProbeVerdict::Leak {
                 reason: "128 of 4096 blocks had not returned once the run drained".to_string(),
-                baseline_free_blocks: 4_096,
-                final_free_blocks: 3_968,
+                baseline_blocks: 4_096,
+                final_blocks: 3_968,
                 samples: 20,
             })),
         ]);
@@ -370,7 +370,7 @@ mod tests {
         assert!(check_kv_pool_held(&engine).is_err());
     }
 
-    /// An engine that publishes no free-block gauge is measured rather than guarded; failing here
+    /// An engine that publishes no block-count gauge is measured rather than guarded; failing here
     /// would stop the harness driving any engine without Prometheus.
     #[test]
     fn test_an_unwatched_engine_is_not_failed_by_the_guard() {

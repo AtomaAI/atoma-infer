@@ -1,7 +1,7 @@
 //! Driving a run.
 //!
 //! One run: offer the workload's requests at their arrival times, whether or not earlier ones have
-//! answered, while the KV-leak probe samples the engine's free-block gauge. What comes out is one
+//! answered, while the KV-leak probe samples the engine's block-count gauge. What comes out is one
 //! [`RunResult`] — the run's numbers and the probe's verdict.
 
 use std::{
