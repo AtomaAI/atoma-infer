@@ -806,10 +806,6 @@ impl RequestBody {
         self.max_completion_tokens
     }
 
-    pub fn max_tokens(&self) -> Option<u32> {
-        self.max_tokens
-    }
-
     pub fn n(&self) -> Option<usize> {
         self.n
     }
