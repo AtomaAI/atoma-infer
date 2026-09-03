@@ -22,7 +22,11 @@ const STATUS_RETURNING_LAUNCHERS: [&str; 2] =
     ["copy_blocks_cache", "reshape_and_cache_flash_cache"];
 
 /// The modules that call into the FFI. Every launch site lives in one of these.
-const CALLER_SOURCES: [&str; 2] = ["src/flash_attention.rs", "src/cache_manager.rs"];
+const CALLER_SOURCES: [&str; 3] = [
+    "src/flash_attention.rs",
+    "src/cache_manager.rs",
+    "src/paged_decode.rs",
+];
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
