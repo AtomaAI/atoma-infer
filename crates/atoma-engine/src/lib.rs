@@ -7,6 +7,7 @@
 
 pub mod batch;
 pub mod config;
+pub mod decode;
 #[cfg(feature = "cuda")]
 pub mod device;
 pub mod executor;
@@ -24,7 +25,9 @@ pub(crate) mod test_support {
     use atoma_core::attention::{
         BackendDeclaration, CaptureContract, ModelDeclaration, SupportLevel,
     };
-    use atoma_core::dispatch::{BucketLadder, DispatchConfig, DispatchDecision, EagerReason};
+    use atoma_core::dispatch::{
+        BucketLadder, DispatchConfig, DispatchDecision, Dispatcher, EagerReason, LiveBatch,
+    };
     use atoma_core::engine::{EngineConfig, EngineHandle};
     use atoma_core::kv::HashAlgorithm;
     use atoma_core::request::{
@@ -217,6 +220,41 @@ pub(crate) mod test_support {
     /// A padding dummy's entry: one token over its own block, never sampling.
     pub(crate) fn dummy(request: u64, block: u32) -> CommandEntry {
         entry(request, 0, vec![PADDING_TOKEN], &[block], false)
+    }
+
+    /// A step command over `live` entries as the engine would issue it: the dispatcher's
+    /// decision for them under [`engine_config`], and as many dummies as their bucket needs,
+    /// each over its own block.
+    pub(crate) fn keyed_command(live: Vec<CommandEntry>) -> StepCommand {
+        let config = engine_config();
+        let mut dispatcher = Dispatcher::new(&config.dispatch, &contract());
+        let token_count: usize = live.iter().map(CommandEntry::query_len).sum();
+        let dispatch = dispatcher.dispatch(LiveBatch {
+            token_count: tokens(token_count),
+            request_count: requests(live.len()),
+            uniform_decode: live.iter().all(|entry| entry.query_len() == 1),
+        });
+        let padding_count = match dispatch {
+            DispatchDecision::FullReplay(key) | DispatchDecision::SegmentedReplay(key) => {
+                key.padded_token_count().get() - token_count
+            }
+            DispatchDecision::Eager(_) => 0,
+        };
+        let mut entries = live;
+        let first_dummy = entries.len() as u64 + 1;
+        let first_block = 100;
+        entries.extend((0..padding_count).map(|index| {
+            dummy(
+                first_dummy + index as u64,
+                first_block + u32::try_from(index).expect("a padding count fits u32"),
+            )
+        }));
+        StepCommand {
+            step: StepId::new(1),
+            entries,
+            padding_count,
+            dispatch,
+        }
     }
 
     /// An eager step command over `entries`, the last `padding_count` of which are dummies.
