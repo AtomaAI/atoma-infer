@@ -98,6 +98,58 @@ extern "C" {
         stream: *mut c_void,
     ) -> c_int;
 
+    /// Returns the `cudaError_t` of the launch.
+    pub(crate) fn decode_embedding_gather_bf16(
+        table: *const c_void,
+        token_ids: *const c_void,
+        out: *mut c_void,
+        hidden: i64,
+        n_tokens: i64,
+        stream: *mut c_void,
+    ) -> c_int;
+
+    /// Returns the `cudaError_t` of the launch.
+    pub(crate) fn decode_rmsnorm_bf16(
+        x: *const c_void,
+        gain: *const c_void,
+        out: *mut c_void,
+        hidden: i64,
+        n_tokens: i64,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> c_int;
+
+    /// Returns the `cudaError_t` of the launch.
+    pub(crate) fn decode_rope_bf16(
+        qkv: *mut c_void,
+        positions: *const c_void,
+        cos_table: *const c_void,
+        sin_table: *const c_void,
+        n_tokens: i64,
+        rot_heads: i64,
+        head_dim: i64,
+        row_width: i64,
+        stream: *mut c_void,
+    ) -> c_int;
+
+    /// Returns the `cudaError_t` of the launch.
+    pub(crate) fn decode_silu_mul_bf16(
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        len: i64,
+        stream: *mut c_void,
+    ) -> c_int;
+
+    /// Returns the `cudaError_t` of the launch.
+    pub(crate) fn decode_add_bf16(
+        lhs: *const c_void,
+        rhs: *const c_void,
+        out: *mut c_void,
+        len: i64,
+        stream: *mut c_void,
+    ) -> c_int;
+
     /// `cudaGetErrorString` for a `cudaError_t` value, as a static NUL-terminated string.
     fn flash_cuda_error_string(code: c_int) -> *const c_char;
 }
