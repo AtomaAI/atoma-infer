@@ -488,10 +488,11 @@ async fn submit(
     ))
 }
 
-/// The token ids of a templated prompt.
+/// The token ids of a templated prompt, with special tokens off: the template writes the BOS
+/// token itself, and the tokenizer's post-processor would prepend a second one.
 fn prompt_ids(tokenizer: &Tokenizer, prompt: String) -> Result<Vec<u32>, TokenizerError> {
     tokenizer
-        .encode(prompt, true)
+        .encode(prompt, false)
         .map(|encoding| encoding.get_ids().to_vec())
 }
 
@@ -551,7 +552,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::test_support::tokenizer;
+    use crate::test_support::{tokenizer, BOS};
 
     const MAX_MODEL_LEN: TokenCount = TokenCount::new(512).expect("nonzero");
     const BLOCK_SIZE: usize = 16;
@@ -734,6 +735,28 @@ mod tests {
         body
     }
 
+    /// The prompt a body renders to, through the same path the handler takes.
+    fn rendered_prompt(body: Value) -> String {
+        serde_json::from_value::<RequestBody>(body)
+            .unwrap()
+            .to_engine_request(0)
+            .unwrap()
+            .prompt
+    }
+
+    /// The template writes the BOS token itself, so the tokenizer must not prepend a second one.
+    #[test]
+    fn a_templated_prompt_tokenizes_to_exactly_one_bos() {
+        let tokenizer = tokenizer();
+        let bos = tokenizer.token_to_id(BOS).unwrap();
+        let hermes = json!({ "model": "NousResearch/Hermes-3-Llama-3.1-8B" });
+        for body in [completion_body(json!({})), completion_body(hermes)] {
+            let ids = prompt_ids(&tokenizer, rendered_prompt(body)).unwrap();
+            assert_eq!(ids.first(), Some(&bos), "{ids:?}");
+            assert_eq!(ids.iter().filter(|&&id| id == bos).count(), 1, "{ids:?}");
+        }
+    }
+
     #[tokio::test]
     async fn a_completion_is_served_whole_through_the_engine_and_the_executor() {
         let served = serve("a", Duration::from_secs(30));
@@ -746,14 +769,11 @@ mod tests {
         assert_eq!(body["choices"][0]["message"]["content"], "aaaa");
         assert_eq!(body["choices"][0]["finish_reason"], "length");
         assert_eq!(body["usage"]["completion_tokens"], 4);
-        let prompt_tokens = served
-            .tokenizer
-            .encode("<|begin_of_text|>", true)
-            .unwrap()
-            .get_ids()
-            .len();
-        assert!(
-            body["usage"]["prompt_tokens"].as_u64().unwrap() as usize > prompt_tokens,
+        let prompt = rendered_prompt(completion_body(json!({})));
+        let prompt_tokens = prompt_ids(&served.tokenizer, prompt).unwrap().len();
+        assert_eq!(
+            body["usage"]["prompt_tokens"].as_u64().unwrap(),
+            u64::try_from(prompt_tokens).unwrap(),
             "the prompt is the templated conversation: {body}"
         );
         served.shutdown();
