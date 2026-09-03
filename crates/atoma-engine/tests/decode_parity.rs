@@ -356,7 +356,17 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
         let (ours, theirs) = (argmax(tensor_row), argmax(candle_row));
         if ours != theirs {
             parity.argmax_disagreements += 1;
-            eprintln!("step {step} row {row}: decode step argmax {ours}, candle argmax {theirs}");
+            // Both forwards' logits for both ids: a disagreement on a pair the two forwards
+            // separate by less than their numeric spread is a near-tie, not a wrong row.
+            let (ours_at, theirs_at) = (at(ours), at(theirs));
+            eprintln!(
+                "step {step} row {row}: decode step argmax {ours} (step {:.4}, candle {:.4}), \
+                 candle argmax {theirs} (step {:.4}, candle {:.4})",
+                tensor_row[ours_at],
+                candle_row[ours_at],
+                tensor_row[theirs_at],
+                candle_row[theirs_at]
+            );
         }
         let diff = tensor_row
             .iter()
@@ -451,6 +461,11 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
         "the largest logit difference {} is above the bound {bound}",
         parity.max_abs_diff
     );
+}
+
+/// A token id as an index into a logits row.
+fn at(token: u32) -> usize {
+    usize::try_from(token).expect("a token id indexes its row")
 }
 
 fn argmax(row: &[f32]) -> u32 {
