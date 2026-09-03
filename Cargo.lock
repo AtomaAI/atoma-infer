@@ -223,6 +223,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atoma-models"
+version = "0.1.0"
+dependencies = [
+ "atoma-runtime",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "atoma-runtime"
 version = "0.1.0"
 dependencies = [
