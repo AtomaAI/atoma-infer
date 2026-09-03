@@ -5,6 +5,8 @@
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use validator::Validate;
+
 use crate::attention::{CaptureContract, SupportLevel};
 use crate::dispatch::{BucketLadder, DispatchConfig};
 use crate::engine::mock::MockExecutor;
@@ -60,6 +62,7 @@ fn config(max_requests: usize, ingress_capacity: usize) -> EngineConfig {
         block_count: u32::try_from(BLOCKS).unwrap(),
         ingress_capacity: requests(ingress_capacity),
         idle_deadline: Duration::from_millis(1),
+        step_deadline: WAIT,
     }
 }
 
@@ -368,13 +371,47 @@ fn a_result_that_does_not_match_the_step_in_flight_is_fatal() {
 }
 
 #[test]
-fn the_idle_deadline_is_a_duration_written_in_milliseconds() {
+fn the_deadlines_are_durations_written_in_milliseconds() {
     let config = config(8, 8);
     let json = serde_json::to_string(&config).unwrap();
     assert!(json.contains(r#""idle_deadline_millis":1"#), "{json}");
+    assert!(json.contains(r#""step_deadline_millis":30000"#), "{json}");
     let back: EngineConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(back.idle_deadline, Duration::from_millis(1));
+    assert_eq!(back.step_deadline, WAIT);
     assert_eq!(back, config);
+}
+
+#[test]
+fn a_zero_step_deadline_is_refused() {
+    let mut config = config(8, 8);
+    config.step_deadline = Duration::ZERO;
+    let errors = config.validate().unwrap_err().to_string();
+    assert!(errors.contains("step_deadline_millis is 0"), "{errors}");
+}
+
+#[test]
+fn a_step_out_past_the_step_deadline_fails_every_live_request_and_exits() {
+    let mut config = config(8, 8);
+    config.step_deadline = Duration::from_millis(20);
+    // The executor's ends are held, unanswered, for the whole test: the exit is the deadline's.
+    let (mut engine, handle, rings) = Engine::new(&config, &contract()).unwrap();
+    let running = submit(&handle, 2, 16);
+    engine.pass();
+    let waiting = submit(&handle, 2, 16);
+    assert_eq!(
+        engine.pass(),
+        Pass::Continue,
+        "the step is within its deadline"
+    );
+    assert!(engine.state().step_in_flight);
+
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(engine.pass(), Pass::Exit);
+    assert_eq!(finish_reason(&running), Some(FinishReason::ExecutorLost));
+    assert_eq!(finish_reason(&waiting), Some(FinishReason::ExecutorLost));
+    assert_eq!(engine.state().live_requests, 0);
+    drop(rings);
 }
 
 #[test]
@@ -515,6 +552,23 @@ fn a_drain_is_answered_from_the_thread_and_shutdown_returns_it() {
     assert_eq!(finish_reason(&late), Some(FinishReason::Shutdown));
     assert_engine_gone(&handle);
     assert!(handle.control.try_send(Control::Shutdown).is_err());
+}
+
+/// An executor that holds its rings and never answers — a leader kept inside a collective by a
+/// rank that died mid-step — is given up on at the step deadline, not waited on to the idle
+/// deadline.
+#[test]
+fn a_wedged_executor_fails_every_live_request_and_returns_the_thread_at_the_step_deadline() {
+    let mut config = config(8, 8);
+    config.idle_deadline = LONG_DEADLINE;
+    config.step_deadline = Duration::from_millis(50);
+    let (handle, rings, engine) = Engine::spawn(&config, &contract()).unwrap();
+    let client = submit(&handle, 3, 16);
+    wait_until("the thread to give the step up", || engine.is_finished());
+    engine.join();
+    assert_eq!(finish_reason(&client), Some(FinishReason::ExecutorLost));
+    assert_engine_gone(&handle);
+    drop(rings);
 }
 
 #[test]

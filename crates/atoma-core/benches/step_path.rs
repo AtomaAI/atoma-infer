@@ -87,6 +87,7 @@ fn decode_config() -> EngineConfig {
         .expect("fits u32"),
         ingress_capacity: requests(live),
         idle_deadline: Duration::from_millis(1),
+        step_deadline: Duration::from_mins(1),
     }
 }
 
@@ -114,6 +115,7 @@ fn churn_config() -> EngineConfig {
         .expect("fits u32"),
         ingress_capacity: requests(live),
         idle_deadline: Duration::from_millis(1),
+        step_deadline: Duration::from_mins(1),
     }
 }
 
