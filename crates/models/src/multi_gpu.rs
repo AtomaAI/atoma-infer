@@ -25,17 +25,6 @@ impl TensorParallelColumnLinear {
         let weight = vb.get_with_hints(shape, "weight", shard(0, rank, size))?;
         Ok(Self::new(Linear::new(weight, None)))
     }
-
-    pub fn load_multi(vb: VarBuilder, prefixes: &[&str], comm: Rc<Comm>) -> Result<Self> {
-        let rank = comm.rank();
-        let size = comm.world_size();
-        let weights: Vec<_> = prefixes
-            .iter()
-            .map(|p| vb.pp(p).get_with_hints((), "weight", shard(0, rank, size)))
-            .collect::<Result<Vec<_>>>()?;
-        let weight = Tensor::cat(&weights, 0)?;
-        Ok(Self::new(Linear::new(weight, None)))
-    }
 }
 
 pub struct TensorParallelRowLinear {
