@@ -1,5 +1,6 @@
-//! The forward on the device: a step command's batch arrays uploaded, the Llama forward over the
-//! paged KV cache on candle's stream, and the selected logits read back to the host.
+//! The forward on the device: a keyed decode batch on the step over runtime-owned tensors, every
+//! other batch through the Llama forward on candle's stream, and the selected logits read back
+//! to the host either way.
 
 use std::sync::Arc;
 
@@ -15,6 +16,16 @@ use crate::forward::Forward;
 use crate::logits::Logits;
 use crate::readback::{Readback, ReadbackError};
 
+#[cfg(not(feature = "nccl"))]
+use atoma_core::dispatch::DispatchDecision;
+#[cfg(not(feature = "nccl"))]
+use tracing::debug;
+
+#[cfg(not(feature = "nccl"))]
+use crate::decode::batch::{DecodeBatch, Route};
+#[cfg(not(feature = "nccl"))]
+use crate::device::decode::{TensorPath, TensorPathError};
+
 /// Why a step could not be run on the device.
 #[derive(Debug, Error)]
 pub enum CudaForwardError {
@@ -22,6 +33,9 @@ pub enum CudaForwardError {
     Candle(#[from] candle_core::Error),
     #[error(transparent)]
     Readback(#[from] ReadbackError),
+    #[cfg(not(feature = "nccl"))]
+    #[error(transparent)]
+    TensorPath(#[from] TensorPathError),
     /// The forward's logits came back on the host, which no device forward should produce.
     #[error("the logits are not on the device")]
     LogitsNotOnDevice,
@@ -41,19 +55,95 @@ pub struct Allocated {
 /// The model forward on one rank's device.
 ///
 /// Holds the session's Replay phase for the process lifetime: nothing is captured in this crate,
-/// and holding the phase is what keeps the allocation from being reopened.
+/// and holding the phase is what keeps the allocation from being reopened. The step over runtime
+/// tensors is enqueued through it; under NCCL the decode step stays on candle and there is none.
 pub struct CudaForward {
     allocated: Allocated,
-    _session: Replay,
+    #[cfg(not(feature = "nccl"))]
+    tensor_path: TensorPath,
+    session: Replay,
 }
 
 impl CudaForward {
     #[must_use]
-    pub fn new(allocated: Allocated, session: Replay) -> Self {
+    pub fn new(
+        allocated: Allocated,
+        #[cfg(not(feature = "nccl"))] tensor_path: TensorPath,
+        session: Replay,
+    ) -> Self {
         Self {
             allocated,
-            _session: session,
+            #[cfg(not(feature = "nccl"))]
+            tensor_path,
+            session,
         }
+    }
+
+    /// The batch as the tensor path serves it, when the layout is keyed and the shape its graphs
+    /// bake; a keyed batch it does not serve is logged and runs on candle.
+    #[cfg(not(feature = "nccl"))]
+    fn keyed_batch(&self, layout: &BatchLayout) -> Result<Option<DecodeBatch>, CudaForwardError> {
+        let key = match layout.dispatch {
+            DispatchDecision::FullReplay(key) | DispatchDecision::SegmentedReplay(key) => key,
+            DispatchDecision::Eager(_) => return Ok(None),
+        };
+        match self.tensor_path.route(layout, key)? {
+            Route::Bucket(batch) => Ok(Some(batch)),
+            Route::Eager(reason) => {
+                debug!(%reason, "keyed batch served on candle");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Runs `batch` on the step over runtime tensors and reads its live rows back.
+    #[cfg(not(feature = "nccl"))]
+    fn tensor_step(
+        &mut self,
+        layout: &BatchLayout,
+        batch: DecodeBatch,
+    ) -> Result<Logits<'_>, CudaForwardError> {
+        let Self {
+            allocated,
+            tensor_path,
+            session,
+        } = self;
+        let Some(readback) = allocated.readback.as_mut() else {
+            return Ok(Logits::new(&[], allocated.vocab));
+        };
+        Ok(tensor_path.step(session, layout, batch, readback)?)
+    }
+
+    /// Runs `layout` through the Llama forward on candle's stream and reads the selected rows
+    /// back.
+    fn candle_forward(&mut self, layout: &BatchLayout) -> Result<Logits<'_>, CudaForwardError> {
+        let Uploaded {
+            tokens,
+            positions,
+            selected,
+            metadata,
+        } = self.upload(layout)?;
+        let Allocated {
+            device,
+            weights,
+            kv_cache,
+            readback,
+            vocab,
+        } = &mut self.allocated;
+        let kv_caches = kv_cache.layers_mut();
+        let logits = weights
+            .llama_mut()
+            .forward(&tokens, &positions, &selected, &kv_caches, metadata)?;
+        #[cfg(not(feature = "nccl"))]
+        self.tensor_path.after_candle(device.stream())?;
+        let rows = layout.selected.len();
+        let Some(readback) = readback else {
+            return Ok(Logits::new(&[], *vocab));
+        };
+        if rows == 0 {
+            return Ok(Logits::new(&[], *vocab));
+        }
+        read_back(readback, device.stream(), &logits, rows)
     }
 
     /// The forward's inputs and attention metadata, uploaded from `layout`.
@@ -107,31 +197,11 @@ impl Forward for CudaForward {
     type Error = CudaForwardError;
 
     fn forward(&mut self, layout: &BatchLayout) -> Result<Logits<'_>, CudaForwardError> {
-        let Uploaded {
-            tokens,
-            positions,
-            selected,
-            metadata,
-        } = self.upload(layout)?;
-        let Allocated {
-            device,
-            weights,
-            kv_cache,
-            readback,
-            vocab,
-        } = &mut self.allocated;
-        let kv_caches = kv_cache.layers_mut();
-        let logits = weights
-            .llama_mut()
-            .forward(&tokens, &positions, &selected, &kv_caches, metadata)?;
-        let rows = layout.selected.len();
-        let Some(readback) = readback else {
-            return Ok(Logits::new(&[], *vocab));
-        };
-        if rows == 0 {
-            return Ok(Logits::new(&[], *vocab));
+        #[cfg(not(feature = "nccl"))]
+        if let Some(batch) = self.keyed_batch(layout)? {
+            return self.tensor_step(layout, batch);
         }
-        read_back(readback, device.stream(), &logits, rows)
+        self.candle_forward(layout)
     }
 }
 

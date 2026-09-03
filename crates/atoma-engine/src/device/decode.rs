@@ -1,0 +1,538 @@
+//! The decode step over runtime-owned tensors on one rank's device: built once at Allocation
+//! from the addresses candle loaded the weights and cache at, and run for every keyed batch.
+//!
+//! Candle keeps owning the weights and the cache; this module snapshots their device addresses
+//! into tensor views, allocates the arena, the step's fixed buffers and the cuBLAS workspace,
+//! resolves every usable bucket's slot tables, and holds the step descriptor over them. A step is
+//! then four descriptors on the capture stream: the fence after candle's stream, the input upload,
+//! the model step, and the logits copy, followed by one host wait. Nothing is captured here; going
+//! through the descriptor seam is what lets a later capture record the same step unchanged.
+
+use std::sync::Arc;
+
+use atoma_core::dispatch::{DispatchConfig, GraphKey};
+use atoma_core::types::TokenCount;
+use atoma_models::attention::AttentionPlan;
+use atoma_models::dims::{DimsError, Llama3RopeScaling, LlamaDims, RopeParams};
+use atoma_models::gemm::{GemmError, StepBlas, WORKSPACE_BYTES};
+use atoma_models::kernels::RotaryTensors;
+use atoma_models::layer::LLAMA_LAYER;
+use atoma_models::llama::slots::{
+    Bucket, BucketSlots, LayerWeights, LlamaCache, LlamaWeights, SlotError, SlotSources,
+    StepStatics,
+};
+use atoma_models::llama::step::{LlamaDecode, LlamaStep, StepError};
+use atoma_models::rope::RotaryTables;
+use atoma_runtime::arena::{ArenaError, ArenaLayout, BucketIdx, CaptureArena};
+use atoma_runtime::error::RuntimeError;
+use atoma_runtime::session::{Allocation, Replay};
+use atoma_runtime::tensor::{Dtype, Layout, Tensor, TensorError};
+use candle_core::cuda::CudaStorageSlice;
+use candle_core::{DType, Storage};
+use cudarc::driver::sys::CUdevice_attribute;
+use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DevicePtr};
+use models::llama::{Config, Llama3RopeType};
+use thiserror::Error;
+use tracing::info;
+
+use crate::batch::BatchLayout;
+use crate::config::Dtype as ConfiguredDtype;
+use crate::decode::batch::{DecodeBatch, DecodeBatchError, DecodeBuckets, Route};
+use crate::decode::inputs::{DecodeInputs, Fence, InputTensors, InputsError, Upload};
+use crate::decode::staging::StagingShape;
+use crate::device::{KvCache, RankDevice, Weights};
+use crate::logits::Logits;
+use crate::readback::{Readback, ReadbackError};
+
+/// Why the tensor path could not be built or a step could not be run on it.
+#[derive(Debug, Error)]
+pub enum TensorPathError {
+    #[error(
+        "model.dtype is {dtype:?}; the decode step over runtime tensors runs bf16 only, so set \
+         model.dtype = \"bf16\""
+    )]
+    NotBf16 { dtype: ConfiguredDtype },
+    #[error("{what} is {dtype:?} on the device; the step reads bf16")]
+    WeightDtype { what: &'static str, dtype: DType },
+    #[error("{what} is not on the device")]
+    NotOnDevice { what: &'static str },
+    #[error("{what} is not contiguous on the device")]
+    NotContiguous { what: &'static str },
+    #[error("{what} holds {held} elements; the step views {expected}")]
+    ElementCount {
+        what: &'static str,
+        held: usize,
+        expected: usize,
+    },
+    #[error(
+        "no rung of engine.dispatch.bucket_ladder is at or below captured_max_requests of \
+         {captured_max}; the decode step needs one bucket to serve"
+    )]
+    NoUsableBucket { captured_max: usize },
+    #[error("the device reports {count} multiprocessors, which is not a count")]
+    MultiprocessorCount { count: i32 },
+    #[error(transparent)]
+    Dims(#[from] DimsError),
+    #[error(transparent)]
+    Arena(#[from] ArenaError),
+    #[error(transparent)]
+    Tensor(#[from] TensorError),
+    #[error(transparent)]
+    Slot(#[from] SlotError),
+    #[error(transparent)]
+    Step(#[from] StepError),
+    #[error(transparent)]
+    Gemm(#[from] GemmError),
+    #[error(transparent)]
+    Inputs(#[from] InputsError),
+    #[error(transparent)]
+    Readback(#[from] ReadbackError),
+    #[error(transparent)]
+    Batch(#[from] DecodeBatchError),
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+    #[error(transparent)]
+    Candle(#[from] candle_core::Error),
+}
+
+/// What the tensor path is sized from: the buckets it serves and the sequence it must hold.
+#[derive(Debug, Clone)]
+pub struct TensorPathPlan {
+    pub dispatch: DispatchConfig,
+    pub max_model_len: TokenCount,
+    pub block_size: TokenCount,
+    pub dtype: ConfiguredDtype,
+}
+
+/// The step's outputs and workspace on the device, owned here for as long as the views over
+/// them are read.
+struct Statics {
+    _logits: CudaSlice<u8>,
+    _softmax_lse: CudaSlice<u8>,
+    _lse_accum: CudaSlice<u8>,
+    _o_accum: CudaSlice<u8>,
+    _cos: CudaSlice<f32>,
+    _sin: CudaSlice<f32>,
+}
+
+/// The decode step over runtime-owned tensors, and everything it addresses.
+pub struct TensorPath {
+    buckets: DecodeBuckets,
+    inputs: DecodeInputs,
+    decode: LlamaDecode,
+    blas: StepBlas,
+    /// Recorded on candle's stream after every candle forward; the step waits on it.
+    candle_done: CudaEvent,
+    _arena: CudaSlice<u8>,
+    _statics: Statics,
+}
+
+impl TensorPath {
+    /// Builds the path over `weights` and `kv_cache` as candle loaded them, for the buckets
+    /// `plan` makes usable, during the Allocation phase.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorPathError`] when the model is not loaded in bf16, no bucket is usable, a
+    /// weight or cache is not the shape the step reads, or the device refuses an allocation.
+    pub fn build(
+        allocation: &Allocation,
+        device: &RankDevice,
+        weights: &Weights,
+        kv_cache: &KvCache,
+        plan: &TensorPathPlan,
+    ) -> Result<Self, TensorPathError> {
+        if plan.dtype != ConfiguredDtype::Bf16 {
+            return Err(TensorPathError::NotBf16 { dtype: plan.dtype });
+        }
+        let buckets = DecodeBuckets::usable(&plan.dispatch);
+        if buckets.tokens().is_empty() {
+            return Err(TensorPathError::NoUsableBucket {
+                captured_max: plan.dispatch.captured_max_requests.get(),
+            });
+        }
+        let llama = weights.llama();
+        let dims = llama_dims(llama.get_config())?;
+        let stream = device.stream();
+        let shape = StagingShape {
+            max_tokens: buckets.largest(),
+            block_table_width: StagingShape::block_table_width(
+                plan.max_model_len.get(),
+                plan.block_size.get(),
+            ),
+            max_position: dims.rope.max_position,
+        };
+        let sm_count = multiprocessors(stream)?;
+        let plans: Vec<AttentionPlan> = buckets
+            .tokens()
+            .iter()
+            .map(|&tokens| {
+                AttentionPlan::new(
+                    &dims,
+                    tokens,
+                    plan.block_size.get(),
+                    shape.block_table_width,
+                    sm_count,
+                )
+            })
+            .collect();
+
+        let arena = CaptureArena::new(
+            dims.layers + 1,
+            LLAMA_LAYER.role_table(&dims),
+            buckets.tokens(),
+            ArenaLayout::Greedy,
+        )?;
+        let arena_memory = zeroed(stream, arena.total_size())?;
+        let memory = Tensor::new(
+            allocation,
+            address(&arena_memory, stream),
+            Layout::contiguous(
+                &[arena.total_size() / Dtype::Bf16.size_in_bytes()],
+                Dtype::Bf16,
+            )?,
+        )?;
+        let inputs = DecodeInputs::new(allocation, stream, shape)?;
+        let (statics, step_statics) =
+            allocate_statics(allocation, stream, &dims, &plans, shape, inputs.tensors())?;
+        let sources = SlotSources {
+            memory: &memory,
+            arena: &arena,
+            statics: &step_statics,
+            dims: &dims,
+        };
+        let slots = buckets
+            .tokens()
+            .iter()
+            .zip(&plans)
+            .enumerate()
+            .map(|(index, (&tokens, plan))| {
+                let bucket = Bucket {
+                    index: BucketIdx(index),
+                    tokens,
+                };
+                BucketSlots::resolve(&sources, bucket, *plan)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let decode = LlamaDecode::new(
+            dims,
+            snapshot_weights(allocation, llama, stream)?,
+            snapshot_cache(allocation, kv_cache, &dims, stream)?,
+            step_statics.rotary,
+            slots,
+        )?;
+        let blas = StepBlas::new(allocation, zeroed(stream, WORKSPACE_BYTES)?)?;
+        let candle_done = stream
+            .context()
+            .new_event(None)
+            .map_err(RuntimeError::from)?;
+        info!(
+            buckets = ?buckets.tokens(),
+            arena_bytes = arena.total_size(),
+            block_table_width = shape.block_table_width,
+            multiprocessors = sm_count,
+            "decode step over runtime tensors built"
+        );
+        Ok(Self {
+            buckets,
+            inputs,
+            decode,
+            blas,
+            candle_done,
+            _arena: arena_memory,
+            _statics: statics,
+        })
+    }
+
+    /// Where a batch keyed by `key` runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorPathError::Batch`] when the layout contradicts its key.
+    pub fn route(&self, layout: &BatchLayout, key: GraphKey) -> Result<Route, TensorPathError> {
+        Ok(DecodeBatch::route(
+            layout,
+            key,
+            &self.buckets,
+            self.inputs.shape().block_table_width,
+        )?)
+    }
+
+    /// Runs `batch`'s step through `session` and reads its live rows' logits back through
+    /// `readback`: the inputs staged, then the fence, the upload, the model step and the logits
+    /// copy enqueued in that order, then the host wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorPathError`] when the inputs cannot be staged, a descriptor cannot be
+    /// enqueued, or the readback fails.
+    pub fn step<'a>(
+        &mut self,
+        session: &Replay,
+        layout: &BatchLayout,
+        batch: DecodeBatch,
+        readback: &'a mut Readback,
+    ) -> Result<Logits<'a>, TensorPathError> {
+        self.stage(layout, &batch)?;
+        session.run(&mut Fence::new(&self.candle_done))?;
+        session.run(&mut self.upload(&batch))?;
+        session.run(&mut self.descriptor(batch.bucket)?)?;
+        let logits = self.decode.bucket(batch.bucket)?.statics.logits.address();
+        session.run(&mut readback.copy(logits, batch.live)?)?;
+        Ok(readback.wait()?)
+    }
+
+    /// Writes `batch`'s inputs from `layout` into the pinned staging.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorPathError::Inputs`] when the layout cannot be staged.
+    pub fn stage(
+        &mut self,
+        layout: &BatchLayout,
+        batch: &DecodeBatch,
+    ) -> Result<(), TensorPathError> {
+        Ok(self.inputs.stage(layout, batch)?)
+    }
+
+    /// The descriptor that copies `batch`'s rows of the staged inputs to the device.
+    #[must_use]
+    pub fn upload(&self, batch: &DecodeBatch) -> Upload<'_> {
+        self.inputs.upload(batch)
+    }
+
+    /// The descriptor that enqueues `bucket`'s model step over the uploaded inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorPathError::Step`] when no such bucket was resolved.
+    pub fn descriptor(&self, bucket: BucketIdx) -> Result<LlamaStep<'_>, TensorPathError> {
+        Ok(self.decode.step(bucket, &self.blas)?)
+    }
+
+    /// Records that candle's stream has finished a forward; the next step waits on it before
+    /// reading the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorPathError::Runtime`] when the event cannot be recorded.
+    pub fn after_candle(&self, stream: &Arc<CudaStream>) -> Result<(), TensorPathError> {
+        self.candle_done
+            .record(stream)
+            .map_err(RuntimeError::from)?;
+        Ok(())
+    }
+}
+
+/// The dimensions the step reads off the checkpoint's configuration.
+fn llama_dims(config: &Config) -> Result<LlamaDims, TensorPathError> {
+    let scaling = config.rope_scaling.as_ref().and_then(|scaling| {
+        matches!(scaling.rope_type, Llama3RopeType::Llama3).then(|| Llama3RopeScaling {
+            factor: scaling.factor,
+            low_freq_factor: scaling.low_freq_factor,
+            high_freq_factor: scaling.high_freq_factor,
+            original_max_position_embeddings: scaling.original_max_position_embeddings,
+        })
+    });
+    // The kernel takes a single-precision epsilon; the checkpoint's double is far inside it.
+    #[allow(clippy::cast_possible_truncation)]
+    let rms_eps = config.rms_norm_eps as f32;
+    let dims = LlamaDims {
+        layers: config.num_hidden_layers,
+        hidden: config.hidden_size,
+        num_heads: config.num_attention_heads,
+        num_kv_heads: config.num_key_value_heads,
+        head_dim: config.hidden_size / config.num_attention_heads,
+        ffn: config.intermediate_size,
+        vocab: config.vocab_size,
+        rms_eps,
+        rope: RopeParams {
+            theta: config.rope_theta,
+            scaling,
+            max_position: config.max_position_embeddings,
+        },
+    };
+    dims.check()?;
+    Ok(dims)
+}
+
+/// The device's multiprocessor count, which the attention split heuristic sizes by.
+fn multiprocessors(stream: &Arc<CudaStream>) -> Result<usize, TensorPathError> {
+    let count = stream
+        .context()
+        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+        .map_err(RuntimeError::from)?;
+    usize::try_from(count).map_err(|_| TensorPathError::MultiprocessorCount { count })
+}
+
+/// `bytes` zeroed bytes on `stream`'s device.
+fn zeroed(stream: &Arc<CudaStream>, bytes: usize) -> Result<CudaSlice<u8>, TensorPathError> {
+    Ok(stream
+        .alloc_zeros::<u8>(bytes)
+        .map_err(RuntimeError::from)?)
+}
+
+/// The device address of a buffer. Event tracking is disabled at context creation, so the read
+/// guard is a no-op and the address is stable for the buffer's lifetime.
+fn address<T>(slice: &CudaSlice<T>, stream: &Arc<CudaStream>) -> u64 {
+    let (address, _reads) = slice.device_ptr(stream);
+    address
+}
+
+/// A view of `dims` over the bf16 device tensor candle holds as `tensor`.
+fn snapshot(
+    allocation: &Allocation,
+    what: &'static str,
+    tensor: &candle_core::Tensor,
+    dims: &[usize],
+    stream: &Arc<CudaStream>,
+) -> Result<Tensor, TensorPathError> {
+    let (storage, layout) = tensor.storage_and_layout();
+    let Storage::Cuda(storage) = &*storage else {
+        return Err(TensorPathError::NotOnDevice { what });
+    };
+    if !layout.is_contiguous() {
+        return Err(TensorPathError::NotContiguous { what });
+    }
+    let CudaStorageSlice::BF16(slice) = &storage.slice else {
+        return Err(TensorPathError::WeightDtype {
+            what,
+            dtype: tensor.dtype(),
+        });
+    };
+    let expected: usize = dims.iter().product();
+    let held = layout.shape().elem_count();
+    if held != expected {
+        return Err(TensorPathError::ElementCount {
+            what,
+            held,
+            expected,
+        });
+    }
+    let start = layout.start_offset() * Dtype::Bf16.size_in_bytes();
+    let view = Layout::contiguous(dims, Dtype::Bf16)?;
+    Ok(Tensor::new(
+        allocation,
+        address(slice, stream) + start as u64,
+        view,
+    )?)
+}
+
+/// Every weight of `llama`, viewed at the address candle loaded it to.
+fn snapshot_weights(
+    allocation: &Allocation,
+    llama: &models::llama::Llama,
+    stream: &Arc<CudaStream>,
+) -> Result<LlamaWeights, TensorPathError> {
+    let view = |what: &'static str, tensor: &candle_core::Tensor| {
+        snapshot(allocation, what, tensor, tensor.dims(), stream)
+    };
+    let layers = llama
+        .layer_weights()
+        .into_iter()
+        .map(|layer| {
+            Ok(LayerWeights {
+                input_norm: view("an input norm gain", layer.input_norm)?,
+                q: view("a query projection", layer.q_proj)?,
+                k: view("a key projection", layer.k_proj)?,
+                v: view("a value projection", layer.v_proj)?,
+                o: view("an output projection", layer.o_proj)?,
+                post_attention_norm: view("a post-attention norm gain", layer.post_attention_norm)?,
+                gate: view("a gate projection", layer.gate_proj)?,
+                up: view("an up projection", layer.up_proj)?,
+                down: view("a down projection", layer.down_proj)?,
+            })
+        })
+        .collect::<Result<Vec<_>, TensorPathError>>()?;
+    Ok(LlamaWeights {
+        embedding: view("the embedding table", llama.embeddings())?,
+        layers,
+        final_norm: view("the final norm gain", llama.final_norm())?,
+        lm_head: view("the head projection", llama.lm_head())?,
+    })
+}
+
+/// Every layer's cache, viewed as `[2, blocks, block_size, kv_width]` at the address candle
+/// allocated it: the key-value heads of a slot flattened, since the view holds four dimensions
+/// and the kernel takes the head stride on its own.
+fn snapshot_cache(
+    allocation: &Allocation,
+    kv_cache: &KvCache,
+    dims: &LlamaDims,
+    stream: &Arc<CudaStream>,
+) -> Result<LlamaCache, TensorPathError> {
+    let caches = kv_cache
+        .layers()
+        .iter()
+        .map(|cache| {
+            let shape = cache.dims();
+            let (blocks, block_size) = (shape.get(1).copied(), shape.get(2).copied());
+            let view = [
+                2,
+                blocks.unwrap_or(0),
+                block_size.unwrap_or(0),
+                dims.kv_width(),
+            ];
+            snapshot(allocation, "a layer's cache", cache, &view, stream)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(LlamaCache::new(&caches, dims)?)
+}
+
+/// Allocates the step's outputs, its attention workspace at the largest any bucket needs, and
+/// the rotary tables, and views each.
+fn allocate_statics(
+    allocation: &Allocation,
+    stream: &Arc<CudaStream>,
+    dims: &LlamaDims,
+    plans: &[AttentionPlan],
+    shape: StagingShape,
+    inputs: InputTensors,
+) -> Result<(Statics, StepStatics), TensorPathError> {
+    let largest = |bytes: fn(&AttentionPlan) -> usize| plans.iter().map(bytes).max().unwrap_or(0);
+    let f32s = |bytes: usize| -> Result<(CudaSlice<u8>, Tensor), TensorPathError> {
+        let buffer = zeroed(stream, bytes)?;
+        let layout = Layout::contiguous(&[bytes / Dtype::F32.size_in_bytes()], Dtype::F32)?;
+        let tensor = Tensor::new(allocation, address(&buffer, stream), layout)?;
+        Ok((buffer, tensor))
+    };
+    let logits_bytes = Dtype::F32.width_bytes(shape.max_tokens * dims.vocab);
+    let (logits_buffer, logits_flat) = f32s(logits_bytes)?;
+    let logits = logits_flat.reshape(&[shape.max_tokens, dims.vocab])?;
+    let (softmax_lse_buffer, softmax_lse) = f32s(largest(AttentionPlan::softmax_lse_bytes))?;
+    let (lse_accum_buffer, lse_accum) = f32s(largest(AttentionPlan::lse_accum_bytes))?;
+    let (o_accum_buffer, o_accum) = f32s(largest(AttentionPlan::o_accum_bytes))?;
+
+    let tables = RotaryTables::new(dims);
+    let upload = |values: &[f32]| -> Result<(CudaSlice<f32>, Tensor), TensorPathError> {
+        let buffer = stream.memcpy_stod(values).map_err(RuntimeError::from)?;
+        let layout = Layout::contiguous(&[tables.max_position(), tables.pairs()], Dtype::F32)?;
+        let tensor = Tensor::new(allocation, address(&buffer, stream), layout)?;
+        Ok((buffer, tensor))
+    };
+    let (cos_buffer, cos) = upload(tables.cos())?;
+    let (sin_buffer, sin) = upload(tables.sin())?;
+
+    Ok((
+        Statics {
+            _logits: logits_buffer,
+            _softmax_lse: softmax_lse_buffer,
+            _lse_accum: lse_accum_buffer,
+            _o_accum: o_accum_buffer,
+            _cos: cos_buffer,
+            _sin: sin_buffer,
+        },
+        StepStatics {
+            token_ids: inputs.token_ids,
+            positions: inputs.positions,
+            seqlens_k: inputs.seqlens_k,
+            slot_mapping: inputs.slot_mapping,
+            block_table: inputs.block_table,
+            logits,
+            softmax_lse,
+            lse_accum,
+            o_accum,
+            rotary: RotaryTensors { cos, sin },
+        },
+    ))
+}

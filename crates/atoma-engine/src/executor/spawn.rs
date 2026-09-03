@@ -15,6 +15,8 @@ use thiserror::Error;
 use tracing::info;
 
 use crate::config::{DeviceOrdinal, ExecutorConfig, ModelConfig, Rank, RankConfig};
+#[cfg(not(feature = "nccl"))]
+use crate::device::decode::{TensorPath, TensorPathPlan};
 use crate::device::forward::{Allocated, CudaForward};
 use crate::device::{Checkpoint, KvCache, KvGeometry, RankDevice, Weights};
 use crate::executor::{
@@ -58,6 +60,8 @@ struct RankPlan {
     max_batch: RequestCount,
     dtype: DType,
     files: ModelFiles,
+    #[cfg(not(feature = "nccl"))]
+    tensor_path: TensorPathPlan,
     #[cfg(feature = "nccl")]
     collective: Id,
 }
@@ -95,6 +99,13 @@ pub fn spawn_ranks(
         max_batch: engine.scheduler.max_batch,
         dtype: model.dtype.into(),
         files: files.clone(),
+        #[cfg(not(feature = "nccl"))]
+        tensor_path: TensorPathPlan {
+            dispatch: engine.dispatch.clone(),
+            max_model_len: engine.scheduler.max_model_len,
+            block_size: engine.scheduler.block_size,
+            dtype: model.dtype,
+        },
         #[cfg(feature = "nccl")]
         collective: Id::new().map_err(|error| StartupError::Collective { status: error.0 })?,
     };
@@ -130,8 +141,8 @@ pub fn spawn_ranks(
 }
 
 /// Opens the forward of rank `rank` on the current thread: drives the rank's session from
-/// Allocation to Replay, allocating everything the rank holds in between, and hands back the
-/// forward that holds it all.
+/// Allocation to Replay, allocating everything the rank holds in between, the step over runtime
+/// tensors included, and hands back the forward that holds it all.
 fn open_forward(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<CudaForward, Cause> {
     let context = RuntimeContext::new(ordinal.get())?;
     let allocation = Allocation::new(&context)?;
@@ -161,8 +172,11 @@ fn open_forward(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<C
     } else {
         None
     };
+    #[cfg(not(feature = "nccl"))]
+    let tensor_path =
+        TensorPath::build(&allocation, &device, &weights, &kv_cache, &plan.tensor_path)?;
     let session = allocation.into_capture().into_replay();
-    info!(%rank, "session in its Replay phase; serving eagerly");
+    info!(%rank, "session in its Replay phase; serving through it");
     Ok(CudaForward::new(
         Allocated {
             device,
@@ -171,6 +185,8 @@ fn open_forward(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<C
             readback,
             vocab: config.vocab_size,
         },
+        #[cfg(not(feature = "nccl"))]
+        tensor_path,
         session,
     ))
 }

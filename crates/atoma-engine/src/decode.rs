@@ -14,3 +14,42 @@
 pub mod batch;
 pub mod inputs;
 pub mod staging;
+
+use atoma_core::attention::{BackendDeclaration, SupportLevel};
+
+/// What the decode step over runtime tensors declares to the capture contract: it serves every
+/// uniform single-token decode batch, so the engine keys those and pads them to their bucket.
+/// Under NCCL the decode step stays on candle and nothing is keyed.
+#[must_use]
+pub fn declaration() -> BackendDeclaration {
+    BackendDeclaration::new("flash-attention", support_level())
+}
+
+#[cfg(not(feature = "nccl"))]
+fn support_level() -> SupportLevel {
+    SupportLevel::UniformSingleTokenDecode
+}
+
+#[cfg(feature = "nccl")]
+fn support_level() -> SupportLevel {
+    SupportLevel::Never
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_declaration_keys_uniform_single_token_decodes_unless_ranks_are_coupled() {
+        let declaration = declaration();
+        assert_eq!(declaration.name(), "flash-attention");
+        #[cfg(not(feature = "nccl"))]
+        assert_eq!(
+            declaration.support_level(),
+            SupportLevel::UniformSingleTokenDecode
+        );
+        #[cfg(feature = "nccl")]
+        assert_eq!(declaration.support_level(), SupportLevel::Never);
+        assert!(declaration.break_points().is_empty());
+    }
+}

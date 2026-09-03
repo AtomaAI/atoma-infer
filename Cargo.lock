@@ -188,6 +188,7 @@ name = "atoma-engine"
 version = "0.1.0"
 dependencies = [
  "atoma-core",
+ "atoma-models",
  "atoma-runtime",
  "candle-core",
  "candle-nn",
