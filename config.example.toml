@@ -48,8 +48,9 @@ eos_token_ids = [ 128001, 128008, 128009 ]
 hash_algorithm = "sha256_v1"
 
 [engine.dispatch]
-# The token buckets the engine captures graphs for. Written order carries no meaning.
-bucket_ladder = [ 1, 1024, 128, 16, 2, 2048, 256, 32, 4, 4096, 512, 64, 8, 8192 ]
+# The token buckets the engine captures graphs for: decode-sized, since a uniform-decode batch
+# has as many tokens as entries and no larger rung can fill. Written order carries no meaning.
+bucket_ladder = [ 1, 16, 2, 24, 32, 4, 8 ]
 # The largest request count any captured graph serves.
 captured_max_requests = 32
 
