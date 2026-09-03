@@ -10,6 +10,7 @@
 //! |---|---|
 //! | [`dims`] | The dimensions a Llama decode step is shaped by, checked once |
 //! | [`layer`] | A layer class: the op order and the roles each op reads and writes; Llama's one class |
+//! | [`llama`] | The Llama decode step: its slot tables, resolved through the arena once |
 //! | [`attention`] | Paged decode attention: the per-bucket plan and the calls it assembles |
 //! | [`gemm`] | The step's multiplications, through a cuBLAS handle bound to the capture stream |
 //! | [`kernels`] | The step's own kernels, each call assembled from checked tensor views |
@@ -20,4 +21,5 @@ pub mod dims;
 pub mod gemm;
 pub mod kernels;
 pub mod layer;
+pub mod llama;
 pub mod rope;
