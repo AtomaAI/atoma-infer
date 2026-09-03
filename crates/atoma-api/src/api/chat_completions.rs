@@ -417,14 +417,20 @@ pub(crate) mod messages {
         prompt.push('\n');
     }
 
+    /// Closes one Hermes 3 turn. The template writes the end-of-turn token straight after the
+    /// turn's content, so nothing separates them.
+    fn push_hermes3_end_of_turn(prompt: &mut String) {
+        prompt.push_str("<|im_end|>\n");
+    }
+
     /// Writes one Hermes 3 turn whose content is text alone: the role line, the content if any,
-    /// and the end-of-turn line.
+    /// and the end-of-turn token.
     fn push_hermes3_turn(prompt: &mut String, role: &str, content: Option<&MessageContent>) {
         push_hermes3_header(prompt, role);
         if let Some(content) = content {
             prompt.push_str(&content.to_string());
         }
-        prompt.push_str("\n<|im_end|>\n");
+        push_hermes3_end_of_turn(prompt);
     }
 
     /// Renders a conversation in the Hermes 3 chat format: the BOS token its template starts
@@ -462,7 +468,7 @@ pub(crate) mod messages {
                     } else if let Some(content) = content {
                         prompt.push_str(&content.to_string());
                     }
-                    prompt.push_str("\n<|im_end|>\n");
+                    push_hermes3_end_of_turn(&mut prompt);
                 }
                 Message::Tool { content, .. } => {
                     push_hermes3_turn(&mut prompt, "tool", content.as_ref());
@@ -1848,7 +1854,7 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.\n<|im_end|>\n",
+            "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -1864,7 +1870,7 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>user\nHello, who are you?\n<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>user\nHello, who are you?<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
     }
@@ -1883,7 +1889,7 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>assistant\nI am Hermes 3, a superintelligent AI.\n<|im_end|>\n",
+            "<|im_start|>assistant\nI am Hermes 3, a superintelligent AI.<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -1899,7 +1905,7 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>tool\nTool response here.\n<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>tool\nTool response here.<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
     }
@@ -1928,7 +1934,7 @@ pub mod tests {
             "<|im_start|>assistant\n",
             "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
             "\"name\": \"get_stock_fundamentals\"}</tool_call>",
-            "\n<|im_end|>\n",
+            "<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -1960,9 +1966,9 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.\n<|im_end|>\n",
-            "<|im_start|>user\nFetch stock data for TSLA.\n<|im_end|>\n",
-            "<|im_start|>assistant\nFetching stock data...\n<|im_end|>\n",
+            "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.<|im_end|>\n",
+            "<|im_start|>user\nFetch stock data for TSLA.<|im_end|>\n",
+            "<|im_start|>assistant\nFetching stock data...<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -1987,7 +1993,7 @@ pub mod tests {
         // Missing content is an empty string.
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>user\n\n<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
     }
@@ -2026,7 +2032,7 @@ pub mod tests {
             "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
             "\"name\": \"get_stock_fundamentals\"}, ",
             "{\"arguments\": {\"symbol\": \"BTC\"}, \"name\": \"get_crypto_data\"}</tool_call>",
-            "\n<|im_end|>\n",
+            "<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -2042,7 +2048,7 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>tool\nStock data for TSLA\n<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>tool\nStock data for TSLA<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
     }
@@ -2063,11 +2069,24 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>system\n\n<|im_end|>\n",
-            "<|im_start|>user\n\n<|im_end|>\n",
+            "<|im_start|>system\n<|im_end|>\n",
+            "<|im_start|>user\n<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
+    }
+
+    /// The template writes `<|im_end|>` straight after a turn's content. The builder wrote a
+    /// newline between the two, so every turn carried a token the model's own template does not.
+    #[test]
+    fn a_hermes3_turn_ends_in_the_end_of_turn_token_with_nothing_before_it() {
+        for messages in every_trailing_role() {
+            let prompt = messages::messages_to_hermes3_prompt(&messages);
+            assert!(
+                !prompt.contains("\n<|im_end|>"),
+                "{messages:?} rendered as {prompt:?}"
+            );
+        }
     }
 
     /// The Hermes 3 template ends in `<|im_start|>assistant` and a newline under its generation
