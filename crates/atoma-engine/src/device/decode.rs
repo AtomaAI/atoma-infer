@@ -226,6 +226,10 @@ impl DecodeStep {
             .context()
             .new_event(None)
             .map_err(RuntimeError::from)?;
+        // Every allocation, zero fill and table upload above went to candle's stream, and the
+        // first step may be keyed before any candle forward records the event a step waits on;
+        // the stream is joined here, in the Allocation phase, where a synchronize is legal.
+        stream.synchronize().map_err(RuntimeError::from)?;
         info!(
             buckets = ?buckets.tokens(),
             arena_bytes = arena.total_size(),
@@ -258,25 +262,30 @@ impl DecodeStep {
         )?)
     }
 
-    /// Runs `batch`'s step through `session` and reads its live rows' logits back through
-    /// `readback`: the inputs staged, then the fence, the upload, the model step and the logits
-    /// copy enqueued in that order, then the host wait.
+    /// Runs `batch`'s step through `session`: the inputs staged, then the fence, the upload, the
+    /// model step and the logits copy enqueued in that order, then the host wait on the copy.
+    /// A rank with no readback runs the same step and waits for it instead, so the next step's
+    /// staging is fenced either way, and returns no rows.
     ///
     /// # Errors
     ///
     /// Returns [`DecodeStepError`] when the inputs cannot be staged, a descriptor cannot be
-    /// enqueued, or the readback fails.
+    /// enqueued, or the wait fails.
     pub fn run<'a>(
         &mut self,
         session: &Replay,
         layout: &BatchLayout,
         batch: DecodeBatch,
-        readback: &'a mut Readback,
+        readback: Option<&'a mut Readback>,
     ) -> Result<Logits<'a>, DecodeStepError> {
         self.stage(layout, &batch)?;
         session.run(&mut Fence::new(&self.candle_done))?;
         session.run(&mut self.upload(&batch))?;
         session.run(&mut self.descriptor(batch.bucket)?)?;
+        let Some(readback) = readback else {
+            session.synchronize()?;
+            return Ok(Logits::new(&[], self.decode.dims().vocab));
+        };
         let logits = self.decode.bucket(batch.bucket)?.statics.logits.address();
         session.run(&mut readback.copy(logits, batch.live)?)?;
         Ok(readback.wait()?)

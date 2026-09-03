@@ -96,7 +96,7 @@ impl CudaForward {
         }
     }
 
-    /// Runs `batch` on the step over runtime tensors and reads its live rows back.
+    /// Runs `batch` on the decode step and reads its live rows back, when this rank reads any.
     #[cfg(not(feature = "nccl"))]
     fn run_decode_step(
         &mut self,
@@ -108,10 +108,7 @@ impl CudaForward {
             decode_step,
             session,
         } = self;
-        let Some(readback) = allocated.readback.as_mut() else {
-            return Ok(Logits::new(&[], allocated.vocab));
-        };
-        Ok(decode_step.run(session, layout, batch, readback)?)
+        Ok(decode_step.run(session, layout, batch, allocated.readback.as_mut())?)
     }
 
     /// Runs `layout` through the Llama forward on candle's stream and reads the selected rows

@@ -4,7 +4,10 @@
 //! KV cache, records the step under capture to show the driver accepts it, then runs decode steps
 //! of varying ids, lengths and block tables through both forwards and compares their logits: the
 //! argmax of every live row must agree, and the largest absolute difference is reported against a
-//! bound.
+//! bound. Around every keyed step the device's free memory is read, and it must not change: the
+//! session captures in relaxed mode, where an allocation from the capturing thread is legal, so
+//! the recording alone does not prove the step allocates nothing, and a lazy allocation that
+//! stays is what the free-memory check catches.
 //!
 //! Needs a device, the CUDA toolkit and a Llama checkpoint loadable in bf16; run through
 //! `scripts/decode-parity.sh`. Under NCCL the decode step stays on candle and there is nothing
@@ -38,6 +41,7 @@ use atoma_engine::readback::Readback;
 use atoma_runtime::arena::BucketIdx;
 use atoma_runtime::context::RuntimeContext;
 use atoma_runtime::session::{Allocation, BakedBuffers, Replay};
+use cudarc::driver::result::mem_get_info;
 
 const DEFAULT_MODEL: &str = "NousResearch/Meta-Llama-3.1-8B-Instruct";
 const BLOCK_SIZE: usize = 16;
@@ -315,6 +319,7 @@ fn compare_step(
         .map(|&index| (index, &sequences[index]))
         .collect();
     let (keyed, on_candle) = decode_commands(&live, dispatcher, dummy_block, 200 + step as u64);
+    let (free_before, _) = mem_get_info().expect("the device reports its free memory");
     let tensor_logits: Vec<Vec<f32>> = {
         let logits = forward
             .forward(&lay_out(&keyed))
@@ -323,6 +328,13 @@ fn compare_step(
             .map(|row| logits.row(row).expect("row").to_vec())
             .collect()
     };
+    let (free_after, _) = mem_get_info().expect("the device reports its free memory");
+    assert_eq!(
+        free_before,
+        free_after,
+        "step {step}: the decode step left {} bytes allocated",
+        free_before.abs_diff(free_after)
+    );
     let candle_logits = forward
         .forward(&lay_out(&on_candle))
         .expect("the eager step runs on candle");

@@ -6,8 +6,9 @@
 //! belongs in one place, on the host, evaluated once at Allocation.
 //!
 //! Every value is f32, one row per position up to the model's maximum, `head_dim / 2` columns.
-//! The tables are the same numbers candle's rotary cache holds for the same configuration, which
-//! is what keeps the two forwards' rotations identical.
+//! The frequencies are the ones candle's rotary cache is built from. Candle rounds its tables to
+//! the model's dtype and rotates in it, while these stay f32 and the kernel rotates in f32, so
+//! the two rotations agree to the model's precision rather than bit for bit.
 
 use std::f32::consts::PI;
 
