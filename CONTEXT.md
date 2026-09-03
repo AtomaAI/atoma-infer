@@ -351,6 +351,12 @@ What the executor returns for one step: each sampling entry's token and whatever
 needs to advance request state.
 _Avoid_: model output, step output, sampler output
 
+**Readback**:
+The one device-to-host copy per step that brings the selected logits to the host: into a pinned
+buffer sized for the largest batch, enqueued on the forward's stream, and waited on through the
+buffer's own event and nothing else.
+_Avoid_: download, sync (for this copy), logits fetch
+
 **Drain**:
 The control message that stops admission and lets running requests finish. The engine is
 drained when no step is in flight and nothing runs; that is the point at which control is

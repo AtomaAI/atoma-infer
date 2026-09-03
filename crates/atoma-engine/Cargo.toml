@@ -7,11 +7,16 @@ version     = { workspace = true }
 
 [dependencies]
 atoma-core          = { workspace = true }
+atoma-runtime       = { workspace = true }
 candle-core         = { workspace = true }
+candle-nn           = { workspace = true, optional = true }
 candle-transformers = { workspace = true }
 core_affinity       = { workspace = true }
 crossbeam-utils     = { workspace = true }
+cudarc              = { workspace = true }
 flume               = { workspace = true }
+hf-hub              = { workspace = true }
+models              = { workspace = true, optional = true }
 rtrb                = { workspace = true }
 serde               = { workspace = true, features = [ "derive" ] }
 serde_json          = { workspace = true }
@@ -19,9 +24,21 @@ thiserror           = { workspace = true }
 tracing             = { workspace = true }
 validator           = { workspace = true, features = [ "derive" ] }
 
+[features]
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+    "dep:candle-nn",
+    "dep:models",
+    "models/cuda",
+]
+nccl = [ "atoma-runtime/nccl", "cuda", "cudarc/nccl", "models/nccl" ]
+
 [dev-dependencies]
 figment     = { workspace = true, features = [ "toml" ] }
 parking_lot = { workspace = true }
+tempfile    = { workspace = true }
 
 [lints.clippy]
 await_holding_lock      = "deny"
