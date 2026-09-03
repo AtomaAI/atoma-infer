@@ -3,6 +3,7 @@
 use atoma_core::request::{SamplingParams, Usage as EngineUsage};
 use atoma_core::types::TokenCount;
 use std::collections::HashMap;
+use std::io;
 use thiserror::Error;
 use utoipa::ToSchema;
 
@@ -730,7 +731,9 @@ struct JsonDumpsFormatter;
 /// Python's `repr`. The digits are left as they are.
 ///
 /// `repr` writes an exponent of two digits at least, and turns to scientific notation below
-/// `1e-4` where `serde_json` waits until `1e-5`.
+/// `1e-4` where `serde_json` waits until `1e-5`. So the magnitudes the two write in different
+/// notations are the ones in `[1e-5, 1e-4)`, which `serde_json` writes with four zeros after the
+/// point and the first significant digit straight behind them.
 fn python_float_notation(written: &str) -> String {
     if let Some((mantissa, exponent)) = written.split_once('e') {
         let (sign, digits) = match exponent.strip_prefix('-') {
@@ -747,30 +750,19 @@ fn python_float_notation(written: &str) -> String {
     let Some(fraction) = magnitude.strip_prefix("0.0000") else {
         return written.to_string();
     };
-    let zeros = fraction.len() - fraction.trim_start_matches('0').len();
-    let mut digits = fraction[zeros..].chars();
+    let mut digits = fraction.chars();
     let Some(first) = digits.next() else {
         return written.to_string();
     };
     let rest = digits.as_str();
     let point = if rest.is_empty() { "" } else { "." };
-    format!("{sign}{first}{point}{rest}e-{:02}", zeros + 5)
-}
-
-/// Writes one float in `repr`'s notation, from what `serde_json` wrote for it.
-fn write_python_float<W>(writer: &mut W, written: &[u8]) -> std::io::Result<()>
-where
-    W: ?Sized + std::io::Write,
-{
-    // serde_json writes a float as ASCII digits, so this fails only if it wrote something else.
-    let written = str::from_utf8(written).map_err(std::io::Error::other)?;
-    writer.write_all(python_float_notation(written).as_bytes())
+    format!("{sign}{first}{point}{rest}e-05")
 }
 
 impl Formatter for JsonDumpsFormatter {
-    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
     where
-        W: ?Sized + std::io::Write,
+        W: ?Sized + io::Write,
     {
         if first {
             Ok(())
@@ -779,16 +771,16 @@ impl Formatter for JsonDumpsFormatter {
         }
     }
 
-    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> io::Result<()>
     where
-        W: ?Sized + std::io::Write,
+        W: ?Sized + io::Write,
     {
         writer.write_all(b": ")
     }
 
-    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
     where
-        W: ?Sized + std::io::Write,
+        W: ?Sized + io::Write,
     {
         if first {
             Ok(())
@@ -797,22 +789,28 @@ impl Formatter for JsonDumpsFormatter {
         }
     }
 
-    fn write_f64<W>(&mut self, writer: &mut W, value: f64) -> std::io::Result<()>
+    fn write_f64<W>(&mut self, writer: &mut W, value: f64) -> io::Result<()>
     where
-        W: ?Sized + std::io::Write,
+        W: ?Sized + io::Write,
     {
         let mut written = Vec::new();
         CompactFormatter.write_f64(&mut written, value)?;
-        write_python_float(writer, &written)
+        // serde_json writes a float as ASCII digits, so this fails only if it wrote something
+        // else.
+        let written = str::from_utf8(&written).map_err(|error| {
+            io::Error::other(format!(
+                "serde_json wrote the float {value} as bytes that are not UTF-8: {error}"
+            ))
+        })?;
+        writer.write_all(python_float_notation(written).as_bytes())
     }
 
-    fn write_f32<W>(&mut self, writer: &mut W, value: f32) -> std::io::Result<()>
+    /// Python has one float type, so a template renders an `f32` as the double it widens to.
+    fn write_f32<W>(&mut self, writer: &mut W, value: f32) -> io::Result<()>
     where
-        W: ?Sized + std::io::Write,
+        W: ?Sized + io::Write,
     {
-        let mut written = Vec::new();
-        CompactFormatter.write_f32(&mut written, value)?;
-        write_python_float(writer, &written)
+        self.write_f64(writer, f64::from(value))
     }
 }
 
@@ -826,7 +824,7 @@ fn json_dumps(value: &Value) -> String {
     let mut serializer = serde_json::Serializer::with_formatter(&mut written, JsonDumpsFormatter);
     value
         .serialize(&mut serializer)
-        .expect("a Value serializes into a Vec without failing");
+        .expect("a Value serializes into a Vec, and serde_json writes every float as ASCII");
     String::from_utf8(written).expect("serde_json writes UTF-8")
 }
 
@@ -1367,11 +1365,13 @@ pub mod tests {
     use atoma_core::request::SamplingParams;
     use atoma_core::types::TokenCount;
 
+    use serde::Serialize;
+
     use super::{
         json_dumps, messages, ChatCompletionChunk, ChatCompletionResponse, Choice,
-        CompletionIdentity, Delta, FinishReason, Message, MessageContent, MessageContentPart,
-        MessageContentPartImageUrl, Model, Refused, RequestBody, StreamChoice, ToolCall,
-        ToolCallFunction, Usage,
+        CompletionIdentity, Delta, FinishReason, JsonDumpsFormatter, Message, MessageContent,
+        MessageContentPart, MessageContentPartImageUrl, Model, Refused, RequestBody, StreamChoice,
+        ToolCall, ToolCallFunction, Usage,
     };
 
     fn identity(created: u64) -> CompletionIdentity {
@@ -2321,6 +2321,19 @@ pub mod tests {
         let value = f64::from_bits(0xc30a_a61f_a224_75ca);
         assert_eq!(format!("{value}"), "-937625523621561.3");
         assert_eq!(json_dumps(&json!(value)), "-937625523621561.2");
+    }
+
+    /// Python has one float type, so a narrower float is written as the double it widens to
+    /// rather than in its own shortest digits, which would be `1e-06` here. A `Value` holds only
+    /// doubles, so nothing routes an `f32` through `json_dumps` today.
+    #[test]
+    fn a_float_argument_narrower_than_a_double_is_widened_first() {
+        let mut written = Vec::new();
+        let mut serializer =
+            serde_json::Serializer::with_formatter(&mut written, JsonDumpsFormatter);
+        1e-6f32.serialize(&mut serializer).unwrap();
+
+        assert_eq!(String::from_utf8(written).unwrap(), "9.999999974752427e-07");
     }
 
     /// The Llama 3 tool call renders its arguments in the caller's order too, which is
