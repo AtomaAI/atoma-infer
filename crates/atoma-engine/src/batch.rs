@@ -6,7 +6,11 @@
 //! engine's order — live entries, then the padding dummies — so the layout reorders them and keeps
 //! the way back: which logits row each sampling entry reads. Pure host arithmetic, with no device
 //! and no tensor: what is laid out here is uploaded as it stands.
+//!
+//! The command's dispatch decision and padding count travel with the layout, so a forward that
+//! routes on the decision reads it from the one value it is handed.
 
+use atoma_core::dispatch::DispatchDecision;
 use atoma_core::step::{CommandEntry, StepCommand};
 use atoma_core::types::{RequestId, TokenCount};
 use thiserror::Error;
@@ -63,6 +67,10 @@ pub struct BatchLayout {
     /// The flattened index of each sampling entry's last token, in batch order: the rows the
     /// forward selects logits for. Entries that do not sample select nothing.
     pub selected: Vec<u32>,
+    /// Which captured graph serves the batch, or why it runs eagerly, as the engine decided.
+    pub dispatch: DispatchDecision,
+    /// How many trailing entries of the command are padding dummies.
+    pub padding_count: usize,
     /// For each sampling entry in command order, its row among `selected`.
     rows: Vec<usize>,
 }
@@ -125,6 +133,8 @@ impl BatchLayout {
             max_prefill_sequence_len: 0,
             max_decode_sequence_len: 0,
             selected: Vec::with_capacity(command.sampling_count()),
+            dispatch: command.dispatch,
+            padding_count: command.padding_count,
             rows: Vec::with_capacity(command.sampling_count()),
         };
         let mut row_by_index = vec![None; entries.len()];
@@ -335,6 +345,14 @@ mod tests {
         assert_eq!(layout.block_table_width, 3);
         assert_eq!(layout.selected, [0, 1]);
         assert_eq!(layout.sampling_rows(), [0, 1]);
+    }
+
+    #[test]
+    fn the_layout_carries_the_commands_dispatch_decision_and_padding_count() {
+        let command = mixed();
+        let layout = BatchLayout::lay_out(&command, BLOCK_SIZE).unwrap();
+        assert_eq!(layout.dispatch, command.dispatch);
+        assert_eq!(layout.padding_count, 1);
     }
 
     #[test]
