@@ -2006,11 +2006,7 @@ pub mod tests {
         let messages: Vec<Message> = vec![];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        assert_eq!(
-            prompt,
-            "<|begin_of_text|><|im_start|>assistant
-"
-        );
+        assert_eq!(prompt, "<|begin_of_text|><|im_start|>assistant\n");
     }
 
     #[test]
