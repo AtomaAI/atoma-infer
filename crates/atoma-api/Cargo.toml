@@ -6,25 +6,32 @@ version = { workspace = true }
 
 [dependencies]
 anyhow                      = { workspace = true }
-atoma-backends              = { workspace = true }
+atoma-core                  = { workspace = true }
+atoma-engine                = { workspace = true }
 axum                        = { workspace = true }
 clap                        = { workspace = true, features = [ "derive" ] }
 flume                       = { workspace = true }
 futures                     = { workspace = true }
+metrics                     = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+rand                        = { workspace = true }
 serde                       = { workspace = true }
 serde_json                  = { workspace = true }
-tokio                       = { workspace = true, features = [ "macros", "rt-multi-thread", "signal" ] }
+thiserror                   = { workspace = true }
+tokenizers                  = { workspace = true }
+tokio                       = { workspace = true, features = [ "macros", "rt-multi-thread", "signal", "time" ] }
 tracing                     = { workspace = true }
 tracing-subscriber          = { workspace = true }
 utoipa                      = { workspace = true, features = [ "axum_extras" ] }
 utoipa-swagger-ui           = { workspace = true, features = [ "axum" ] }
 uuid                        = { workspace = true, features = [ "v7" ] }
+validator                   = { workspace = true, features = [ "derive" ] }
 
 [features]
-cuda = [ "atoma-backends/cuda" ]
-nccl = [ "atoma-backends/nccl", "cuda" ]
+cuda = [ "atoma-engine/cuda" ]
+nccl = [ "atoma-engine/nccl", "cuda" ]
 
 [dev-dependencies]
-metrics = { workspace = true }
-tower   = { workspace = true, features = [ "util" ] }
+crossbeam-utils = { workspace = true }
+figment         = { workspace = true, features = [ "test" ] }
+tower           = { workspace = true, features = [ "util" ] }

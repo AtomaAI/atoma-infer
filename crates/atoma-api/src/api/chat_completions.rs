@@ -1,12 +1,9 @@
 //! OpenAI-compatible chat completion request and response types.
 
-use atoma_backends::{
-    GenerateParameters, GenerateRequest, GenerateRequestOutput, GenerateStreamingOutput,
-};
-use std::{
-    collections::HashMap,
-    time::{Instant, SystemTime},
-};
+use atoma_core::request::{SamplingParams, Usage as EngineUsage};
+use atoma_core::types::TokenCount;
+use std::collections::HashMap;
+use thiserror::Error;
 use utoipa::ToSchema;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -108,6 +105,13 @@ pub enum Model {
         deserialize = "meta-llama/Llama-3.2-3B-Instruct"
     ))]
     Llama323bInstruct,
+    /// The ungated mirror of `meta-llama/Llama-3.1-8B-Instruct`: the same weights, reachable
+    /// without a Hugging Face token, and served with the same prompt template.
+    #[serde(rename(
+        serialize = "NousResearch/Meta-Llama-3.1-8B-Instruct",
+        deserialize = "NousResearch/Meta-Llama-3.1-8B-Instruct"
+    ))]
+    NousLlama318bInstruct,
     #[serde(rename(
         serialize = "NousResearch/Hermes-3-Llama-3.1-8B",
         deserialize = "NousResearch/Hermes-3-Llama-3.1-8B"
@@ -145,6 +149,9 @@ impl std::fmt::Display for Model {
             Model::Llama321bInstruct => write!(f, "meta-llama/Llama-3.2-1B-Instruct"),
             Model::Llama323b => write!(f, "meta-llama/Llama-3.2-3B"),
             Model::Llama323bInstruct => write!(f, "meta-llama/Llama-3.2-3B-Instruct"),
+            Model::NousLlama318bInstruct => {
+                write!(f, "NousResearch/Meta-Llama-3.1-8B-Instruct")
+            }
             Model::HermesLlama318b => write!(f, "NousResearch/Hermes-3-Llama-3.1-8B"),
             Model::HermesLlama3170b => write!(f, "NousResearch/Hermes-3-Llama-3.1-70B"),
             Model::HermesLlama31405b => write!(f, "NousResearch/Hermes-3-Llama-3.1-405B"),
@@ -157,10 +164,21 @@ impl Model {
         use Model::*;
         match self {
             Llama27b | Llama27bChatHf | Llama270b => messages::messages_to_llama2_prompt(messages),
-            Llama38b | Llama38bInstruct | Llama370b | Llama370bInstruct | Llama318b
-            | Llama318bInstruct | Llama3170b | Llama3170bInstruct | Llama31405b
-            | Llama31405bInstruct | Llama321b | Llama321bInstruct | Llama323b
-            | Llama323bInstruct => messages::messages_to_llama3_prompt(messages),
+            Llama38b
+            | Llama38bInstruct
+            | Llama370b
+            | Llama370bInstruct
+            | Llama318b
+            | Llama318bInstruct
+            | Llama3170b
+            | Llama3170bInstruct
+            | Llama31405b
+            | Llama31405bInstruct
+            | Llama321b
+            | Llama321bInstruct
+            | Llama323b
+            | Llama323bInstruct
+            | NousLlama318bInstruct => messages::messages_to_llama3_prompt(messages),
             HermesLlama318b | HermesLlama3170b | HermesLlama31405b => {
                 messages::messages_to_hermes3_prompt(messages)
             }
@@ -595,7 +613,8 @@ impl ToolCall {
             | Model::Llama321b
             | Model::Llama321bInstruct
             | Model::Llama323b
-            | Model::Llama323bInstruct => {
+            | Model::Llama323bInstruct
+            | Model::NousLlama318bInstruct => {
                 // Check if arguments is a JSON object
                 if let Some(args) = self.function.arguments.as_object() {
                     let params_str = args
@@ -812,47 +831,132 @@ impl RequestBody {
     }
 }
 
+/// What the engine is asked on a chat completion's behalf, before the prompt is tokenized.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineRequest {
+    /// The conversation rendered through the model's chat template.
+    pub prompt: String,
+    pub sampling: SamplingParams,
+    /// The most tokens to generate when the request bounds it. When it does not, the bound is
+    /// the room left under the max model length, which is known only once the prompt is
+    /// tokenized.
+    pub max_new_tokens: Option<TokenCount>,
+    /// Strings that end generation where they appear; matched after detokenization.
+    pub stop: Vec<String>,
+    pub stream: bool,
+}
+
+/// A request the engine cannot serve as asked. Every variant answers with a 400.
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum Refused {
+    #[error("logprobs are not supported")]
+    Logprobs,
+    #[error("top_logprobs is not supported")]
+    TopLogprobs,
+    #[error("n must be 1; {n} choices are not supported")]
+    Choices { n: usize },
+    #[error("logit_bias is not supported")]
+    LogitBias,
+    #[error("tools are not supported")]
+    Tools,
+    #[error("frequency_penalty is not applied; it must be 0 or unset, not {frequency_penalty}")]
+    FrequencyPenalty { frequency_penalty: f32 },
+    #[error("presence_penalty is not applied; it must be 0 or unset, not {presence_penalty}")]
+    PresencePenalty { presence_penalty: f32 },
+    #[error("temperature must be between 0 and 2, not {temperature}")]
+    Temperature { temperature: f32 },
+    #[error("top_p must be between 0 and 1, not {top_p}")]
+    TopP { top_p: f32 },
+    #[error("max_completion_tokens must be at least 1")]
+    NoCompletionTokens,
+}
+
 impl RequestBody {
-    pub fn to_generate_request(self, request_id: String) -> GenerateRequest {
-        let model = self.model();
-        let inputs = model.messages_to_prompt(self.messages());
-        let frequency_penalty = self.frequency_penalty();
-        let max_new_tokens = self.max_completion_tokens();
-        let decoder_input_details = self.logprobs().unwrap_or_default();
-        let repetition_penalty = self.presence_penalty();
-        let stop = match self.stop() {
-            Some(StopCondition::Array(stop_tokens)) => stop_tokens.clone(),
-            Some(StopCondition::String(stop_token)) => vec![stop_token.clone()],
-            None => Vec::new(),
-        };
-        let seed = self.seed();
-        let temperature = self.temperature();
-        let top_p = self.top_p();
-        let _user = self.user();
-        let n = self.n.unwrap_or(1);
-        let parameters = GenerateParameters {
-            best_of: None,
+    /// The engine request this body asks for, or why it cannot be served.
+    ///
+    /// Sampling is on, as the API's default is the model's own distribution; a temperature of
+    /// zero is the request for greedy decoding, honoured by the sampler. `seed` is used when
+    /// given and `fresh_seed` otherwise, so an unseeded request is not reproducible by
+    /// accident. `user` is the caller's own identifier and is accepted without being acted on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Refused`] for what the engine does not serve — `logprobs`, `top_logprobs`,
+    /// more than one choice, `logit_bias`, `tools`, a non-zero `frequency_penalty` or
+    /// `presence_penalty` — and for a temperature outside 0 to 2, a `top_p` outside 0 to 1, or
+    /// a completion budget of zero.
+    pub fn to_engine_request(&self, fresh_seed: u64) -> Result<EngineRequest, Refused> {
+        self.refuse_unserved()?;
+        Ok(EngineRequest {
+            prompt: self.model.messages_to_prompt(&self.messages),
+            sampling: self.sampling(fresh_seed)?,
+            max_new_tokens: self.max_new_tokens()?,
+            stop: self.stop_strings(),
+            stream: self.stream.unwrap_or(false),
+        })
+    }
+
+    /// Refuses what the engine does not serve at all, when set to anything but its unset value.
+    fn refuse_unserved(&self) -> Result<(), Refused> {
+        if self.logprobs == Some(true) {
+            return Err(Refused::Logprobs);
+        }
+        if self.top_logprobs.is_some() {
+            return Err(Refused::TopLogprobs);
+        }
+        if let Some(n) = self.n.filter(|&n| n != 1) {
+            return Err(Refused::Choices { n });
+        }
+        if self
+            .logit_bias
+            .as_ref()
+            .is_some_and(|bias| !bias.is_empty())
+        {
+            return Err(Refused::LogitBias);
+        }
+        if self.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+            return Err(Refused::Tools);
+        }
+        Ok(())
+    }
+
+    /// The sampling parameters the engine applies, refusing those out of range and the
+    /// penalties the sampler does not apply.
+    fn sampling(&self, fresh_seed: u64) -> Result<SamplingParams, Refused> {
+        let temperature = self.temperature.unwrap_or(1.0);
+        if !(0.0..=2.0).contains(&temperature) {
+            return Err(Refused::Temperature { temperature });
+        }
+        let top_p = self.top_p.unwrap_or(1.0);
+        if !(0.0..=1.0).contains(&top_p) {
+            return Err(Refused::TopP { top_p });
+        }
+        if let Some(frequency_penalty) = self.frequency_penalty.filter(|&penalty| penalty != 0.0) {
+            return Err(Refused::FrequencyPenalty { frequency_penalty });
+        }
+        if let Some(presence_penalty) = self.presence_penalty.filter(|&penalty| penalty != 0.0) {
+            return Err(Refused::PresencePenalty { presence_penalty });
+        }
+        Ok(SamplingParams {
             temperature,
-            repetition_penalty,
-            frequency_penalty,
-            max_new_tokens,
-            repeat_last_n: None,
-            top_k: None,
             top_p,
-            typical_p: None,
             do_sample: true,
-            return_full_text: Some(false),
-            stop,
-            truncate: None,
-            decoder_input_details,
-            random_seed: seed,
-            top_n_tokens: None,
-            n,
-        };
-        GenerateRequest {
-            request_id,
-            inputs,
-            parameters,
+            seed: self.seed.unwrap_or(fresh_seed),
+            ..SamplingParams::default()
+        })
+    }
+
+    fn max_new_tokens(&self) -> Result<Option<TokenCount>, Refused> {
+        self.max_completion_tokens
+            .map(|budget| TokenCount::new(budget as usize).ok_or(Refused::NoCompletionTokens))
+            .transpose()
+    }
+
+    fn stop_strings(&self) -> Vec<String> {
+        match &self.stop {
+            Some(StopCondition::Array(strings)) => strings.clone(),
+            Some(StopCondition::String(string)) => vec![string.clone()],
+            None => Vec::new(),
         }
     }
 }
@@ -876,93 +980,86 @@ pub struct Choice {
     pub finish_reason: FinishReason,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+/// Why a completion ended, in the API's own words: the model stopped, or the budget ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
-    Stopped,
-    LengthCapped,
-    ContentFilter,
+    /// The model emitted an end-of-sequence token, or a stop string was matched.
+    Stop,
+    /// The completion budget, or the max model length, was reached.
+    Length,
 }
 
-impl TryFrom<Option<&str>> for FinishReason {
-    type Error = String;
-
-    fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
-        match value {
-            Some("stopped") => Ok(FinishReason::Stopped),
-            Some("length_capped") => Ok(FinishReason::LengthCapped),
-            Some("content_filter") => Ok(FinishReason::ContentFilter),
-            None => Ok(FinishReason::Stopped),
-            _ => Err(format!("Invalid finish reason: {}", value.unwrap())),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
 }
 
-impl TryFrom<(String, GenerateRequestOutput)> for ChatCompletionResponse {
-    type Error = String;
+impl Usage {
+    /// The usage of `prompt_tokens` and `completion_tokens`.
+    #[must_use]
+    pub fn new(prompt_tokens: usize, completion_tokens: usize) -> Self {
+        // A count past u32 is not a count this API will ever report; saturating names that
+        // rather than wrapping.
+        let prompt_tokens = u32::try_from(prompt_tokens).unwrap_or(u32::MAX);
+        let completion_tokens = u32::try_from(completion_tokens).unwrap_or(u32::MAX);
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        }
+    }
+}
 
-    fn try_from((model, value): (String, GenerateRequestOutput)) -> Result<Self, Self::Error> {
-        let inference_outputs = value.inference_outputs;
-        let choices = inference_outputs
-            .iter()
-            .map(|output| {
-                Ok(Choice {
-                    index: output.index as u32,
-                    message: Message::Assistant {
-                        content: Some(MessageContent::Text(output.output_text.clone())),
-                        name: None,
-                        refusal: None,
-                        tool_calls: vec![],
-                    },
-                    logprobs: Some(
-                        serde_json::to_value(&output.logprobs)
-                            .map_err(|e| format!("Failed to convert logprobs to JSON: {}", e))?,
-                    ),
-                    finish_reason: FinishReason::try_from(output.finish_reason.as_deref())?,
-                })
-            })
-            .collect::<Result<Vec<Choice>, Self::Error>>()?;
-        let prompt_tokens = value.prompt_token_ids.len() as u32;
-        let completion_tokens = inference_outputs
-            .iter()
-            .map(|o| o.token_ids.len())
-            .sum::<usize>() as u32;
-        let total_tokens = prompt_tokens + completion_tokens;
+impl From<EngineUsage> for Usage {
+    fn from(usage: EngineUsage) -> Self {
+        Self::new(usage.prompt_tokens, usage.generated_tokens)
+    }
+}
 
-        let now = Instant::now();
-        let finished_time = value
-            .metrics
-            .read()
-            .expect("Failed to read metrics from the inference output response")
-            .finished_time
-            .ok_or("Finished time not found")?;
-        let duration = now.duration_since(finished_time);
-        let system_now = SystemTime::now();
-        let system_duration = system_now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Failed to get system duration");
-        let created = system_duration.as_millis() as u64 - duration.as_millis() as u64;
+/// What this server reports as its configuration fingerprint.
+pub const SYSTEM_FINGERPRINT: &str = concat!("atoma-infer/", env!("CARGO_PKG_VERSION"));
 
-        Ok(ChatCompletionResponse {
-            id: value.request_id,
-            object: "chat.completions".into(),
+/// What identifies one completion in its response and in every chunk of its stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionIdentity {
+    pub id: String,
+    pub model: String,
+    /// Seconds since the Unix epoch when the request arrived.
+    pub created: u64,
+}
+
+impl ChatCompletionResponse {
+    /// The one-choice response to a completed request.
+    #[must_use]
+    pub fn completed(
+        identity: CompletionIdentity,
+        content: String,
+        finish_reason: FinishReason,
+        usage: Usage,
+    ) -> Self {
+        let CompletionIdentity { id, model, created } = identity;
+        Self {
+            id,
+            object: "chat.completion".into(),
             created,
             model,
-            system_fingerprint: "vllm".into(),
-            choices,
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-            },
-        })
+            system_fingerprint: SYSTEM_FINGERPRINT.into(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message::Assistant {
+                    content: Some(MessageContent::Text(content)),
+                    name: None,
+                    refusal: None,
+                    tool_calls: vec![],
+                },
+                logprobs: None,
+                finish_reason,
+            }],
+            usage,
+        }
     }
 }
 
@@ -998,7 +1095,7 @@ pub struct StreamChoice {
     pub logprobs: Option<Value>,
     /// The reason why the model stopped generating tokens, if applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<String>,
+    pub finish_reason: Option<FinishReason>,
 }
 
 /// Represents the delta (incremental update) in a streaming chat completion response.
@@ -1017,41 +1114,49 @@ pub struct Delta {
     pub tool_calls: Vec<ToolCall>,
 }
 
-impl TryFrom<(String, GenerateStreamingOutput)> for ChatCompletionChunk {
-    type Error = String;
+/// The chunks a streamed request is made of: the text as it comes, then the finish.
+impl ChatCompletionChunk {
+    /// A chunk carrying new text and nothing else.
+    #[must_use]
+    pub fn text(identity: &CompletionIdentity, content: String) -> Self {
+        Self::chunk(identity, Some(content), None, Usage::new(0, 0))
+    }
 
-    fn try_from((model, value): (String, GenerateStreamingOutput)) -> Result<Self, Self::Error> {
-        let id = value.request_id;
-        let created = value.created;
-        let usage = Usage {
-            prompt_tokens: value.num_prompt_tokens as u32,
-            completion_tokens: value.num_completion_tokens as u32,
-            total_tokens: value.num_prompt_tokens as u32 + value.num_completion_tokens as u32,
-        };
-        let choices = vec![StreamChoice {
-            index: 0,
-            delta: Delta {
-                role: "assistant".into(),
-                content: Some(value.output_text),
-                refusal: None,
-                tool_calls: vec![],
-            },
-            logprobs: Some(
-                serde_json::to_value(&value.logprobs)
-                    .map_err(|e| format!("Failed to convert logprobs to JSON: {}", e))?,
-            ),
-            finish_reason: value.finish_reason,
-        }];
-        let chunk = ChatCompletionChunk {
-            id,
+    /// The last chunk: no text, the finish reason and the usage.
+    #[must_use]
+    pub fn finished(
+        identity: &CompletionIdentity,
+        finish_reason: FinishReason,
+        usage: Usage,
+    ) -> Self {
+        Self::chunk(identity, None, Some(finish_reason), usage)
+    }
+
+    fn chunk(
+        identity: &CompletionIdentity,
+        content: Option<String>,
+        finish_reason: Option<FinishReason>,
+        usage: Usage,
+    ) -> Self {
+        Self {
+            id: identity.id.clone(),
             object: "chat.completion.chunk".into(),
-            created,
-            model,
-            system_fingerprint: "vllm".into(),
-            choices,
+            created: identity.created,
+            model: identity.model.clone(),
+            system_fingerprint: SYSTEM_FINGERPRINT.into(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: Delta {
+                    role: "assistant".into(),
+                    content,
+                    refusal: None,
+                    tool_calls: vec![],
+                },
+                logprobs: None,
+                finish_reason,
+            }],
             usage,
-        };
-        Ok(chunk)
+        }
     }
 }
 
@@ -1059,11 +1164,22 @@ impl TryFrom<(String, GenerateStreamingOutput)> for ChatCompletionChunk {
 pub mod tests {
     use serde_json::json;
 
+    use atoma_core::request::SamplingParams;
+    use atoma_core::types::TokenCount;
+
     use super::{
-        messages, ChatCompletionChunk, ChatCompletionResponse, Choice, Delta, FinishReason,
-        Message, MessageContent, MessageContentPart, MessageContentPartImageUrl, Model,
-        RequestBody, StreamChoice, ToolCall, ToolCallFunction, Usage,
+        messages, ChatCompletionChunk, ChatCompletionResponse, Choice, CompletionIdentity, Delta,
+        FinishReason, Message, MessageContent, MessageContentPart, MessageContentPartImageUrl,
+        Model, Refused, RequestBody, StreamChoice, ToolCall, ToolCallFunction, Usage,
     };
+
+    fn identity(created: u64) -> CompletionIdentity {
+        CompletionIdentity {
+            id: "chatcmpl-1".into(),
+            model: "llama".into(),
+            created,
+        }
+    }
 
     #[test]
     fn deserialize_request_body_basic() {
@@ -1103,11 +1219,142 @@ pub mod tests {
 
         let request_body: RequestBody =
             serde_json::from_str(json_request_body).expect("Harness body must deserialize");
-        let request = request_body.to_generate_request("request".to_string());
+        let request = request_body.to_engine_request(7).unwrap();
 
-        assert_eq!(request.parameters.temperature, Some(0.0));
-        assert_eq!(request.parameters.max_new_tokens, Some(128));
-        assert!(request.parameters.do_sample);
+        assert_eq!(request.sampling.temperature, 0.0);
+        assert!(request.sampling.do_sample);
+        assert_eq!(request.max_new_tokens, Some(TokenCount::new(128).unwrap()));
+        assert!(request.stream);
+        assert!(request.prompt.contains("Hello"));
+        assert!(request.stop.is_empty());
+    }
+
+    fn body(fields: serde_json::Value) -> RequestBody {
+        let mut body = json!({
+            "model": "meta-llama/Llama-3.2-1B-Instruct",
+            "messages": [{ "role": "user", "content": "Hi" }]
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn a_body_that_asks_for_nothing_samples_from_the_models_own_distribution() {
+        let request = body(json!({})).to_engine_request(42).unwrap();
+        assert_eq!(
+            request.sampling,
+            SamplingParams {
+                temperature: 1.0,
+                top_p: 1.0,
+                do_sample: true,
+                seed: 42,
+                ..SamplingParams::default()
+            }
+        );
+        assert_eq!(
+            request.max_new_tokens, None,
+            "the room left under the max model length"
+        );
+        assert!(!request.stream);
+        assert!(request.stop.is_empty());
+    }
+
+    #[test]
+    fn a_seed_given_is_kept_and_one_absent_is_the_fresh_one() {
+        assert_eq!(
+            body(json!({ "seed": 9 }))
+                .to_engine_request(42)
+                .unwrap()
+                .sampling
+                .seed,
+            9
+        );
+        assert_eq!(
+            body(json!({})).to_engine_request(42).unwrap().sampling.seed,
+            42
+        );
+    }
+
+    #[test]
+    fn stop_strings_arrive_as_one_or_several() {
+        assert_eq!(
+            body(json!({ "stop": "\n" }))
+                .to_engine_request(1)
+                .unwrap()
+                .stop,
+            ["\n"]
+        );
+        assert_eq!(
+            body(json!({ "stop": ["a", "b"] }))
+                .to_engine_request(1)
+                .unwrap()
+                .stop,
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn what_the_engine_cannot_honour_is_refused_by_name() {
+        let refused = |fields: serde_json::Value| body(fields).to_engine_request(1).unwrap_err();
+        assert_eq!(refused(json!({ "logprobs": true })), Refused::Logprobs);
+        assert_eq!(refused(json!({ "top_logprobs": 2 })), Refused::TopLogprobs);
+        assert_eq!(refused(json!({ "n": 2 })), Refused::Choices { n: 2 });
+        assert_eq!(
+            refused(json!({ "logit_bias": { "50256": -100 } })),
+            Refused::LogitBias
+        );
+        assert_eq!(
+            refused(json!({ "tools": [{ "type": "function", "function": { "name": "f" } }] })),
+            Refused::Tools
+        );
+        assert_eq!(
+            refused(json!({ "frequency_penalty": 0.5 })),
+            Refused::FrequencyPenalty {
+                frequency_penalty: 0.5
+            }
+        );
+        assert_eq!(
+            refused(json!({ "presence_penalty": -0.5 })),
+            Refused::PresencePenalty {
+                presence_penalty: -0.5
+            }
+        );
+        assert_eq!(
+            refused(json!({ "temperature": 2.5 })),
+            Refused::Temperature { temperature: 2.5 }
+        );
+        assert_eq!(
+            refused(json!({ "top_p": 1.5 })),
+            Refused::TopP { top_p: 1.5 }
+        );
+        assert_eq!(
+            refused(json!({ "max_completion_tokens": 0 })),
+            Refused::NoCompletionTokens
+        );
+        assert!(
+            refused(json!({ "n": 3 })).to_string().contains("3 choices"),
+            "the refusal names what was asked"
+        );
+    }
+
+    #[test]
+    fn the_unset_values_of_refusable_fields_are_accepted() {
+        assert!(
+            body(json!({ "logprobs": false, "n": 1, "logit_bias": {}, "tools": [] }))
+                .to_engine_request(1)
+                .is_ok()
+        );
+        assert!(body(json!({
+            "temperature": 0,
+            "top_p": 0,
+            "frequency_penalty": 0,
+            "presence_penalty": 0.0,
+            "user": "someone"
+        }))
+        .to_engine_request(1)
+        .is_ok());
     }
 
     #[test]
@@ -1897,7 +2144,7 @@ pub mod tests {
                     "role": "assistant",
                     "content": "Hello, how can I help you today?"
                 },
-                "finish_reason": "stopped"
+                "finish_reason": "stop"
             }],
             "usage": {
                 "prompt_tokens": 9,
@@ -1926,7 +2173,7 @@ pub mod tests {
                 tool_calls: vec![],
             }
         );
-        assert_eq!(response.choices[0].finish_reason, FinishReason::Stopped);
+        assert_eq!(response.choices[0].finish_reason, FinishReason::Stop);
         assert_eq!(response.usage.prompt_tokens, 9);
         assert_eq!(response.usage.completion_tokens, 12);
         assert_eq!(response.usage.total_tokens, 21);
@@ -1940,30 +2187,68 @@ pub mod tests {
                 "role": "assistant",
                 "content": "Hello, how can I help you today?"
             },
-            "finish_reason": "stopped"
+            "finish_reason": "stop"
         });
 
         let choice: Choice = serde_json::from_value(json).unwrap();
 
         assert_eq!(choice.index, 0);
         assert!(matches!(choice.message, Message::Assistant { .. }));
-        assert!(matches!(choice.finish_reason, FinishReason::Stopped));
+        assert!(matches!(choice.finish_reason, FinishReason::Stop));
     }
 
     #[test]
     fn test_deserialize_finish_reason() {
         assert_eq!(
-            serde_json::from_str::<FinishReason>("\"stopped\"").unwrap(),
-            FinishReason::Stopped
+            serde_json::from_str::<FinishReason>("\"stop\"").unwrap(),
+            FinishReason::Stop
         );
         assert_eq!(
-            serde_json::from_str::<FinishReason>("\"length_capped\"").unwrap(),
-            FinishReason::LengthCapped
+            serde_json::from_str::<FinishReason>("\"length\"").unwrap(),
+            FinishReason::Length
         );
+        assert!(serde_json::from_str::<FinishReason>("\"content_filter\"").is_err());
+    }
+
+    #[test]
+    fn a_completed_response_is_one_assistant_choice_with_its_finish_and_usage() {
+        let response = ChatCompletionResponse::completed(
+            identity(1_700_000_000),
+            "Hello!".into(),
+            FinishReason::Length,
+            Usage::new(9, 12),
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["object"], "chat.completion");
+        assert_eq!(json["created"], 1_700_000_000);
+        assert_eq!(json["choices"][0]["index"], 0);
+        assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(json["choices"][0]["message"]["content"], "Hello!");
+        assert_eq!(json["choices"][0]["finish_reason"], "length");
+        assert_eq!(json["usage"]["prompt_tokens"], 9);
+        assert_eq!(json["usage"]["completion_tokens"], 12);
+        assert_eq!(json["usage"]["total_tokens"], 21);
         assert_eq!(
-            serde_json::from_str::<FinishReason>("\"content_filter\"").unwrap(),
-            FinishReason::ContentFilter
+            serde_json::from_value::<ChatCompletionResponse>(json).unwrap(),
+            response
         );
+    }
+
+    #[test]
+    fn a_text_chunk_carries_the_text_alone_and_the_last_chunk_the_finish_and_usage() {
+        let text = ChatCompletionChunk::text(&identity(5), "Hel".into());
+        let json = serde_json::to_value(&text).unwrap();
+        assert_eq!(json["object"], "chat.completion.chunk");
+        assert_eq!(json["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(json["choices"][0]["delta"]["content"], "Hel");
+        assert!(json["choices"][0].get("finish_reason").is_none());
+
+        let last =
+            ChatCompletionChunk::finished(&identity(5), FinishReason::Stop, Usage::new(3, 2));
+        let json = serde_json::to_value(&last).unwrap();
+        assert!(json["choices"][0]["delta"].get("content").is_none());
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert_eq!(json["usage"]["total_tokens"], 5);
     }
 
     #[test]
@@ -1997,7 +2282,7 @@ pub mod tests {
                     {"can": -0.3, "may": -0.5}
                 ]
             },
-            "finish_reason": "stopped"
+            "finish_reason": "stop"
         });
 
         let choice: Choice = serde_json::from_value(json).unwrap();
@@ -2016,7 +2301,7 @@ pub mod tests {
                 ]
             })
         );
-        assert!(matches!(choice.finish_reason, FinishReason::Stopped));
+        assert!(matches!(choice.finish_reason, FinishReason::Stop));
     }
 
     #[test]
