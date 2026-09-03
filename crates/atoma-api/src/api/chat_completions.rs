@@ -974,17 +974,12 @@ impl RequestBody {
     /// The completion budget the request carries, under whichever name: `max_completion_tokens`
     /// wins when both are sent. `None` leaves the bound to the room under the max model length.
     fn max_new_tokens(&self) -> Result<Option<TokenCount>, Refused> {
-        if let Some(budget) = self.max_completion_tokens {
-            return TokenCount::new(budget as usize)
-                .map(Some)
-                .ok_or(Refused::ZeroCompletionTokens);
-        }
-        if let Some(budget) = self.max_tokens {
-            return TokenCount::new(budget as usize)
-                .map(Some)
-                .ok_or(Refused::ZeroMaxTokens);
-        }
-        Ok(None)
+        let (budget, refusal) = match (self.max_completion_tokens, self.max_tokens) {
+            (Some(budget), _) => (budget, Refused::ZeroCompletionTokens),
+            (None, Some(budget)) => (budget, Refused::ZeroMaxTokens),
+            (None, None) => return Ok(None),
+        };
+        TokenCount::new(budget as usize).map(Some).ok_or(refusal)
     }
 
     fn stop_strings(&self) -> Vec<String> {
