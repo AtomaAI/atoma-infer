@@ -1948,7 +1948,8 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|im_start|>assistant\n",
-            "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, \"name\": \"get_stock_fundamentals\"}</tool_call>",
+            "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
+            "\"name\": \"get_stock_fundamentals\"}</tool_call>",
             "\n<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
@@ -2039,7 +2040,8 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|im_start|>assistant\n",
-            "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, \"name\": \"get_stock_fundamentals\"}, ",
+            "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
+            "\"name\": \"get_stock_fundamentals\"}, ",
             "{\"arguments\": {\"symbol\": \"BTC\"}, \"name\": \"get_crypto_data\"}</tool_call>",
             "\n<|im_end|>\n",
             "<|im_start|>assistant\n",
