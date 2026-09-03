@@ -88,8 +88,8 @@ fn decode_event(event: &str) -> Option<SseEvent> {
 /// engine that ignored an unknown length field would generate until its own stop condition and
 /// answer a different question than the one being measured. `temperature: 0` selects greedy
 /// decoding on both engines, so the sampler contributes no variance to the comparison; the engine
-/// under test accepts it at `crates/backends/vllm/src/validation.rs`, asserted there and at the
-/// `RequestBody` hop in `crates/atoma-api/src/api/chat_completions.rs`.
+/// under test maps it to greedy sampling at the `RequestBody` hop in
+/// `crates/atoma-api/src/api/chat_completions.rs`, asserted there.
 fn completion_body(model: &str, request: &BenchRequest) -> serde_json::Value {
     serde_json::json!({
         "model": model,
