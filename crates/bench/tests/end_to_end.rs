@@ -1,6 +1,6 @@
 //! The harness driven end to end against a stub engine.
 //!
-//! The stub speaks the same OpenAI streaming surface and publishes the same free-block gauge as
+//! The stub speaks the same OpenAI streaming surface and publishes the same block-count gauge as
 //! the engine under test, so these tests cover what the unit tests cannot: arrivals actually
 //! firing over the wire, tokens actually being timed, and the KV-leak probe actually failing a run
 //! whose pool drains.
@@ -40,6 +40,11 @@ const POOL_BLOCKS: u64 = 512;
 /// Blocks the stub holds per request while it is answering.
 const BLOCKS_PER_REQUEST: u64 = 4;
 
+/// How long a [`Behaviour::RetiresLate`] stub goes on holding a request's blocks after its last
+/// token has left. Several sampling intervals, so a probe reading the gauge the moment the run
+/// ends sees blocks that are on their way back.
+const RETIRE_LAG: Duration = Duration::from_millis(60);
+
 /// How the stub engine behaves.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Behaviour {
@@ -49,6 +54,9 @@ enum Behaviour {
     Leaking,
     /// Answers the first request, then refuses everything.
     RefusesAfterWarmup,
+    /// Answers every request and returns every block, but only after a lag — the shape of a real
+    /// engine, which retires a request on its own thread after the last token has left.
+    RetiresLate,
 }
 
 /// The stub engine's state.
@@ -64,13 +72,14 @@ struct StubState {
 }
 
 impl StubState {
-    /// The free-block count the stub publishes: blocks are held while a request is in flight, and
-    /// a leaking engine also keeps one per request it has finished.
-    fn free_blocks(&self) -> u64 {
+    /// The count of blocks the pool can still hand out, as the stub publishes it: blocks are held
+    /// while a request is in flight, and a leaking engine also keeps one per request it has
+    /// finished.
+    fn available_blocks(&self) -> u64 {
         let held = self.in_flight.load(Ordering::Relaxed) * BLOCKS_PER_REQUEST;
         let leaked = match self.behaviour {
             Behaviour::Leaking => self.answered.load(Ordering::Relaxed),
-            Behaviour::Healthy | Behaviour::RefusesAfterWarmup => 0,
+            Behaviour::Healthy | Behaviour::RefusesAfterWarmup | Behaviour::RetiresLate => 0,
         };
 
         POOL_BLOCKS.saturating_sub(held + leaked)
@@ -82,6 +91,21 @@ const PREFILL: Duration = Duration::from_millis(20);
 
 /// How long the stub takes per token after the first.
 const DECODE_STEP: Duration = Duration::from_millis(5);
+
+/// Returns a request's blocks to the stub's pool, after [`RETIRE_LAG`] for a stub that retires
+/// late.
+fn retire(state: &Arc<StubState>) {
+    if state.behaviour != Behaviour::RetiresLate {
+        state.in_flight.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        tokio::time::sleep(RETIRE_LAG).await;
+        state.in_flight.fetch_sub(1, Ordering::Relaxed);
+    });
+}
 
 /// Streams an answer token by token, so the harness times a real stream rather than one response
 /// that happens to contain several events.
@@ -102,8 +126,8 @@ async fn completions(State(state): State<Arc<StubState>>) -> Response {
                 index if index < TOKENS_PER_ANSWER => tokio::time::sleep(DECODE_STEP).await,
                 index if index > TOKENS_PER_ANSWER => return None,
                 _ => {
-                    state.in_flight.fetch_sub(1, Ordering::Relaxed);
                     state.answered.fetch_add(1, Ordering::Relaxed);
+                    retire(&state);
                     return Some((
                         Ok::<_, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
                         index + 1,
@@ -124,17 +148,17 @@ async fn completions(State(state): State<Arc<StubState>>) -> Response {
         .into_response()
 }
 
-/// The gauge the stub engine publishes its free-block count on, standing in for the name a real
-/// engine publishes and an operator puts in `kv_probe.metric`.
-const STUB_FREE_BLOCKS_METRIC: &str = "atoma_kv_free_gpu_blocks";
+/// The gauge the stub engine publishes its block count on, standing in for the name a real engine
+/// publishes and an operator puts in `kv_probe.metric`.
+const STUB_BLOCKS_METRIC: &str = "atoma_engine_available_blocks";
 
-/// Publishes the free-block gauge in the Prometheus text format.
+/// Publishes the block-count gauge in the Prometheus text format.
 async fn metrics(State(state): State<Arc<StubState>>) -> String {
     state.scrapes.fetch_add(1, Ordering::Relaxed);
     format!(
         "# TYPE {metric} gauge\n{metric} {value}\n",
-        metric = STUB_FREE_BLOCKS_METRIC,
-        value = state.free_blocks()
+        metric = STUB_BLOCKS_METRIC,
+        value = state.available_blocks()
     )
 }
 
@@ -209,7 +233,7 @@ fn config(address: SocketAddr, runs: usize) -> BenchConfig {
             ..VllmBaseline::default()
         },
         kv_probe: KvProbeConfig {
-            metric: Some(STUB_FREE_BLOCKS_METRIC.to_string()),
+            metric: Some(STUB_BLOCKS_METRIC.to_string()),
             interval_ms: 10,
             ..KvProbeConfig::default()
         },
@@ -295,6 +319,20 @@ async fn test_the_kv_probe_passes_a_run_against_an_engine_that_returns_its_block
     );
 }
 
+/// A request's blocks come back after its last token, not with it, so the count read the instant
+/// a run ends is still short. That lag is not a leak, and a probe that called it one would fail
+/// every run against a healthy engine and retire itself as a guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_the_kv_probe_waits_for_a_pool_that_returns_its_blocks_late() {
+    let engine = drive(Behaviour::RetiresLate, 1).await;
+
+    assert!(
+        probe_verdict(&engine, 0).run_passes(),
+        "{:?}",
+        engine.runs[0].kv_probe
+    );
+}
+
 /// The acceptance criterion of the probe: an engine whose pool drains fails the run, even though
 /// every request it answered looked fine.
 #[tokio::test(flavor = "multi_thread")]
@@ -335,7 +373,7 @@ async fn test_the_probe_reads_its_baseline_before_it_starts_sampling() {
 
     let probe = KvProbe::new(
         format!("http://{address}/metrics"),
-        STUB_FREE_BLOCKS_METRIC.to_string(),
+        STUB_BLOCKS_METRIC.to_string(),
         Duration::from_secs(60),
     )
     .start()
@@ -349,7 +387,7 @@ async fn test_the_probe_reads_its_baseline_before_it_starts_sampling() {
 
     let samples = probe.finish().await;
     assert_eq!(
-        samples.first().map(|sample| sample.free_blocks),
+        samples.first().map(|sample| sample.blocks),
         Some(POOL_BLOCKS),
         "the baseline is the whole pool, measured before any load: {samples:?}"
     );

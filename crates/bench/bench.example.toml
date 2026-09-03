@@ -87,11 +87,14 @@ server_args             = [  ]
 shm_size                = "16g"
 startup_timeout_seconds = 900
 
-# A run fails if the engine's free-block count never recovers to where it started. `metric` is the
-# gauge the engine under test publishes that count on, so it changes with the engine: the value
-# below is `atoma-infer`'s. Required whenever `engine.metrics_url` is set.
+# A run fails if the pool never recovers to the size it started at. `metric` is the gauge the
+# engine under test publishes that size on, so it changes with the engine: the value below is
+# `atoma-infer`'s. It must count the blocks the pool can still hand out, cached ones included —
+# `atoma_engine_free_blocks` is the free list alone, which a healthy engine drains to zero as
+# retired requests park their blocks for prefix reuse. Required whenever `engine.metrics_url` is
+# set.
 [kv_probe]
 interval_ms      = 1000
-metric           = "atoma_kv_free_gpu_blocks"
+metric           = "atoma_engine_available_blocks"
 num_windows      = 4
 tolerance_blocks = 0
