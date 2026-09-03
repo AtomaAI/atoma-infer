@@ -307,6 +307,9 @@ fn prefill(forward: &mut CudaForward, sequences: &mut [Sequence]) {
 struct Parity {
     rows: usize,
     argmax_disagreements: usize,
+    /// Rows whose argmaxes differ on ids candle's own logits hold at one value: bf16 cannot
+    /// separate them, so the reference has no order to disagree with.
+    ties: usize,
     max_abs_diff: f32,
     sum_abs_diff: f64,
     /// The same rows through candle alone against candle in the live batch.
@@ -395,13 +398,20 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
         let candle_row = candle_logits.row(row).expect("row");
         let (ours, theirs) = (argmax(tensor_row), argmax(candle_row));
         if ours != theirs {
-            parity.argmax_disagreements += 1;
-            // Both forwards' logits for both ids: a disagreement on a pair the two forwards
-            // separate by less than their numeric spread is a near-tie, not a wrong row.
+            // Both forwards' logits for both ids. Candle reads its logits back in bf16: when it
+            // holds the two ids at one value it cannot order them, and its argmax takes the
+            // lower id, so the row is a tie rather than a disagreement.
             let (ours_at, theirs_at) = (at(ours), at(theirs));
+            let tied = candle_row[ours_at] == candle_row[theirs_at];
+            if tied {
+                parity.ties += 1;
+            } else {
+                parity.argmax_disagreements += 1;
+            }
             eprintln!(
-                "step {step} row {row}: decode step argmax {ours} (step {:.4}, candle {:.4}), \
-                 candle argmax {theirs} (step {:.4}, candle {:.4})",
+                "step {step} row {row}: {} — decode step argmax {ours} (step {:.4}, candle \
+                 {:.4}), candle argmax {theirs} (step {:.4}, candle {:.4})",
+                if tied { "tie" } else { "disagreement" },
                 tensor_row[ours_at],
                 candle_row[ours_at],
                 tensor_row[theirs_at],
@@ -489,6 +499,7 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     println!("decode steps:         {STEPS}");
     println!("rows compared:        {}", parity.rows);
     println!("argmax disagreements: {}", parity.argmax_disagreements);
+    println!("argmax ties:          {}", parity.ties);
     println!("max |logit diff|:     {:.6}", parity.max_abs_diff);
     println!("mean |logit diff|:    {:.6}", parity.mean_abs_diff());
     println!("bound:                {bound}");
@@ -498,7 +509,7 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     println!("capture graph nodes:  {nodes}");
     assert_eq!(
         parity.argmax_disagreements, 0,
-        "every live row's argmax agrees"
+        "every live row's argmax agrees on ids candle's logits separate"
     );
     assert!(
         parity.max_abs_diff <= bound,
