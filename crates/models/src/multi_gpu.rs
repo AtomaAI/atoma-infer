@@ -16,10 +16,13 @@ impl TensorParallelColumnLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.linear.forward(x)
     }
-    pub fn load(vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
+    /// `shape` is the whole weight's, before sharding. Candle checks it at world size one, where
+    /// the shard is the whole tensor, and ignores it above; a builder handed no shape cannot load
+    /// on one rank.
+    pub fn load(vb: VarBuilder, shape: (usize, usize), comm: Rc<Comm>) -> Result<Self> {
         let rank = comm.rank();
         let size = comm.world_size();
-        let weight = vb.get_with_hints((), "weight", shard(0, rank, size))?;
+        let weight = vb.get_with_hints(shape, "weight", shard(0, rank, size))?;
         Ok(Self::new(Linear::new(weight, None)))
     }
 
@@ -48,10 +51,12 @@ impl TensorParallelRowLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.linear.forward(x)?.apply_op1_no_bwd(&self.all_reduce)
     }
-    pub fn load(vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
+    /// `shape` is the whole weight's, before sharding; see
+    /// [`TensorParallelColumnLinear::load`].
+    pub fn load(vb: VarBuilder, shape: (usize, usize), comm: Rc<Comm>) -> Result<Self> {
         let rank = comm.rank();
         let size = comm.world_size();
-        let weight = vb.get_with_hints((), "weight", shard(1, rank, size))?;
+        let weight = vb.get_with_hints(shape, "weight", shard(1, rank, size))?;
         Ok(Self::new(Linear::new(weight, None), comm))
     }
 }
