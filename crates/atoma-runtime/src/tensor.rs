@@ -431,6 +431,20 @@ impl Tensor {
         })
     }
 
+    /// A view minted without the Allocation witness, for the shape and stride arithmetic of
+    /// crates that have no device to allocate on.
+    ///
+    /// Behind the `test-support` feature, which nothing in a serving build enables: a real view
+    /// names bytes the session fixed, and this one names whatever the caller says.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::Misaligned`] when `address` does not suit the layout's dtype.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(address: sys::CUdeviceptr, layout: Layout) -> Result<Self, TensorError> {
+        Self::at(address, layout)
+    }
+
     /// A view `offset` bytes into this one. Every offset a layout produces is a whole number of
     /// elements, so alignment is preserved.
     fn shifted(&self, layout: Layout, offset: usize) -> Self {

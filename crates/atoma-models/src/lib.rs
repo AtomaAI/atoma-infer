@@ -10,9 +10,11 @@
 //! |---|---|
 //! | [`dims`] | The dimensions a Llama decode step is shaped by, checked once |
 //! | [`layer`] | A layer class: the op order and the roles each op reads and writes; Llama's one class |
+//! | [`attention`] | Paged decode attention: the per-bucket plan and the calls it assembles |
 //! | [`gemm`] | The step's multiplications, through a cuBLAS handle bound to the capture stream |
 //! | [`rope`] | The rotary embedding's cosine and sine tables, computed on the host once |
 
+pub mod attention;
 pub mod dims;
 pub mod gemm;
 pub mod layer;
