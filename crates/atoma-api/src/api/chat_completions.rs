@@ -2402,6 +2402,36 @@ pub mod tests {
             ),
             "a tool message with nothing before it gets no role line"
         );
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[
+                Message::Assistant {
+                    content: None,
+                    name: None,
+                    refusal: None,
+                    tool_calls: vec![ToolCall {
+                        id: "1".to_string(),
+                        r#type: "function".to_string(),
+                        function: ToolCallFunction {
+                            name: "get_weather".to_string(),
+                            arguments: json!({ "city": "Lisbon" }),
+                        },
+                    }],
+                },
+                tool(),
+                user(),
+            ]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<|im_start|>assistant\n<tool_call>\n",
+                "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Lisbon\"}}",
+                "\n</tool_call><|im_end|>\n",
+                "<|im_start|>tool\n<tool_response>\n25 C\n</tool_response>\n<|im_end|>",
+                "<|im_start|>user\nWeather?<|im_end|>\n",
+                "<|im_start|>assistant\n",
+            ),
+            "the conversation a tool call makes: the answer to the call, then the next turn"
+        );
     }
 
     /// A run of consecutive tool messages is one turn: one role line, one block per message, one
@@ -2513,8 +2543,7 @@ pub mod tests {
     /// The template writes `<|im_end|>` straight after a turn's content. The builder wrote a
     /// newline between the two, so every turn carried a token the model's own template does not.
     ///
-    /// A tool run that something follows is the template's one exception, and no conversation
-    /// here ends in one.
+    /// A tool run that something follows is the template's one exception, pinned below.
     #[test]
     fn a_hermes3_turn_ends_in_the_end_of_turn_token_with_nothing_before_it() {
         for messages in every_trailing_role() {
@@ -2531,6 +2560,20 @@ pub mod tests {
             }])
             .contains("<|im_start|>user\nHi<|im_end|>\n"),
             "the content runs straight into the tag, rather than the tag being absent"
+        );
+        assert!(
+            messages::messages_to_hermes3_prompt(&[
+                Message::Tool {
+                    content: Some(MessageContent::Text("25 C".to_string())),
+                    tool_call_id: "1".to_string(),
+                },
+                Message::User {
+                    content: Some(MessageContent::Text("Hi".to_string())),
+                    name: None,
+                },
+            ])
+            .contains("</tool_response>\n<|im_end|>"),
+            "the exception: a tool run that something follows closes its last block with a newline"
         );
     }
 
