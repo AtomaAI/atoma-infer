@@ -731,6 +731,10 @@ pub struct RequestBody {
     /// An upper bound for the number of tokens that can be generated for a completion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+    /// The deprecated name for `max_completion_tokens`, and still what most clients send. Read
+    /// when `max_completion_tokens` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     /// How many chat completion choices to generate for each input message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     n: Option<usize>,
@@ -796,6 +800,10 @@ impl RequestBody {
 
     pub fn max_completion_tokens(&self) -> Option<u32> {
         self.max_completion_tokens
+    }
+
+    pub fn max_tokens(&self) -> Option<u32> {
+        self.max_tokens
     }
 
     pub fn n(&self) -> Option<usize> {
@@ -873,6 +881,8 @@ pub enum Refused {
     TopP { top_p: f32 },
     #[error("max_completion_tokens must be at least 1")]
     NoCompletionTokens,
+    #[error("max_tokens must be at least 1")]
+    NoMaxTokens,
 }
 
 impl RequestBody {
@@ -881,14 +891,16 @@ impl RequestBody {
     /// Sampling is on, as the API's default is the model's own distribution; a temperature of
     /// zero is the request for greedy decoding, honoured by the sampler. `seed` is used when
     /// given and `fresh_seed` otherwise, so an unseeded request is not reproducible by
-    /// accident. `user` is the caller's own identifier and is accepted without being acted on.
+    /// accident. The completion budget is `max_completion_tokens`, or the deprecated
+    /// `max_tokens` when that is absent. `user` is the caller's own identifier and is accepted
+    /// without being acted on.
     ///
     /// # Errors
     ///
     /// Returns [`Refused`] for what the engine does not serve — `logprobs`, `top_logprobs`,
     /// more than one choice, `logit_bias`, `tools`, a non-zero `frequency_penalty` or
     /// `presence_penalty` — and for a temperature outside 0 to 2, a `top_p` outside 0 to 1, or
-    /// a completion budget of zero.
+    /// a completion budget of zero under either of its names.
     pub fn to_engine_request(&self, fresh_seed: u64) -> Result<EngineRequest, Refused> {
         self.refuse_unserved()?;
         Ok(EngineRequest {
@@ -950,10 +962,20 @@ impl RequestBody {
         })
     }
 
+    /// The completion budget the request carries, under whichever name: `max_completion_tokens`
+    /// wins when both are sent. `None` leaves the bound to the room under the max model length.
     fn max_new_tokens(&self) -> Result<Option<TokenCount>, Refused> {
-        self.max_completion_tokens
-            .map(|budget| TokenCount::new(budget as usize).ok_or(Refused::NoCompletionTokens))
-            .transpose()
+        if let Some(budget) = self.max_completion_tokens {
+            return TokenCount::new(budget as usize)
+                .map(Some)
+                .ok_or(Refused::NoCompletionTokens);
+        }
+        if let Some(budget) = self.max_tokens {
+            return TokenCount::new(budget as usize)
+                .map(Some)
+                .ok_or(Refused::NoMaxTokens);
+        }
+        Ok(None)
     }
 
     fn stop_strings(&self) -> Vec<String> {
@@ -1281,6 +1303,24 @@ pub mod tests {
         );
     }
 
+    /// `max_tokens` is the deprecated name for the budget and still what most clients send; a
+    /// request carrying it alone is bounded by it rather than served as though no budget were set.
+    #[test]
+    fn a_budget_sent_as_max_tokens_is_applied() {
+        let request = body(json!({ "max_tokens": 8 }))
+            .to_engine_request(1)
+            .unwrap();
+        assert_eq!(request.max_new_tokens, Some(TokenCount::new(8).unwrap()));
+    }
+
+    #[test]
+    fn max_completion_tokens_wins_when_both_budgets_are_sent() {
+        let request = body(json!({ "max_completion_tokens": 3, "max_tokens": 8 }))
+            .to_engine_request(1)
+            .unwrap();
+        assert_eq!(request.max_new_tokens, Some(TokenCount::new(3).unwrap()));
+    }
+
     #[test]
     fn stop_strings_arrive_as_one_or_several() {
         assert_eq!(
@@ -1337,6 +1377,7 @@ pub mod tests {
             refused(json!({ "max_completion_tokens": 0 })),
             Refused::NoCompletionTokens
         );
+        assert_eq!(refused(json!({ "max_tokens": 0 })), Refused::NoMaxTokens);
         assert!(
             refused(json!({ "n": 3 })).to_string().contains("3 choices"),
             "the refusal names what was asked"

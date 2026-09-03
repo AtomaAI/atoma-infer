@@ -787,6 +787,23 @@ mod tests {
         served.shutdown();
     }
 
+    /// The shape most clients send: the deprecated `max_tokens` and no `max_completion_tokens`.
+    #[tokio::test]
+    async fn a_budget_sent_as_max_tokens_bounds_the_completion() {
+        let served = serve("a", Duration::from_secs(30));
+        let mut body = completion_body(json!({ "max_tokens": 4 }));
+        body.as_object_mut()
+            .unwrap()
+            .remove("max_completion_tokens");
+        let (status, body) = post(served.router(), body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "aaaa");
+        assert_eq!(body["choices"][0]["finish_reason"], "length");
+        assert_eq!(body["usage"]["completion_tokens"], 4);
+        served.shutdown();
+    }
+
     #[tokio::test]
     async fn a_stop_string_ends_the_completion_before_the_match() {
         let served = serve("a", Duration::from_secs(30));
