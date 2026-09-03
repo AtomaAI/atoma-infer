@@ -16,7 +16,7 @@ metrics                     = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 rand                        = { workspace = true }
 serde                       = { workspace = true }
-serde_json                  = { workspace = true }
+serde_json                  = { workspace = true, features = [ "preserve_order" ] }
 thiserror                   = { workspace = true }
 tokenizers                  = { workspace = true }
 tokio                       = { workspace = true, features = [ "macros", "rt-multi-thread", "signal", "time" ] }

@@ -271,7 +271,7 @@ impl Message {
 }
 
 pub(crate) mod messages {
-    use super::{Message, MessageContent, Model};
+    use super::{Message, MessageContent, Model, ToolCall};
     use tracing::warn;
 
     /// Function to convert a list of messages to a prompt string in Llama2 format.
@@ -409,30 +409,76 @@ pub(crate) mod messages {
         prompt
     }
 
-    /// Writes one Hermes 3 role line: the start-of-turn token, the role, and the newline the
-    /// template puts before a turn's content.
-    fn push_hermes3_header(prompt: &mut String, role: &str) {
+    /// Opens one Hermes 3 turn: the start-of-turn token and the role, and nothing after them.
+    fn push_hermes3_turn_start(prompt: &mut String, role: &str) {
         prompt.push_str("<|im_start|>");
         prompt.push_str(role);
+    }
+
+    /// Writes one Hermes 3 role line: the turn's opening, and the newline the template puts
+    /// before a turn's content.
+    fn push_hermes3_header(prompt: &mut String, role: &str) {
+        push_hermes3_turn_start(prompt, role);
         prompt.push('\n');
     }
 
+    /// Closes one Hermes 3 turn. The template writes the end-of-turn token straight after the
+    /// turn's content, so nothing separates them.
+    fn push_hermes3_end_of_turn(prompt: &mut String) {
+        prompt.push_str("<|im_end|>\n");
+    }
+
     /// Writes one Hermes 3 turn whose content is text alone: the role line, the content if any,
-    /// and the end-of-turn line.
+    /// and the end-of-turn token.
     fn push_hermes3_turn(prompt: &mut String, role: &str, content: Option<&MessageContent>) {
         push_hermes3_header(prompt, role);
         if let Some(content) = content {
             prompt.push_str(&content.to_string());
         }
-        prompt.push_str("\n<|im_end|>\n");
+        push_hermes3_end_of_turn(prompt);
     }
 
+    /// Writes one Hermes 3 tool call as its own block: the newline the template opens a block
+    /// with, the call, and the newline before the closing tag.
+    fn push_hermes3_tool_call(prompt: &mut String, tool_call: &ToolCall) {
+        prompt.push_str("\n<tool_call>\n");
+        // Every Hermes 3 model renders a tool call the same way, so one variant stands for the
+        // family.
+        prompt.push_str(&tool_call.function_call_string(Model::HermesLlama318b));
+        prompt.push_str("\n</tool_call>");
+    }
+
+    /// Writes one Hermes 3 assistant turn made of tool calls, one block each.
+    ///
+    /// The role line carries no newline of its own here: the template opens the turn with the
+    /// role alone, and the first block opens with the newline that would have followed it.
+    fn push_hermes3_tool_call_turn(prompt: &mut String, tool_calls: &[ToolCall]) {
+        push_hermes3_turn_start(prompt, "assistant");
+        for tool_call in tool_calls {
+            push_hermes3_tool_call(prompt, tool_call);
+        }
+        push_hermes3_end_of_turn(prompt);
+    }
+
+    /// The system turn the Hermes 3 template writes ahead of a conversation that does not open
+    /// with one of its own.
+    const HERMES3_DEFAULT_SYSTEM_TURN: &str =
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n";
+
     /// Renders a conversation in the Hermes 3 chat format: the BOS token its template starts
-    /// with, each turn, and the assistant header so that generation starts inside the assistant
-    /// turn.
+    /// with, the default system turn where the template writes one, each turn, and the assistant
+    /// header so that generation starts inside the assistant turn.
     pub(crate) fn messages_to_hermes3_prompt(messages: &[Message]) -> String {
         let mut prompt = String::new();
         prompt.push_str("<|begin_of_text|>");
+        // The template's injection sits inside its own loop over the messages, so an empty
+        // conversation is left alone rather than given a system turn to itself.
+        if messages
+            .first()
+            .is_some_and(|first| !matches!(first, Message::System { .. }))
+        {
+            prompt.push_str(HERMES3_DEFAULT_SYSTEM_TURN);
+        }
 
         for message in messages {
             match message {
@@ -447,22 +493,11 @@ pub(crate) mod messages {
                     tool_calls,
                     ..
                 } => {
-                    push_hermes3_header(&mut prompt, "assistant");
-                    if !tool_calls.is_empty() {
-                        // Every Hermes 3 model renders a tool call the same way, so one variant
-                        // stands for the family.
-                        let tool_calls_str = tool_calls
-                            .iter()
-                            .map(|tc| tc.function_call_string(Model::HermesLlama318b))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        prompt.push_str("<tool_call>");
-                        prompt.push_str(&tool_calls_str);
-                        prompt.push_str("</tool_call>");
-                    } else if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
+                    if tool_calls.is_empty() {
+                        push_hermes3_turn(&mut prompt, "assistant", content.as_ref());
+                    } else {
+                        push_hermes3_tool_call_turn(&mut prompt, tool_calls);
                     }
-                    prompt.push_str("\n<|im_end|>\n");
                 }
                 Message::Tool { content, .. } => {
                     push_hermes3_turn(&mut prompt, "tool", content.as_ref());
@@ -604,17 +639,72 @@ pub struct ToolCall {
     function: ToolCallFunction,
 }
 
+/// Writes JSON as Python's `json.dumps` writes it: a space after every colon and after every
+/// comma, where `serde_json` writes neither.
+///
+/// A chat template renders a tool call's arguments through Jinja's `tojson`, which is
+/// `json.dumps` with `ensure_ascii=False`. Its spacing is part of the prompt, so a server that
+/// writes the compact form sends the model a different token sequence for the same tool call.
+///
+/// One difference is left: a float whose exponent is -5 or below is written as `serde_json`
+/// writes it — `0.00001` and `1e-6` against `json.dumps`' `1e-05` and `1e-06`. Every other
+/// magnitude, and every other type, matches.
+struct JsonDumpsFormatter;
+
+impl serde_json::ser::Formatter for JsonDumpsFormatter {
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        writer.write_all(b": ")
+    }
+
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+}
+
+/// Renders `value` the way a chat template's `tojson` renders it.
+///
+/// The keys come out in the order the caller sent them, which is `preserve_order` on this
+/// crate's `serde_json`: `json.dumps` writes a dict in its own order, and without the feature a
+/// [`Value`] would sort them.
+fn json_dumps(value: &Value) -> String {
+    let mut written = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut written, JsonDumpsFormatter);
+    value
+        .serialize(&mut serializer)
+        .expect("a Value serializes into a Vec without failing");
+    String::from_utf8(written).expect("serde_json writes UTF-8")
+}
+
 impl ToolCall {
     pub fn function_call_string(&self, model: Model) -> String {
         match model {
             Model::HermesLlama318b | Model::HermesLlama3170b | Model::HermesLlama31405b => {
-                let formatted_arguments = serde_json::to_string(&self.function.arguments)
-                    .unwrap()
-                    .replace("\":\"", "\": \""); // Add a space after the colon
-
+                // The template writes the name before the arguments.
                 format!(
-                    "{{\"arguments\": {}, \"name\": \"{}\"}}",
-                    formatted_arguments, self.function.name
+                    "{{\"name\": \"{}\", \"arguments\": {}}}",
+                    self.function.name,
+                    json_dumps(&self.function.arguments)
                 )
             }
             Model::Llama38b
@@ -715,8 +805,14 @@ pub enum StopCondition {
     String(String),
 }
 
+/// What a chat completion request asks for.
+///
+/// Every field the API serves is declared here, and a body carrying one that is not is refused
+/// rather than served as though it were absent: an unserved parameter and a misspelt budget both
+/// change what the caller gets back, and dropping either in silence hides that.
 #[derive(Debug, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename(serialize = "requestBody", deserialize = "requestBody"))]
+#[serde(deny_unknown_fields)]
 pub struct RequestBody {
     /// A list of messages comprising the conversation so far.
     messages: Vec<Message>,
@@ -1197,6 +1293,25 @@ pub mod tests {
         assert!(request.stream);
         assert!(request.prompt.contains("Hello"));
         assert!(request.stop.is_empty());
+    }
+
+    /// A field the API does not declare changes what the caller gets back — a misspelt budget
+    /// lets generation run to the model's own stop — so the body is refused rather than served
+    /// with the field dropped.
+    #[test]
+    fn a_field_the_api_does_not_declare_is_refused_by_name() {
+        let error = serde_json::from_value::<RequestBody>(json!({
+            "model": "meta-llama/Llama-3.2-1B-Instruct",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "max_completion_token": 8
+        }))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `max_completion_token`"),
+            "{error}"
+        );
     }
 
     fn body(fields: serde_json::Value) -> RequestBody {
@@ -1772,8 +1887,9 @@ pub mod tests {
         assert_eq!(result, expected);
     }
 
-    /// One conversation per trailing role, and the empty one.
-    fn every_trailing_role() -> [Vec<Message>; 5] {
+    /// One conversation per trailing role, the assistant's two ways of speaking, and the empty
+    /// one.
+    fn every_trailing_role() -> [Vec<Message>; 6] {
         let text = |text: &str| Some(MessageContent::Text(text.to_string()));
         [
             vec![],
@@ -1790,6 +1906,19 @@ pub mod tests {
                 name: None,
                 refusal: None,
                 tool_calls: vec![],
+            }],
+            vec![Message::Assistant {
+                content: None,
+                name: None,
+                refusal: None,
+                tool_calls: vec![ToolCall {
+                    id: "1".to_string(),
+                    r#type: "function".to_string(),
+                    function: ToolCallFunction {
+                        name: "get_weather".to_string(),
+                        arguments: serde_json::json!({ "city": "Lisbon" }),
+                    },
+                }],
             }],
             vec![Message::Tool {
                 content: text("25 C"),
@@ -1823,7 +1952,7 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.\n<|im_end|>\n",
+            "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -1839,7 +1968,8 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>user\nHello, who are you?\n<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+            "<|im_start|>user\nHello, who are you?<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
     }
@@ -1858,7 +1988,8 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>assistant\nI am Hermes 3, a superintelligent AI.\n<|im_end|>\n",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+            "<|im_start|>assistant\nI am Hermes 3, a superintelligent AI.<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -1874,7 +2005,8 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>tool\nTool response here.\n<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+            "<|im_start|>tool\nTool response here.<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
     }
@@ -1900,10 +2032,12 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>assistant\n",
-            "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
-            "\"name\": \"get_stock_fundamentals\"}</tool_call>",
-            "\n<|im_end|>\n",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+            "<|im_start|>assistant",
+            "\n<tool_call>\n",
+            "{\"name\": \"get_stock_fundamentals\", \"arguments\": {\"symbol\": \"TSLA\"}}",
+            "\n</tool_call>",
+            "<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -1935,9 +2069,9 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.\n<|im_end|>\n",
-            "<|im_start|>user\nFetch stock data for TSLA.\n<|im_end|>\n",
-            "<|im_start|>assistant\nFetching stock data...\n<|im_end|>\n",
+            "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.<|im_end|>\n",
+            "<|im_start|>user\nFetch stock data for TSLA.<|im_end|>\n",
+            "<|im_start|>assistant\nFetching stock data...<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -1962,11 +2096,103 @@ pub mod tests {
         // Missing content is an empty string.
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>user\n\n<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+            "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
     }
 
+    /// The template's `tojson` is `json.dumps`, which spaces every colon and every comma and
+    /// writes a dict in its own order. A single string-valued argument is the one shape a colon
+    /// substitution also gets right, so the arguments here are the ones that told the two apart.
+    /// Every object below is written out of alphabetical order, which a sorted map would not
+    /// preserve.
+    #[test]
+    fn hermes3_tool_call_arguments_are_spaced_the_way_the_template_writes_them() {
+        let call = |arguments: serde_json::Value| {
+            ToolCall {
+                id: "1".to_string(),
+                r#type: "function".to_string(),
+                function: ToolCallFunction {
+                    name: "f".to_string(),
+                    arguments,
+                },
+            }
+            .function_call_string(Model::HermesLlama318b)
+        };
+
+        assert_eq!(
+            call(json!({ "symbol": "TSLA", "shares": 5 })),
+            "{\"name\": \"f\", \"arguments\": {\"symbol\": \"TSLA\", \"shares\": 5}}",
+            "the caller's order, spaced after the colon whatever the value's type"
+        );
+        assert_eq!(
+            call(json!({ "nested": { "a": 1 }, "list": [1, 2], "ok": true })),
+            "{\"name\": \"f\", \"arguments\": \
+             {\"nested\": {\"a\": 1}, \"list\": [1, 2], \"ok\": true}}"
+        );
+        assert_eq!(
+            call(json!({})),
+            "{\"name\": \"f\", \"arguments\": {}}",
+            "an empty object carries no separator to space"
+        );
+        assert_eq!(
+            call(json!({ "city": "Köln", "note": "中文 😀" })),
+            "{\"name\": \"f\", \"arguments\": {\"city\": \"Köln\", \"note\": \"中文 😀\"}}",
+            "the template's tojson passes ensure_ascii=False, so text is not escaped"
+        );
+    }
+
+    /// Where `serde_json` and `json.dumps` disagree, and the magnitudes where they do not. A
+    /// float whose exponent is -5 or below is the one value this builder still writes differently
+    /// from the template: `json.dumps` would write `1e-05` and `1e-06` for the first two.
+    #[test]
+    fn a_float_argument_is_written_as_serde_json_writes_it() {
+        let arguments = |arguments: serde_json::Value| {
+            let call = ToolCall {
+                id: "1".to_string(),
+                r#type: "function".to_string(),
+                function: ToolCallFunction {
+                    name: "f".to_string(),
+                    arguments,
+                },
+            };
+            call.function_call_string(Model::HermesLlama318b)
+        };
+
+        assert_eq!(
+            arguments(json!({ "a": 1e-5, "b": 1e-6 })),
+            "{\"name\": \"f\", \"arguments\": {\"a\": 0.00001, \"b\": 1e-6}}",
+            "the departure this builder still carries"
+        );
+        assert_eq!(
+            arguments(json!({ "a": 0.0001, "b": 1.5, "c": 1e16 })),
+            "{\"name\": \"f\", \"arguments\": {\"a\": 0.0001, \"b\": 1.5, \"c\": 1e+16}}",
+            "every other magnitude matches json.dumps"
+        );
+    }
+
+    /// The Llama 3 tool call renders its arguments in the caller's order too, which is
+    /// `preserve_order` rather than the alphabetical order a sorted map would have imposed.
+    #[test]
+    fn a_llama3_tool_call_keeps_the_callers_argument_order() {
+        let call = ToolCall {
+            id: "1".to_string(),
+            r#type: "function".to_string(),
+            function: ToolCallFunction {
+                name: "get_weather".to_string(),
+                arguments: json!({ "city": "Lisbon", "at": "noon" }),
+            },
+        };
+        assert_eq!(
+            call.function_call_string(Model::Llama318bInstruct),
+            "get_weather(city='Lisbon', at='noon')"
+        );
+    }
+
+    /// The template writes one `<tool_call>` block per call rather than one block holding every
+    /// call, and opens the turn with the role alone: the newline a text turn carries after the
+    /// role is the one each block opens with.
     #[test]
     fn test_hermes3_multiple_tool_calls() {
         let tool_call1 = ToolCall {
@@ -1997,11 +2223,15 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>assistant\n",
-            "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
-            "\"name\": \"get_stock_fundamentals\"}, ",
-            "{\"arguments\": {\"symbol\": \"BTC\"}, \"name\": \"get_crypto_data\"}</tool_call>",
-            "\n<|im_end|>\n",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+            "<|im_start|>assistant",
+            "\n<tool_call>\n",
+            "{\"name\": \"get_stock_fundamentals\", \"arguments\": {\"symbol\": \"TSLA\"}}",
+            "\n</tool_call>",
+            "\n<tool_call>\n",
+            "{\"name\": \"get_crypto_data\", \"arguments\": {\"symbol\": \"BTC\"}}",
+            "\n</tool_call>",
+            "<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
@@ -2017,7 +2247,8 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>tool\nStock data for TSLA\n<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+            "<|im_start|>tool\nStock data for TSLA<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
     }
@@ -2038,11 +2269,73 @@ pub mod tests {
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
             "<|begin_of_text|>",
-            "<|im_start|>system\n\n<|im_end|>\n",
-            "<|im_start|>user\n\n<|im_end|>\n",
+            "<|im_start|>system\n<|im_end|>\n",
+            "<|im_start|>user\n<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
+    }
+
+    /// A conversation that does not open with a system message is given the template's own, so
+    /// the model is addressed under the same system prompt on either server. The template writes
+    /// it from inside its loop over the messages, so an empty conversation gets none.
+    #[test]
+    fn a_hermes3_conversation_is_given_the_templates_system_turn_where_it_writes_one() {
+        let user = || Message::User {
+            content: Some(MessageContent::Text("Hi".to_string())),
+            name: None,
+        };
+        let system = || Message::System {
+            content: Some(MessageContent::Text("Be brief.".to_string())),
+            name: None,
+        };
+
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[user()]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<|im_start|>user\nHi<|im_end|>\n",
+                "<|im_start|>assistant\n",
+            ),
+            "written ahead of the conversation, not anywhere in it"
+        );
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[system(), user()]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nBe brief.<|im_end|>\n",
+                "<|im_start|>user\nHi<|im_end|>\n",
+                "<|im_start|>assistant\n",
+            ),
+            "a system message of the conversation's own is not doubled"
+        );
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[]),
+            "<|begin_of_text|><|im_start|>assistant\n",
+            "the template writes its system turn from inside its loop over the messages"
+        );
+    }
+
+    /// The template writes `<|im_end|>` straight after a turn's content. The builder wrote a
+    /// newline between the two, so every turn carried a token the model's own template does not.
+    #[test]
+    fn a_hermes3_turn_ends_in_the_end_of_turn_token_with_nothing_before_it() {
+        for messages in every_trailing_role() {
+            let prompt = messages::messages_to_hermes3_prompt(&messages);
+            assert!(
+                !prompt.contains("\n<|im_end|>"),
+                "{messages:?} rendered as {prompt:?}"
+            );
+        }
+        assert!(
+            messages::messages_to_hermes3_prompt(&[Message::User {
+                content: Some(MessageContent::Text("Hi".to_string())),
+                name: None,
+            }])
+            .contains("<|im_start|>user\nHi<|im_end|>\n"),
+            "the content runs straight into the tag, rather than the tag being absent"
+        );
     }
 
     /// The Hermes 3 template ends in `<|im_start|>assistant` and a newline under its generation

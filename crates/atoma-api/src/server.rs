@@ -17,7 +17,8 @@ use atoma_core::request::{egress, EgressReceiver, NewRequest, Priority, StopCrit
 use atoma_core::types::TokenCount;
 use atoma_engine::config::Rank;
 use atoma_engine::executor::{ExecutorError, ExecutorThread};
-use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
@@ -30,7 +31,7 @@ use tokenizers::{Error as TokenizerError, Tokenizer};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::{signal, task, time};
-use tracing::{error, info, instrument, warn, Span};
+use tracing::{debug, error, info, instrument, warn, Span};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
@@ -332,6 +333,42 @@ impl ApiError {
     fn internal(message: String, request_id: &str) -> Self {
         Self::new(ErrorKind::Internal, message, request_id)
     }
+
+    /// The refusal a body that cannot be read as a request answers with. `body_text` is what the
+    /// extractor would have written as plain text: the undeclared field and the names it was
+    /// expected among, or where the JSON broke.
+    fn unreadable_body(rejection: &JsonRejection, request_id: &str) -> Self {
+        Self::new(ErrorKind::InvalidRequest, rejection.body_text(), request_id)
+    }
+}
+
+/// The JSON body of a request, read as [`Json`] reads it and refused as this API refuses.
+///
+/// [`Json`]'s own rejection is a status of its choosing and a plain-text body, so a body it cannot
+/// read would answer outside the `invalid_request_error` envelope every other refusal uses. This
+/// extractor brings those failures into the envelope, under a request id of their own: the handler
+/// never runs, so the id it would have issued does not exist.
+pub struct JsonBody<T>(pub T);
+
+impl<S, T> FromRequest<S> for JsonBody<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(request, state).await {
+            Ok(Json(body)) => Ok(Self(body)),
+            Err(rejection) => {
+                let request_id = next_request_id().to_string();
+                // A body the caller malformed is diagnostic, not degradation, and any caller can
+                // send one as often as it likes.
+                debug!(request_id, cause = %rejection, "the request body cannot be read");
+                Err(ApiError::unreadable_body(&rejection, &request_id))
+            }
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -376,7 +413,7 @@ fn unix_now() -> u64 {
         ),
         (
             status = 400,
-            description = "Asks for what the engine cannot honour",
+            description = "Cannot be read as a request, or asks for what the engine cannot honour",
             body = serde_json::Value
         ),
         (status = 429, description = "The engine is overloaded", body = serde_json::Value),
@@ -386,7 +423,7 @@ fn unix_now() -> u64 {
 #[instrument(skip_all, fields(request_id))]
 pub async fn completion_handler(
     State(state): State<AppState>,
-    Json(request): Json<RequestBody>,
+    JsonBody(request): JsonBody<RequestBody>,
 ) -> Result<Response, ApiError> {
     let request_id = next_request_id().to_string();
     Span::current().record("request_id", request_id.as_str());
@@ -695,16 +732,27 @@ mod tests {
         }
     }
 
+    const JSON: &str = "application/json";
+
     async fn post(router: Router, body: Value) -> (StatusCode, String) {
+        post_as(router, body.to_string(), Some(JSON)).await
+    }
+
+    /// Posts a body as it stands, under a content type of the caller's choosing or none at all:
+    /// for the requests a [`Value`] and a well-formed header cannot express.
+    async fn post_as(
+        router: Router,
+        body: String,
+        content_type: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(CHAT_COMPLETIONS_PATH);
+        if let Some(content_type) = content_type {
+            request = request.header(header::CONTENT_TYPE, content_type);
+        }
         let response = router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(CHAT_COMPLETIONS_PATH)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
+            .oneshot(request.body(Body::from(body)).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -857,6 +905,60 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("2 choices"));
+        served.shutdown();
+    }
+
+    /// A misspelt budget is refused by name rather than dropped, which would have served the
+    /// request as though no budget were asked for.
+    #[tokio::test]
+    async fn a_field_the_api_does_not_declare_is_a_400() {
+        let served = serve("a", Duration::from_secs(30));
+        let (status, body) = post(
+            served.router(),
+            completion_body(json!({ "max_completion_token": 8 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown field `max_completion_token`"),
+            "{body}"
+        );
+        served.shutdown();
+    }
+
+    /// A body the extractor cannot read is refused like any other: the same envelope under a
+    /// request id, saying what could not be read. A missing content type is refused the same way,
+    /// where the extractor would have answered a 415, and a broken body where it would have
+    /// answered a 422 and a line of text.
+    #[tokio::test]
+    async fn a_body_that_cannot_be_read_is_refused_in_the_envelope() {
+        let served = serve("a", Duration::from_secs(30));
+        let cases = [
+            ("{ not json".to_owned(), Some(JSON), "parse"),
+            (
+                json!({ "model": "meta-llama/Llama-3.2-1B-Instruct", "messages": 3 }).to_string(),
+                Some(JSON),
+                "messages",
+            ),
+            (completion_body(json!({})).to_string(), None, "Content-Type"),
+        ];
+        for (posted, content_type, said) in cases {
+            let (status, body) = post_as(served.router(), posted.clone(), content_type).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{posted}: {body}");
+            let body: Value = serde_json::from_str(&body)
+                .unwrap_or_else(|_| panic!("{posted} answered outside the envelope: {body}"));
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(body["error"]["request_id"].is_string(), "{body}");
+            assert!(
+                body["error"]["message"].as_str().unwrap().contains(said),
+                "{posted} was refused without saying {said}: {body}"
+            );
+        }
         served.shutdown();
     }
 
