@@ -645,6 +645,10 @@ pub struct ToolCall {
 /// A chat template renders a tool call's arguments through Jinja's `tojson`, which is
 /// `json.dumps` with `ensure_ascii=False`. Its spacing is part of the prompt, so a server that
 /// writes the compact form sends the model a different token sequence for the same tool call.
+///
+/// One difference is left: a float whose exponent is -5 or below is written as `serde_json`
+/// writes it — `0.00001` and `1e-6` against `json.dumps`' `1e-05` and `1e-06`. Every other
+/// magnitude, and every other type, matches.
 struct JsonDumpsFormatter;
 
 impl serde_json::ser::Formatter for JsonDumpsFormatter {
@@ -2131,6 +2135,58 @@ pub mod tests {
             call(json!({})),
             "{\"name\": \"f\", \"arguments\": {}}",
             "an empty object carries no separator to space"
+        );
+        assert_eq!(
+            call(json!({ "city": "Köln", "note": "中文 😀" })),
+            "{\"name\": \"f\", \"arguments\": {\"city\": \"Köln\", \"note\": \"中文 😀\"}}",
+            "the template's tojson passes ensure_ascii=False, so text is not escaped"
+        );
+    }
+
+    /// Where `serde_json` and `json.dumps` disagree, and the magnitudes where they do not. A
+    /// float whose exponent is -5 or below is the one value this builder still writes differently
+    /// from the template: `json.dumps` would write `1e-05` and `1e-06` for the first two.
+    #[test]
+    fn a_float_argument_is_written_as_serde_json_writes_it() {
+        let arguments = |arguments: serde_json::Value| {
+            let call = ToolCall {
+                id: "1".to_string(),
+                r#type: "function".to_string(),
+                function: ToolCallFunction {
+                    name: "f".to_string(),
+                    arguments,
+                },
+            };
+            call.function_call_string(Model::HermesLlama318b)
+        };
+
+        assert_eq!(
+            arguments(json!({ "a": 1e-5, "b": 1e-6 })),
+            "{\"name\": \"f\", \"arguments\": {\"a\": 0.00001, \"b\": 1e-6}}",
+            "the departure this builder still carries"
+        );
+        assert_eq!(
+            arguments(json!({ "a": 0.0001, "b": 1.5, "c": 1e16 })),
+            "{\"name\": \"f\", \"arguments\": {\"a\": 0.0001, \"b\": 1.5, \"c\": 1e+16}}",
+            "every other magnitude matches json.dumps"
+        );
+    }
+
+    /// The Llama 3 tool call renders its arguments in the caller's order too, which is
+    /// `preserve_order` rather than the alphabetical order a sorted map would have imposed.
+    #[test]
+    fn a_llama3_tool_call_keeps_the_callers_argument_order() {
+        let call = ToolCall {
+            id: "1".to_string(),
+            r#type: "function".to_string(),
+            function: ToolCallFunction {
+                name: "get_weather".to_string(),
+                arguments: json!({ "city": "Lisbon", "at": "noon" }),
+            },
+        };
+        assert_eq!(
+            call.function_call_string(Model::Llama318bInstruct),
+            "get_weather(city='Lisbon', at='noon')"
         );
     }
 
