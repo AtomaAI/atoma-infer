@@ -51,26 +51,27 @@ pub enum Unservable {
     NoBucket { tokens: usize, largest: usize },
 }
 
-/// Where a keyed batch runs.
+/// What checking a keyed batch found: the decode step serves it, or candle does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Route {
-    /// The decode step, at this bucket.
-    Bucket(DecodeBatch),
-    /// The eager path, for this reason.
+pub enum Checked {
+    /// Served by the decode step, at this bucket.
+    Step(DecodeBatch),
+    /// Served eagerly, on candle, for this reason.
     Eager(Unservable),
 }
 
-/// The buckets the decode step serves: the configured ladder's rungs at or below the captured
-/// maximum, in configured order. The arena and every slot table are built over exactly these, so
-/// a rung's position here is its bucket index everywhere.
+/// The buckets the decode step serves: the configured bucket ladder's entries at or below the
+/// captured maximum, in configured order. The arena and every slot table are built over exactly
+/// these, so an entry's position here is its bucket index everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeBuckets {
     tokens: Vec<usize>,
 }
 
 impl DecodeBuckets {
-    /// The rungs of `config`'s ladder a captured decode graph can serve: a uniform-decode batch
-    /// has as many tokens as entries, so a rung above the captured request maximum never fills.
+    /// The entries of `config`'s bucket ladder a captured decode graph can serve: a uniform-decode
+    /// batch has as many tokens as entries, so a bucket above the captured request maximum never
+    /// fills.
     #[must_use]
     pub fn usable(config: &DispatchConfig) -> Self {
         let captured_max = config.captured_max_requests.get();
@@ -85,24 +86,24 @@ impl DecodeBuckets {
         }
     }
 
-    /// The rungs, in bucket-index order.
+    /// The buckets, in index order.
     #[must_use]
     pub fn tokens(&self) -> &[usize] {
         &self.tokens
     }
 
-    /// The largest rung, or zero when nothing is usable.
+    /// The largest bucket, or zero when nothing is usable.
     #[must_use]
     pub fn largest(&self) -> usize {
         self.tokens.iter().copied().max().unwrap_or(0)
     }
 
-    /// The bucket serving exactly `tokens`: the first rung of that size.
+    /// The bucket serving exactly `tokens`: the first entry of that size.
     #[must_use]
     pub fn index_of(&self, tokens: usize) -> Option<BucketIdx> {
         self.tokens
             .iter()
-            .position(|&rung| rung == tokens)
+            .position(|&bucket| bucket == tokens)
             .map(BucketIdx)
     }
 }
@@ -111,7 +112,7 @@ impl DecodeBuckets {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeBatch {
     pub bucket: BucketIdx,
-    /// Entries in the batch, dummies included: the bucket's rung.
+    /// Entries in the batch, dummies included: the bucket's size.
     pub tokens: usize,
     /// The leading entries that are live; each samples, so these are the logits rows read back.
     pub live: usize,
@@ -127,12 +128,12 @@ impl DecodeBatch {
     /// Returns [`DecodeBatchError`] when the layout contradicts its key: an entry computing more
     /// than one token, an entry count that is not the bucket, no live entry, a dummy that
     /// samples, or a block table wider than a sequence can be.
-    pub fn route(
+    pub fn check(
         layout: &BatchLayout,
         key: GraphKey,
         buckets: &DecodeBuckets,
         max_block_table_width: usize,
-    ) -> Result<Route, DecodeBatchError> {
+    ) -> Result<Checked, DecodeBatchError> {
         if !key.uniform_decode() {
             return Err(DecodeBatchError::KeyNotUniformDecode);
         }
@@ -163,15 +164,15 @@ impl DecodeBatch {
             return Err(DecodeBatchError::DummySamples { entry });
         }
         if let Some(entry) = (0..live).find(|entry| !selected.contains(entry)) {
-            return Ok(Route::Eager(Unservable::LiveEntryNotSampling { entry }));
+            return Ok(Checked::Eager(Unservable::LiveEntryNotSampling { entry }));
         }
         let Some(index) = buckets.index_of(bucket) else {
-            return Ok(Route::Eager(Unservable::NoBucket {
+            return Ok(Checked::Eager(Unservable::NoBucket {
                 tokens: bucket,
                 largest: buckets.largest(),
             }));
         };
-        Ok(Route::Bucket(Self {
+        Ok(Checked::Step(Self {
             bucket: index,
             tokens: bucket,
             live,
@@ -206,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn the_usable_buckets_are_the_ladders_rungs_up_to_the_captured_maximum_in_order() {
+    fn the_usable_buckets_are_the_bucket_ladders_entries_up_to_the_captured_maximum_in_order() {
         let mut config = engine_config().dispatch;
         config.bucket_ladder = BucketLadder::new(vec![8, 1, 4, 2, 16, 4]).unwrap();
         config.captured_max_requests = RequestCount::new(4).unwrap();
@@ -218,7 +219,7 @@ mod tests {
         assert_eq!(
             buckets.index_of(4),
             Some(BucketIdx(1)),
-            "the first rung of four"
+            "the first bucket of four"
         );
         assert_eq!(buckets.index_of(2), Some(BucketIdx(2)));
         assert_eq!(buckets.index_of(8), None);
@@ -234,11 +235,11 @@ mod tests {
         ]);
         assert_eq!(layout.padding_count, 1);
 
-        let route = DecodeBatch::route(&layout, key, &buckets(), MAX_WIDTH).unwrap();
+        let checked = DecodeBatch::check(&layout, key, &buckets(), MAX_WIDTH).unwrap();
 
         assert_eq!(
-            route,
-            Route::Bucket(DecodeBatch {
+            checked,
+            Checked::Step(DecodeBatch {
                 bucket: BucketIdx(2),
                 tokens: 4,
                 live: 3,
@@ -250,9 +251,9 @@ mod tests {
     #[test]
     fn one_decode_fills_the_bucket_of_one_with_no_padding() {
         let (layout, key) = keyed(vec![entry(1, 3, vec![9], &[10], true)]);
-        let route = DecodeBatch::route(&layout, key, &buckets(), MAX_WIDTH).unwrap();
-        let Route::Bucket(batch) = route else {
-            panic!("{route:?}");
+        let checked = DecodeBatch::check(&layout, key, &buckets(), MAX_WIDTH).unwrap();
+        let Checked::Step(batch) = checked else {
+            panic!("{checked:?}");
         };
         assert_eq!(
             (batch.bucket, batch.tokens, batch.live),
@@ -266,10 +267,10 @@ mod tests {
             entry(1, 3, vec![9], &[10], true),
             entry(2, 2, vec![9], &[20, 21], false),
         ]);
-        let route = DecodeBatch::route(&layout, key, &buckets(), MAX_WIDTH).unwrap();
+        let checked = DecodeBatch::check(&layout, key, &buckets(), MAX_WIDTH).unwrap();
         assert_eq!(
-            route,
-            Route::Eager(Unservable::LiveEntryNotSampling { entry: 1 })
+            checked,
+            Checked::Eager(Unservable::LiveEntryNotSampling { entry: 1 })
         );
     }
 
@@ -284,11 +285,11 @@ mod tests {
         config.captured_max_requests = RequestCount::new(2).unwrap();
         let buckets = DecodeBuckets::usable(&config);
 
-        let route = DecodeBatch::route(&layout, key, &buckets, MAX_WIDTH).unwrap();
+        let checked = DecodeBatch::check(&layout, key, &buckets, MAX_WIDTH).unwrap();
 
         assert_eq!(
-            route,
-            Route::Eager(Unservable::NoBucket {
+            checked,
+            Checked::Eager(Unservable::NoBucket {
                 tokens: 4,
                 largest: 2
             })
@@ -308,7 +309,7 @@ mod tests {
         let mut wide = layout.clone();
         wide.block_table_width = MAX_WIDTH + 1;
         assert_eq!(
-            DecodeBatch::route(&wide, key, &buckets, MAX_WIDTH).unwrap_err(),
+            DecodeBatch::check(&wide, key, &buckets, MAX_WIDTH).unwrap_err(),
             DecodeBatchError::BlockTableTooWide {
                 width: MAX_WIDTH + 1,
                 max_width: MAX_WIDTH
@@ -318,14 +319,14 @@ mod tests {
         let mut sampling_dummy = layout.clone();
         sampling_dummy.selected.push(3);
         assert_eq!(
-            DecodeBatch::route(&sampling_dummy, key, &buckets, MAX_WIDTH).unwrap_err(),
+            DecodeBatch::check(&sampling_dummy, key, &buckets, MAX_WIDTH).unwrap_err(),
             DecodeBatchError::DummySamples { entry: 3 }
         );
 
         let mut all_padding = layout.clone();
         all_padding.padding_count = 4;
         assert_eq!(
-            DecodeBatch::route(&all_padding, key, &buckets, MAX_WIDTH).unwrap_err(),
+            DecodeBatch::check(&all_padding, key, &buckets, MAX_WIDTH).unwrap_err(),
             DecodeBatchError::NoLiveEntries {
                 entries: 4,
                 padding: 4
@@ -334,7 +335,7 @@ mod tests {
 
         layout.tokens.push(9);
         assert_eq!(
-            DecodeBatch::route(&layout, key, &buckets, MAX_WIDTH).unwrap_err(),
+            DecodeBatch::check(&layout, key, &buckets, MAX_WIDTH).unwrap_err(),
             DecodeBatchError::EntryNotOneToken {
                 entries: 4,
                 tokens: 5
@@ -351,7 +352,7 @@ mod tests {
         let (_, key_of_one) = keyed(vec![entry(1, 3, vec![9], &[10], true)]);
         assert_ne!(key, key_of_one);
         assert_eq!(
-            DecodeBatch::route(&layout, key_of_one, &buckets(), MAX_WIDTH).unwrap_err(),
+            DecodeBatch::check(&layout, key_of_one, &buckets(), MAX_WIDTH).unwrap_err(),
             DecodeBatchError::EntriesNotBucket {
                 entries: 2,
                 bucket: 1
@@ -373,7 +374,7 @@ mod tests {
             panic!("keyed");
         };
         assert_eq!(
-            DecodeBatch::route(&layout, key, &buckets(), MAX_WIDTH).unwrap_err(),
+            DecodeBatch::check(&layout, key, &buckets(), MAX_WIDTH).unwrap_err(),
             DecodeBatchError::EntryNotOneToken {
                 entries: 3,
                 tokens: 5

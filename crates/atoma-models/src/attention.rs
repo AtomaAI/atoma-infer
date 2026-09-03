@@ -26,7 +26,7 @@ use crate::dims::LlamaDims;
 /// f32 is what the split kernel accumulates in.
 const ACCUMULATOR: Dtype = Dtype::F32;
 
-/// The precision the decode path runs. Refused at startup if the model is loaded in another.
+/// The precision the decode step runs. Refused at startup if the model is loaded in another.
 pub const PRECISION: Precision = Precision::Bf16;
 
 /// Why an attention plan or call could not be shaped.
@@ -39,7 +39,7 @@ pub enum AttentionError {
     CacheShape { rank: usize, dims: [usize; 4] },
     #[error("the cache holds {kv_width} key-value elements per slot, not the model's {expected}")]
     CacheWidth { kv_width: usize, expected: usize },
-    #[error("{operand} is {dtype:?}; the decode path runs bf16")]
+    #[error("{operand} is {dtype:?}; the decode step runs bf16")]
     OperandDtype { operand: &'static str, dtype: Dtype },
     #[error("{operand} is {rows} by {columns}, not {expected_rows} by {expected_columns}")]
     OperandShape {
@@ -283,7 +283,7 @@ pub fn decode_call(
 ///
 /// # Panics
 ///
-/// Panics when the key or value segment does not lie in the fused row, which the width check
+/// Panics when the key or value columns do not lie in the fused row, which the width check
 /// above has already ruled out.
 pub fn kv_write_call(
     qkv: &Tensor,

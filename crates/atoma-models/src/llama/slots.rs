@@ -22,7 +22,7 @@ use thiserror::Error;
 use crate::attention::{cache_halves, AttentionError, AttentionPlan, CacheHalves};
 use crate::dims::LlamaDims;
 use crate::kernels::RotaryTensors;
-use crate::layer::{LayerOffset, LayerWeight, QkvSegment, Role, RoleRef};
+use crate::layer::{LayerOffset, LayerWeight, QkvColumns, Role, RoleRef};
 
 /// The activations' element type: every arena slot is read and written as bf16.
 const ACTIVATION: Dtype = Dtype::Bf16;
@@ -152,7 +152,7 @@ pub enum SlotError {
     Tensor(#[from] TensorError),
 }
 
-/// One rung of the bucket ladder: its index into the arena and the tokens it serves.
+/// One entry of the bucket ladder: its index into the arena and the tokens it serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bucket {
     pub index: BucketIdx,
@@ -221,14 +221,14 @@ impl LayerSlots {
         &self.roles[role as usize]
     }
 
-    /// The column view of the fused row a projection writes: `[tokens, segment width]` with the
+    /// The column view of the fused row a projection writes: `[tokens, width]` with the
     /// fused row's stride.
     #[must_use]
-    pub fn segment(&self, segment: QkvSegment) -> &Tensor {
-        match segment {
-            QkvSegment::Q => &self.q,
-            QkvSegment::K => &self.k,
-            QkvSegment::V => &self.v,
+    pub fn columns(&self, columns: QkvColumns) -> &Tensor {
+        match columns {
+            QkvColumns::Q => &self.q,
+            QkvColumns::K => &self.k,
+            QkvColumns::V => &self.v,
         }
     }
 }
@@ -814,9 +814,9 @@ mod tests {
         let qkv = row.role(Role::Qkv);
 
         let (q, k, v) = (
-            row.segment(QkvSegment::Q),
-            row.segment(QkvSegment::K),
-            row.segment(QkvSegment::V),
+            row.columns(QkvColumns::Q),
+            row.columns(QkvColumns::K),
+            row.columns(QkvColumns::V),
         );
         assert_eq!(q.address(), qkv.address());
         assert_eq!(k.address(), qkv.address() + (dims.q_width() * 2) as u64);
@@ -827,8 +827,8 @@ mod tests {
         assert_eq!(q.dims(), [8, dims.q_width()]);
         assert_eq!(k.dims(), [8, dims.kv_width()]);
         assert_eq!(v.dims(), [8, dims.kv_width()]);
-        for segment in [q, k, v] {
-            assert_eq!(segment.strides(), [dims.qkv_width(), 1]);
+        for view in [q, k, v] {
+            assert_eq!(view.strides(), [dims.qkv_width(), 1]);
         }
     }
 

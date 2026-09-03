@@ -27,7 +27,7 @@ use atoma_core::types::{
 };
 use atoma_engine::batch::BatchLayout;
 use atoma_engine::config::{DeviceOrdinal, Dtype, ModelConfig};
-use atoma_engine::decode::batch::Route;
+use atoma_engine::decode::batch::Checked;
 use atoma_engine::decode::declaration;
 use atoma_engine::device::decode::{DecodeStep, DecodeStepPlan};
 use atoma_engine::device::forward::{Allocated, CudaForward};
@@ -121,7 +121,7 @@ fn dummy(index: usize, block: u32) -> CommandEntry {
 
 fn dispatch_config() -> DispatchConfig {
     DispatchConfig {
-        bucket_ladder: BucketLadder::new(LADDER.to_vec()).expect("nonzero rungs"),
+        bucket_ladder: BucketLadder::new(LADDER.to_vec()).expect("nonzero buckets"),
         captured_max_requests: requests(MAX_BATCH),
     }
 }
@@ -247,7 +247,7 @@ fn record_bucket_of_one(
     let DispatchDecision::FullReplay(key) = layout.dispatch else {
         panic!("keyed");
     };
-    let Route::Bucket(batch) = decode_step.route(&layout, key).expect("routes") else {
+    let Checked::Step(batch) = decode_step.check(&layout, key).expect("checks") else {
         panic!("the bucket of one serves one decode");
     };
     decode_step.stage(&layout, &batch).expect("stages");

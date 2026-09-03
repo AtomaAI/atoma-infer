@@ -47,7 +47,9 @@ pub enum StepError {
     Launch(#[from] KernelError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
-    #[error("bucket {index} holds rung {held}; the buckets must be resolved in ladder order")]
+    #[error(
+        "bucket {index} holds bucket {held}; the buckets must be resolved in bucket-ladder order"
+    )]
     BucketOrder { index: usize, held: usize },
     #[error("no bucket {index} is resolved; {count} are")]
     NoBucket { index: usize, count: usize },
@@ -67,7 +69,7 @@ pub enum ResolvedOp<'a> {
         gain: &'a Tensor,
         output: &'a Tensor,
     },
-    /// `output = input · weightᵀ`; a segmented projection's output is the column view.
+    /// `output = input · weightᵀ`; a column-writing projection's output is the column view.
     Projection {
         input: &'a Tensor,
         weight: &'a Tensor,
@@ -154,11 +156,11 @@ impl ResolvedOp<'_> {
     }
 }
 
-/// Where a resolved op goes: onto a stream, or into a record.
+/// Where a resolved op goes: onto a stream, or into a recording launcher's list.
 pub trait OpLauncher {
     type Error;
 
-    /// Launches `op`, named `name` for logs and records.
+    /// Launches `op`, named `name` for logs and recording launchers.
     ///
     /// # Errors
     ///
@@ -177,12 +179,12 @@ pub struct LlamaDecode {
 }
 
 impl LlamaDecode {
-    /// The step over `weights` and `cache`, with `buckets` resolved in ladder order.
+    /// The step over `weights` and `cache`, with `buckets` resolved in bucket-ladder order.
     ///
     /// # Errors
     ///
     /// Returns [`StepError`] when the weights are not the model's shape or the buckets are not
-    /// in ladder order.
+    /// in bucket-ladder order.
     pub fn new(
         dims: LlamaDims,
         weights: LlamaWeights,
@@ -214,7 +216,7 @@ impl LlamaDecode {
         &self.dims
     }
 
-    /// The buckets resolved, in ladder order.
+    /// The buckets resolved, in bucket-ladder order.
     #[must_use]
     pub fn buckets(&self) -> &[BucketSlots] {
         &self.buckets
@@ -321,12 +323,12 @@ impl LlamaDecode {
                 input,
                 weight,
                 output,
-                segment,
+                columns,
             } => ResolvedOp::Projection {
                 input: at(input),
                 weight: weights.get(weight),
-                output: match segment {
-                    Some(segment) => activations.frame(layer, output.layer).segment(segment),
+                output: match columns {
+                    Some(columns) => activations.frame(layer, output.layer).columns(columns),
                     None => at(output),
                 },
             },
@@ -493,7 +495,7 @@ mod tests {
 
     use super::*;
     use crate::dims::test_support::llama_8b;
-    use crate::layer::{LayerOffset, QkvSegment, LLAMA_OPS};
+    use crate::layer::{LayerOffset, QkvColumns, LLAMA_OPS};
     use crate::llama::slots::{Bucket, LayerWeights, SlotSources, StepStatics};
 
     const LAYERS: usize = 2;
@@ -715,11 +717,11 @@ mod tests {
                     }
                     let column = match *op {
                         LayerOp::Projection {
-                            segment: Some(QkvSegment::K),
+                            columns: Some(QkvColumns::K),
                             ..
                         } => dims.q_width(),
                         LayerOp::Projection {
-                            segment: Some(QkvSegment::V),
+                            columns: Some(QkvColumns::V),
                             ..
                         } => dims.q_width() + dims.kv_width(),
                         _ => 0,
@@ -810,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn buckets_out_of_ladder_order_are_refused_when_the_step_is_built() {
+    fn buckets_out_of_bucket_ladder_order_are_refused_when_the_step_is_built() {
         let (decode, _) = decode();
         let dims = *decode.dims();
         let mut buckets = decode.buckets().to_vec();

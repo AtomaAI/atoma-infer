@@ -149,7 +149,7 @@ mod tests {
     use atoma_core::step::CommandEntry;
 
     use super::*;
-    use crate::decode::batch::{DecodeBuckets, Route};
+    use crate::decode::batch::{Checked, DecodeBuckets};
     use crate::test_support::{engine_config, entry, keyed_command, BLOCK_SIZE};
 
     const MAX_TOKENS: usize = 4;
@@ -200,7 +200,7 @@ mod tests {
             panic!("keyed: {:?}", layout.dispatch);
         };
         let buckets = DecodeBuckets::usable(&engine_config().dispatch);
-        let Route::Bucket(batch) = DecodeBatch::route(&layout, key, &buckets, WIDTH).unwrap()
+        let Checked::Step(batch) = DecodeBatch::check(&layout, key, &buckets, WIDTH).unwrap()
         else {
             panic!("served by the decode step");
         };

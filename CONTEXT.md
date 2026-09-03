@@ -38,8 +38,9 @@ _Avoid_: launcher, enqueue callback, work item
 
 **Op launcher**:
 Where a step's walk hands each op once its operands are resolved: the CUDA launcher issues the
-op's kernel call on the stream a descriptor was handed, a recording launcher lists the addresses
-the op would touch. Lives inside a descriptor and is never one.
+op's kernel call on the stream the enclosing descriptor was handed, passing the handle through
+to the C-ABI launch and keeping it nowhere; a recording launcher lists the addresses the op
+would touch. Lives inside a descriptor and is never one.
 _Avoid_: descriptor (for this), backend, executor
 
 **Weight reload**:

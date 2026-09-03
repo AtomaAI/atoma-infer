@@ -145,9 +145,9 @@ pub enum LayerWeight {
     Down,
 }
 
-/// The segment of the fused qkv row a projection writes.
+/// The columns of the fused qkv row a projection writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum QkvSegment {
+pub enum QkvColumns {
     Q,
     K,
     V,
@@ -161,12 +161,12 @@ pub enum LayerOp {
         gain: LayerWeight,
         output: RoleRef,
     },
-    /// `output = input · weightᵀ`, into a segment of the fused row when `segment` is set.
+    /// `output = input · weightᵀ`, into columns of the fused row when `columns` is set.
     Projection {
         input: RoleRef,
         weight: LayerWeight,
         output: RoleRef,
-        segment: Option<QkvSegment>,
+        columns: Option<QkvColumns>,
     },
     /// The rotary embedding over the q and k heads of the fused row, in place.
     Rope { qkv: RoleRef },
@@ -222,20 +222,20 @@ impl LayerOp {
         match self {
             LayerOp::RmsNorm { .. } => "rmsnorm",
             LayerOp::Projection {
-                segment: Some(QkvSegment::Q),
+                columns: Some(QkvColumns::Q),
                 ..
             } => "q_proj",
             LayerOp::Projection {
-                segment: Some(QkvSegment::K),
+                columns: Some(QkvColumns::K),
                 ..
             } => "k_proj",
             LayerOp::Projection {
-                segment: Some(QkvSegment::V),
+                columns: Some(QkvColumns::V),
                 ..
             } => "v_proj",
             LayerOp::Projection {
                 weight,
-                segment: None,
+                columns: None,
                 ..
             } => match weight {
                 LayerWeight::O => "o_proj",
@@ -352,19 +352,19 @@ pub const LLAMA_OPS: [LayerOp; 15] = [
         input: RoleRef::same(Role::Normed),
         weight: LayerWeight::Q,
         output: RoleRef::same(Role::Qkv),
-        segment: Some(QkvSegment::Q),
+        columns: Some(QkvColumns::Q),
     },
     LayerOp::Projection {
         input: RoleRef::same(Role::Normed),
         weight: LayerWeight::K,
         output: RoleRef::same(Role::Qkv),
-        segment: Some(QkvSegment::K),
+        columns: Some(QkvColumns::K),
     },
     LayerOp::Projection {
         input: RoleRef::same(Role::Normed),
         weight: LayerWeight::V,
         output: RoleRef::same(Role::Qkv),
-        segment: Some(QkvSegment::V),
+        columns: Some(QkvColumns::V),
     },
     LayerOp::Rope {
         qkv: RoleRef::same(Role::Qkv),
@@ -380,7 +380,7 @@ pub const LLAMA_OPS: [LayerOp; 15] = [
         input: RoleRef::same(Role::AttnOut),
         weight: LayerWeight::O,
         output: RoleRef::same(Role::OProj),
-        segment: None,
+        columns: None,
     },
     LayerOp::ResidualAdd {
         residual: RoleRef::same(Role::Hidden),
@@ -396,13 +396,13 @@ pub const LLAMA_OPS: [LayerOp; 15] = [
         input: RoleRef::same(Role::Normed),
         weight: LayerWeight::Gate,
         output: RoleRef::same(Role::Gate),
-        segment: None,
+        columns: None,
     },
     LayerOp::Projection {
         input: RoleRef::same(Role::Normed),
         weight: LayerWeight::Up,
         output: RoleRef::same(Role::Up),
-        segment: None,
+        columns: None,
     },
     LayerOp::SiluMul {
         gate: RoleRef::same(Role::Gate),
@@ -413,7 +413,7 @@ pub const LLAMA_OPS: [LayerOp; 15] = [
         input: RoleRef::same(Role::FfnAct),
         weight: LayerWeight::Down,
         output: RoleRef::same(Role::FfnDown),
-        segment: None,
+        columns: None,
     },
     LayerOp::ResidualAdd {
         residual: RoleRef::same(Role::Mid),

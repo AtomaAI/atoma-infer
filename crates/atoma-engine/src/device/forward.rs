@@ -22,7 +22,7 @@ use atoma_core::dispatch::DispatchDecision;
 use tracing::debug;
 
 #[cfg(not(feature = "nccl"))]
-use crate::decode::batch::{DecodeBatch, Route};
+use crate::decode::batch::{Checked, DecodeBatch};
 #[cfg(not(feature = "nccl"))]
 use crate::device::decode::{DecodeStep, DecodeStepError};
 
@@ -87,9 +87,9 @@ impl CudaForward {
             DispatchDecision::FullReplay(key) | DispatchDecision::SegmentedReplay(key) => key,
             DispatchDecision::Eager(_) => return Ok(None),
         };
-        match self.decode_step.route(layout, key)? {
-            Route::Bucket(batch) => Ok(Some(batch)),
-            Route::Eager(reason) => {
+        match self.decode_step.check(layout, key)? {
+            Checked::Step(batch) => Ok(Some(batch)),
+            Checked::Eager(reason) => {
                 debug!(%reason, "keyed batch served on candle");
                 Ok(None)
             }

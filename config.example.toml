@@ -49,7 +49,7 @@ hash_algorithm = "sha256_v1"
 
 [engine.dispatch]
 # The token buckets the engine captures graphs for: decode-sized, since a uniform-decode batch
-# has as many tokens as entries and no larger rung can fill. Written order carries no meaning.
+# has as many tokens as entries and no larger bucket can fill. Written order carries no meaning.
 bucket_ladder = [ 1, 16, 2, 24, 32, 4, 8 ]
 # The largest request count any captured graph serves.
 captured_max_requests = 32

@@ -308,16 +308,20 @@ mod tests {
         let x = rows(&[8, 4096], Dtype::Bf16);
         let w = rows(&[1024, 4096], Dtype::Bf16);
         let qkv = rows(&[8, 6144], Dtype::Bf16);
-        let (k_segment, offset) = qkv.narrow(1, 4096, 1024).unwrap();
+        let (k_columns, offset) = qkv.narrow(1, 4096, 1024).unwrap();
 
-        let shape = GemmShape::x_wt(&x, &w, &k_segment).unwrap();
+        let shape = GemmShape::x_wt(&x, &w, &k_columns).unwrap();
 
         assert_eq!(shape.out_features, 1024);
         assert_eq!(
             shape.output_stride, 6144,
-            "the segment's rows are still a fused row apart"
+            "the column view's rows are still a fused row apart"
         );
-        assert_eq!(offset, 4096 * 2, "the segment starts at its first column");
+        assert_eq!(
+            offset,
+            4096 * 2,
+            "the column view starts at its first column"
+        );
     }
 
     #[test]

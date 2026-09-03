@@ -37,7 +37,7 @@ use tracing::info;
 
 use crate::batch::BatchLayout;
 use crate::config::Dtype as ConfiguredDtype;
-use crate::decode::batch::{DecodeBatch, DecodeBatchError, DecodeBuckets, Route};
+use crate::decode::batch::{Checked, DecodeBatch, DecodeBatchError, DecodeBuckets};
 use crate::decode::inputs::{DecodeInputs, Fence, InputTensors, InputsError, Upload};
 use crate::decode::staging::StagingShape;
 use crate::device::{KvCache, RankDevice, Weights};
@@ -65,7 +65,7 @@ pub enum DecodeStepError {
         expected: usize,
     },
     #[error(
-        "no rung of engine.dispatch.bucket_ladder is at or below captured_max_requests of \
+        "no entry of engine.dispatch.bucket_ladder is at or below captured_max_requests of \
          {captured_max}; the decode step needs one bucket to serve"
     )]
     NoUsableBucket { captured_max: usize },
@@ -128,7 +128,7 @@ pub struct DecodeStep {
 }
 
 impl DecodeStep {
-    /// Builds the path over `weights` and `kv_cache` as candle loaded them, for the buckets
+    /// Builds the step over `weights` and `kv_cache` as candle loaded them, for the buckets
     /// `plan` makes usable, during the Allocation phase.
     ///
     /// # Errors
@@ -244,13 +244,13 @@ impl DecodeStep {
         })
     }
 
-    /// Where a batch keyed by `key` runs.
+    /// Checks a batch keyed by `key` against the shape the step bakes.
     ///
     /// # Errors
     ///
     /// Returns [`DecodeStepError::Batch`] when the layout contradicts its key.
-    pub fn route(&self, layout: &BatchLayout, key: GraphKey) -> Result<Route, DecodeStepError> {
-        Ok(DecodeBatch::route(
+    pub fn check(&self, layout: &BatchLayout, key: GraphKey) -> Result<Checked, DecodeStepError> {
+        Ok(DecodeBatch::check(
             layout,
             key,
             &self.buckets,
