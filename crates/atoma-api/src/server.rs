@@ -26,7 +26,7 @@ use axum::Router;
 use metrics::gauge;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::json;
-use tokenizers::Tokenizer;
+use tokenizers::{Error as TokenizerError, Tokenizer};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::{signal, task, time};
@@ -423,19 +423,15 @@ async fn submit(
         stream: _,
     } = request;
     let tokenizer = Arc::clone(&state.tokenizer);
-    let prompt_ids = task::spawn_blocking(move || {
-        tokenizer
-            .encode(prompt, true)
-            .map(|encoding| encoding.get_ids().to_vec())
-    })
-    .await
-    .map_err(|join| ApiError::internal(format!("tokenization panicked: {join}"), request_id))?
-    .map_err(|error| {
-        ApiError::internal(
-            format!("the prompt cannot be tokenized: {error}"),
-            request_id,
-        )
-    })?;
+    let prompt_ids = task::spawn_blocking(move || prompt_ids(&tokenizer, prompt))
+        .await
+        .map_err(|join| ApiError::internal(format!("tokenization panicked: {join}"), request_id))?
+        .map_err(|error| {
+            ApiError::internal(
+                format!("the prompt cannot be tokenized: {error}"),
+                request_id,
+            )
+        })?;
     let prompt_tokens = prompt_ids.len();
     let max_new_tokens = match max_new_tokens {
         Some(budget) => budget,
@@ -490,6 +486,13 @@ async fn submit(
         receiver,
         Completion::new(identity, detokenizer, prompt_tokens),
     ))
+}
+
+/// The token ids of a templated prompt.
+fn prompt_ids(tokenizer: &Tokenizer, prompt: String) -> Result<Vec<u32>, TokenizerError> {
+    tokenizer
+        .encode(prompt, true)
+        .map(|encoding| encoding.get_ids().to_vec())
 }
 
 /// Reads a request's events until it finishes and answers with the whole completion. Dropping
