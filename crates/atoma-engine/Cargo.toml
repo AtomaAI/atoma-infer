@@ -9,13 +9,19 @@ version     = { workspace = true }
 atoma-core          = { workspace = true }
 candle-core         = { workspace = true }
 candle-transformers = { workspace = true }
+core_affinity       = { workspace = true }
+crossbeam-utils     = { workspace = true }
+flume               = { workspace = true }
+rtrb                = { workspace = true }
 serde               = { workspace = true, features = [ "derive" ] }
 serde_json          = { workspace = true }
 thiserror           = { workspace = true }
+tracing             = { workspace = true }
 validator           = { workspace = true, features = [ "derive" ] }
 
 [dev-dependencies]
-figment = { workspace = true, features = [ "toml" ] }
+figment     = { workspace = true, features = [ "toml" ] }
+parking_lot = { workspace = true }
 
 [lints.clippy]
 await_holding_lock      = "deny"
