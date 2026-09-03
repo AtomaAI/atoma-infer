@@ -271,7 +271,7 @@ impl Message {
 }
 
 pub(crate) mod messages {
-    use super::{Message, MessageContent, Model};
+    use super::{Message, MessageContent, Model, ToolCall};
     use tracing::warn;
 
     /// Function to convert a list of messages to a prompt string in Llama2 format.
@@ -433,6 +433,28 @@ pub(crate) mod messages {
         push_hermes3_end_of_turn(prompt);
     }
 
+    /// Writes one Hermes 3 tool call as its own block: the newline the template opens a block
+    /// with, the call, and the newline before the closing tag.
+    fn push_hermes3_tool_call(prompt: &mut String, tool_call: &ToolCall) {
+        prompt.push_str("\n<tool_call>\n");
+        // Every Hermes 3 model renders a tool call the same way, so one variant stands for the
+        // family.
+        prompt.push_str(&tool_call.function_call_string(Model::HermesLlama318b));
+        prompt.push_str("\n</tool_call>");
+    }
+
+    /// Writes one Hermes 3 assistant turn made of tool calls, one block each.
+    ///
+    /// The role line carries no newline of its own here: the template opens the turn with the
+    /// role alone, and the first block opens with the newline that would have followed it.
+    fn push_hermes3_tool_call_turn(prompt: &mut String, tool_calls: &[ToolCall]) {
+        prompt.push_str("<|im_start|>assistant");
+        for tool_call in tool_calls {
+            push_hermes3_tool_call(prompt, tool_call);
+        }
+        push_hermes3_end_of_turn(prompt);
+    }
+
     /// The system turn the Hermes 3 template writes ahead of a conversation that does not open
     /// with one of its own.
     const HERMES3_DEFAULT_SYSTEM_TURN: &str =
@@ -466,22 +488,11 @@ pub(crate) mod messages {
                     tool_calls,
                     ..
                 } => {
-                    push_hermes3_header(&mut prompt, "assistant");
-                    if !tool_calls.is_empty() {
-                        // Every Hermes 3 model renders a tool call the same way, so one variant
-                        // stands for the family.
-                        let tool_calls_str = tool_calls
-                            .iter()
-                            .map(|tc| tc.function_call_string(Model::HermesLlama318b))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        prompt.push_str("<tool_call>");
-                        prompt.push_str(&tool_calls_str);
-                        prompt.push_str("</tool_call>");
-                    } else if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
+                    if tool_calls.is_empty() {
+                        push_hermes3_turn(&mut prompt, "assistant", content.as_ref());
+                    } else {
+                        push_hermes3_tool_call_turn(&mut prompt, tool_calls);
                     }
-                    push_hermes3_end_of_turn(&mut prompt);
                 }
                 Message::Tool { content, .. } => {
                     push_hermes3_turn(&mut prompt, "tool", content.as_ref());
@@ -631,9 +642,10 @@ impl ToolCall {
                     .unwrap()
                     .replace("\":\"", "\": \""); // Add a space after the colon
 
+                // The template writes the name before the arguments.
                 format!(
-                    "{{\"arguments\": {}, \"name\": \"{}\"}}",
-                    formatted_arguments, self.function.name
+                    "{{\"name\": \"{}\", \"arguments\": {}}}",
+                    self.function.name, formatted_arguments
                 )
             }
             Model::Llama38b
@@ -1948,9 +1960,10 @@ pub mod tests {
         let expected = concat!(
             "<|begin_of_text|>",
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
-            "<|im_start|>assistant\n",
-            "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
-            "\"name\": \"get_stock_fundamentals\"}</tool_call>",
+            "<|im_start|>assistant",
+            "\n<tool_call>\n",
+            "{\"name\": \"get_stock_fundamentals\", \"arguments\": {\"symbol\": \"TSLA\"}}",
+            "\n</tool_call>",
             "<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
@@ -2016,6 +2029,9 @@ pub mod tests {
         assert_eq!(prompt, expected);
     }
 
+    /// The template writes one `<tool_call>` block per call rather than one block holding every
+    /// call, and opens the turn with the role alone: the newline a text turn carries after the
+    /// role is the one each block opens with.
     #[test]
     fn test_hermes3_multiple_tool_calls() {
         let tool_call1 = ToolCall {
@@ -2047,10 +2063,13 @@ pub mod tests {
         let expected = concat!(
             "<|begin_of_text|>",
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
-            "<|im_start|>assistant\n",
-            "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
-            "\"name\": \"get_stock_fundamentals\"}, ",
-            "{\"arguments\": {\"symbol\": \"BTC\"}, \"name\": \"get_crypto_data\"}</tool_call>",
+            "<|im_start|>assistant",
+            "\n<tool_call>\n",
+            "{\"name\": \"get_stock_fundamentals\", \"arguments\": {\"symbol\": \"TSLA\"}}",
+            "\n</tool_call>",
+            "\n<tool_call>\n",
+            "{\"name\": \"get_crypto_data\", \"arguments\": {\"symbol\": \"BTC\"}}",
+            "\n</tool_call>",
             "<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
