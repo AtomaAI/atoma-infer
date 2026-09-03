@@ -73,18 +73,6 @@ impl RotaryTables {
     pub fn max_position(&self) -> usize {
         self.max_position
     }
-
-    /// Values in either table.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.cos.len()
-    }
-
-    /// Whether the tables cover no position at all.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.cos.is_empty()
-    }
 }
 
 /// The inverse frequency of each rotary pair: `theta^(-2i / head_dim)` for pair `i`, scaled when
@@ -152,9 +140,8 @@ mod tests {
         let tables = RotaryTables::new(&dims);
         assert_eq!(tables.pairs(), 64);
         assert_eq!(tables.max_position(), 16);
-        assert_eq!(tables.len(), 16 * 64);
+        assert_eq!(tables.cos().len(), 16 * 64);
         assert_eq!(tables.cos().len(), tables.sin().len());
-        assert!(!tables.is_empty());
     }
 
     #[test]

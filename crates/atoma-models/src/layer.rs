@@ -221,38 +221,29 @@ impl LayerOp {
     pub fn name(&self) -> &'static str {
         match self {
             LayerOp::RmsNorm { .. } => "rmsnorm",
-            LayerOp::Projection {
-                columns: Some(QkvColumns::Q),
-                ..
-            } => "q_proj",
-            LayerOp::Projection {
-                columns: Some(QkvColumns::K),
-                ..
-            } => "k_proj",
-            LayerOp::Projection {
-                columns: Some(QkvColumns::V),
-                ..
-            } => "v_proj",
-            LayerOp::Projection {
-                weight,
-                columns: None,
-                ..
-            } => match weight {
-                LayerWeight::O => "o_proj",
-                LayerWeight::Gate => "gate_proj",
-                LayerWeight::Up => "up_proj",
-                LayerWeight::Down => "down_proj",
-                LayerWeight::InputNorm
-                | LayerWeight::Q
-                | LayerWeight::K
-                | LayerWeight::V
-                | LayerWeight::PostAttentionNorm => "projection",
-            },
+            LayerOp::Projection { weight, .. } => weight.projection_name(),
             LayerOp::Rope { .. } => "rope",
             LayerOp::KvWrite { .. } => "kv_write",
             LayerOp::Attention { .. } => "attention",
             LayerOp::SiluMul { .. } => "silu_mul",
             LayerOp::ResidualAdd { .. } => "residual_add",
+        }
+    }
+}
+
+impl LayerWeight {
+    /// The projection this weight is, as logs name it; a norm gain is no projection.
+    #[must_use]
+    pub fn projection_name(self) -> &'static str {
+        match self {
+            LayerWeight::Q => "q_proj",
+            LayerWeight::K => "k_proj",
+            LayerWeight::V => "v_proj",
+            LayerWeight::O => "o_proj",
+            LayerWeight::Gate => "gate_proj",
+            LayerWeight::Up => "up_proj",
+            LayerWeight::Down => "down_proj",
+            LayerWeight::InputNorm | LayerWeight::PostAttentionNorm => "projection",
         }
     }
 }

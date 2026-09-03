@@ -92,6 +92,13 @@ mod compiled {
     use crate::error::{arg_i64, KernelError};
     use crate::ffi;
 
+    /// Enqueues the embedding gather on `call.stream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError`] when a count does not fit the kernel's argument or the launch
+    /// fails.
+    ///
     /// # Safety
     /// Every address in `call` must be live on the stream's device and match its documented
     /// shape; every token id must index the table.
@@ -110,6 +117,13 @@ mod compiled {
         ffi::check_launch("decode_embedding_gather_bf16", status)
     }
 
+    /// Enqueues the RMSNorm on `call.stream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError`] when a count does not fit the kernel's argument or the launch
+    /// fails.
+    ///
     /// # Safety
     /// Every address in `call` must be live on the stream's device and match its documented
     /// shape.
@@ -129,6 +143,13 @@ mod compiled {
         ffi::check_launch("decode_rmsnorm_bf16", status)
     }
 
+    /// Enqueues the rotary embedding on `call.stream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError`] when a count does not fit the kernel's argument or the launch
+    /// fails.
+    ///
     /// # Safety
     /// Every address in `call` must be live on the stream's device and match its documented
     /// shape; every position must index the tables.
@@ -150,6 +171,13 @@ mod compiled {
         ffi::check_launch("decode_rope_bf16", status)
     }
 
+    /// Enqueues the SiLU-gated multiply on `call.stream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError`] when a count does not fit the kernel's argument or the launch
+    /// fails.
+    ///
     /// # Safety
     /// Every address in `call` must be live on the stream's device and cover `len` elements.
     pub unsafe fn silu_mul(call: &SiluMulCall) -> Result<(), KernelError> {
@@ -166,6 +194,13 @@ mod compiled {
         ffi::check_launch("decode_silu_mul_bf16", status)
     }
 
+    /// Enqueues the residual add on `call.stream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError`] when a count does not fit the kernel's argument or the launch
+    /// fails.
+    ///
     /// # Safety
     /// Every address in `call` must be live on the stream's device and cover `len` elements.
     pub unsafe fn add(call: &AddCall) -> Result<(), KernelError> {
@@ -188,6 +223,10 @@ pub use compiled::{add, embedding_gather, rmsnorm, rope, silu_mul};
 
 /// Named refusal: this build carries no kernels.
 ///
+/// # Errors
+///
+/// Always returns [`KernelError::NotCompiled`].
+///
 /// # Safety
 /// Dereferences nothing; the signature matches the real launch.
 #[cfg(not(feature = "cuda"))]
@@ -198,6 +237,10 @@ pub unsafe fn embedding_gather(_call: &EmbeddingGatherCall) -> Result<(), Kernel
 }
 
 /// Named refusal: this build carries no kernels.
+///
+/// # Errors
+///
+/// Always returns [`KernelError::NotCompiled`].
 ///
 /// # Safety
 /// Dereferences nothing; the signature matches the real launch.
@@ -210,6 +253,10 @@ pub unsafe fn rmsnorm(_call: &RmsNormCall) -> Result<(), KernelError> {
 
 /// Named refusal: this build carries no kernels.
 ///
+/// # Errors
+///
+/// Always returns [`KernelError::NotCompiled`].
+///
 /// # Safety
 /// Dereferences nothing; the signature matches the real launch.
 #[cfg(not(feature = "cuda"))]
@@ -221,6 +268,10 @@ pub unsafe fn rope(_call: &RopeCall) -> Result<(), KernelError> {
 
 /// Named refusal: this build carries no kernels.
 ///
+/// # Errors
+///
+/// Always returns [`KernelError::NotCompiled`].
+///
 /// # Safety
 /// Dereferences nothing; the signature matches the real launch.
 #[cfg(not(feature = "cuda"))]
@@ -231,6 +282,10 @@ pub unsafe fn silu_mul(_call: &SiluMulCall) -> Result<(), KernelError> {
 }
 
 /// Named refusal: this build carries no kernels.
+///
+/// # Errors
+///
+/// Always returns [`KernelError::NotCompiled`].
 ///
 /// # Safety
 /// Dereferences nothing; the signature matches the real launch.

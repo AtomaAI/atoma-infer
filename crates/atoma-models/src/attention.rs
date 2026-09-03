@@ -44,6 +44,8 @@ pub enum AttentionError {
     Operand(#[from] OperandError),
     #[error("a batch of {batch} sequences does not fill the plan's bucket of {bucket}")]
     BatchNotBucket { batch: usize, bucket: usize },
+    #[error("the split heuristic chose {splits} partitions, more than the kernel's count holds")]
+    SplitCount { splits: usize },
 }
 
 /// What one bucket's attention needs before anything runs.
@@ -66,14 +68,18 @@ pub struct AttentionPlan {
 impl AttentionPlan {
     /// The plan for `bucket` decoding sequences over `max_blocks_per_seq` blocks of `page_block`
     /// slots, on a device of `sm_count` multiprocessors.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttentionError::SplitCount`] when the heuristic's split count does not fit the
+    /// kernel's argument.
     pub fn new(
         dims: &LlamaDims,
         bucket: usize,
         page_block: usize,
         max_blocks_per_seq: usize,
         sm_count: usize,
-    ) -> Self {
+    ) -> Result<Self, AttentionError> {
         let shape = DecodeShape {
             batch_size: bucket,
             num_heads: dims.num_heads,
@@ -92,13 +98,13 @@ impl AttentionPlan {
             },
             sm_count,
         );
-        Self {
+        Ok(Self {
             bucket,
             max_blocks_per_seq,
             page_block,
-            num_splits: u32::try_from(splits).unwrap_or(u32::MAX),
+            num_splits: u32::try_from(splits).map_err(|_| AttentionError::SplitCount { splits })?,
             shape,
-        }
+        })
     }
 
     /// The kernel shape this plan launches.
@@ -123,13 +129,6 @@ impl AttentionPlan {
     #[must_use]
     pub fn o_accum_bytes(&self) -> usize {
         ACCUMULATOR.width_bytes(self.shape.o_accum_len(self.num_splits))
-    }
-
-    /// Bytes of caller-owned workspace one call needs: the two split accumulators. Allocated
-    /// once, at the largest bucket, because a captured graph bakes their addresses.
-    #[must_use]
-    pub fn workspace_bytes(&self) -> usize {
-        self.lse_accum_bytes() + self.o_accum_bytes()
     }
 }
 
@@ -371,7 +370,7 @@ mod tests {
     const BLOCK_COLUMNS: usize = 256;
 
     fn plan(bucket: usize) -> AttentionPlan {
-        AttentionPlan::new(&llama_8b(2), bucket, PAGE_BLOCK, BLOCK_COLUMNS, H100_SMS)
+        AttentionPlan::new(&llama_8b(2), bucket, PAGE_BLOCK, BLOCK_COLUMNS, H100_SMS).unwrap()
     }
 
     /// A view at `address` of a contiguous layout; the arithmetic under test needs no device.
@@ -404,10 +403,6 @@ mod tests {
             4 * shape.lse_accum_len(plan.num_splits)
         );
         assert_eq!(plan.o_accum_bytes(), 4 * shape.o_accum_len(plan.num_splits));
-        assert_eq!(
-            plan.workspace_bytes(),
-            plan.lse_accum_bytes() + plan.o_accum_bytes()
-        );
         assert_eq!(plan.softmax_lse_bytes(), 4 * BUCKET * 32);
     }
 

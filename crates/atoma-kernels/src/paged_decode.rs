@@ -182,6 +182,11 @@ mod compiled {
 
     /// Enqueues the paged decode attention kernel on `call.stream`.
     ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError`] when an argument does not fit the kernel's parameter or the
+    /// launch fails.
+    ///
     /// # Safety
     /// Every address in `call` must be live on the stream's device and match its documented
     /// shape; the accumulators must hold what [`super::DecodeShape`] sizes for `num_splits`.
@@ -260,6 +265,11 @@ mod compiled {
 
     /// Enqueues the paged cache writes, keys then values, on `call.stream`.
     ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError`] when an argument does not fit the kernel's parameter or the
+    /// launch fails.
+    ///
     /// # Safety
     /// Every address in `call` must be live on the stream's device and match its documented
     /// shape; every slot in the mapping must lie inside the caches.
@@ -298,6 +308,10 @@ pub use compiled::{decode_attention, write_kv};
 
 /// Named refusal: this build carries no kernels.
 ///
+/// # Errors
+///
+/// Always returns [`KernelError::NotCompiled`].
+///
 /// # Safety
 /// Dereferences nothing; the signature matches the real launch.
 #[cfg(not(feature = "cuda"))]
@@ -306,6 +320,10 @@ pub unsafe fn decode_attention(_call: &DecodeAttentionCall) -> Result<(), Kernel
 }
 
 /// Named refusal: this build carries no kernels.
+///
+/// # Errors
+///
+/// Always returns [`KernelError::NotCompiled`].
 ///
 /// # Safety
 /// Dereferences nothing; the signature matches the real launch.

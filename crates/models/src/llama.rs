@@ -509,10 +509,10 @@ impl Llama {
     }
 
     /// Every layer's weights, in layer order.
-    pub fn layer_weights(&self) -> Vec<LayerWeights<'_>> {
+    pub fn layer_weights(&self) -> Vec<LayerTensors<'_>> {
         self.blocks
             .iter()
-            .map(|block| LayerWeights {
+            .map(|block| LayerTensors {
                 input_norm: block.rms_1.weight(),
                 q_proj: block.attn.q_proj.weight(),
                 k_proj: block.attn.k_proj.weight(),
@@ -542,7 +542,7 @@ impl Llama {
 /// each norm's gain `[hidden]`. Borrowed views of the loaded tensors, so their device addresses
 /// are the loaded weights' own.
 #[derive(Debug, Clone, Copy)]
-pub struct LayerWeights<'a> {
+pub struct LayerTensors<'a> {
     pub input_norm: &'a Tensor,
     pub q_proj: &'a Tensor,
     pub k_proj: &'a Tensor,

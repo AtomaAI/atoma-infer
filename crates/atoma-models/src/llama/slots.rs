@@ -656,7 +656,7 @@ mod tests {
     }
 
     fn plan(tokens: usize) -> AttentionPlan {
-        AttentionPlan::new(&dims(), tokens, PAGE_BLOCK, BLOCK_COLUMNS, SMS)
+        AttentionPlan::new(&dims(), tokens, PAGE_BLOCK, BLOCK_COLUMNS, SMS).unwrap()
     }
 
     #[test]

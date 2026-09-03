@@ -61,6 +61,9 @@ pub struct CudaForward {
     allocated: Allocated,
     #[cfg(not(feature = "nccl"))]
     decode_step: DecodeStep,
+    /// Held for the process lifetime, which is what keeps the allocation from being reopened;
+    /// under NCCL nothing is enqueued through it.
+    #[cfg_attr(feature = "nccl", allow(dead_code))]
     session: Replay,
 }
 

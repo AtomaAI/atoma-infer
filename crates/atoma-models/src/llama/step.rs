@@ -27,7 +27,7 @@ use crate::attention::{
     decode_call, kv_write_call, AttentionError, AttentionPlan, AttentionTensors, CacheHalves,
 };
 use crate::dims::LlamaDims;
-use crate::gemm::{GemmError, GemmShape, StepBlas};
+use crate::gemm::{GemmError, StepBlas};
 use crate::kernels::{DecodeKernels, RotaryTensors};
 use crate::layer::{LayerOp, Role, RoleRef, LLAMA_LAYER};
 use crate::llama::slots::{BucketSlots, LlamaCache, LlamaWeights, SlotError};
@@ -381,14 +381,6 @@ pub struct LlamaStep<'a> {
     blas: &'a StepBlas,
 }
 
-impl LlamaStep<'_> {
-    /// The bucket this step runs.
-    #[must_use]
-    pub fn bucket(&self) -> BucketIdx {
-        self.slots.bucket.index
-    }
-}
-
 impl Descriptor for LlamaStep<'_> {
     type Error = StepError;
 
@@ -417,9 +409,6 @@ impl OpLauncher for CudaLauncher<'_> {
 
     fn launch(&mut self, _name: &'static str, op: &ResolvedOp<'_>) -> Result<(), StepError> {
         let stream = self.stream;
-        // SAFETY, for every launch below: each tensor is a view the session minted over live
-        // device memory, its shape was held to the kernel's when the call was assembled, and
-        // the stream is the session's own capture stream, handed in by the descriptor seam.
         match *op {
             ResolvedOp::EmbeddingGather {
                 table,
@@ -429,6 +418,8 @@ impl OpLauncher for CudaLauncher<'_> {
                 let call = self
                     .kernels
                     .embedding_gather(table, token_ids, out, stream)?;
+                // SAFETY: the call was assembled from checked views over live device memory,
+                // on the session's own stream.
                 unsafe { decode_ops::embedding_gather(&call) }?;
             }
             ResolvedOp::RmsNorm {
@@ -437,6 +428,7 @@ impl OpLauncher for CudaLauncher<'_> {
                 output,
             } => {
                 let call = self.kernels.rmsnorm(input, gain, output, stream)?;
+                // SAFETY: as for the gather.
                 unsafe { decode_ops::rmsnorm(&call) }?;
             }
             ResolvedOp::Projection {
@@ -444,11 +436,9 @@ impl OpLauncher for CudaLauncher<'_> {
                 weight,
                 output,
             } => {
-                let shape = GemmShape::x_wt(input.layout(), weight.layout(), output.layout())?;
-                unsafe {
-                    self.blas
-                        .enqueue(shape, weight.address(), input.address(), output.address())
-                }?;
+                // SAFETY: three views over live device memory; the handle is bound to the
+                // session's stream.
+                unsafe { self.blas.enqueue(input, weight, output) }?;
             }
             ResolvedOp::Rope {
                 qkv,
@@ -456,6 +446,7 @@ impl OpLauncher for CudaLauncher<'_> {
                 tables,
             } => {
                 let call = self.kernels.rope(qkv, positions, tables, stream)?;
+                // SAFETY: as for the gather.
                 unsafe { decode_ops::rope(&call) }?;
             }
             ResolvedOp::KvWrite {
@@ -464,14 +455,18 @@ impl OpLauncher for CudaLauncher<'_> {
                 slot_mapping,
             } => {
                 let call = kv_write_call(qkv, cache, slot_mapping, self.dims, stream)?;
+                // SAFETY: as for the gather; every slot in the mapping was laid out inside the
+                // cache by the engine.
                 unsafe { paged_decode::write_kv(&call) }?;
             }
             ResolvedOp::Attention { plan, tensors } => {
                 let call = decode_call(plan, &tensors, self.dims, stream)?;
+                // SAFETY: as for the gather; the accumulators were sized from this plan.
                 unsafe { paged_decode::decode_attention(&call) }?;
             }
             ResolvedOp::SiluMul { gate, up, output } => {
                 let call = self.kernels.silu_mul(gate, up, output, stream)?;
+                // SAFETY: as for the gather.
                 unsafe { decode_ops::silu_mul(&call) }?;
             }
             ResolvedOp::ResidualAdd {
@@ -480,6 +475,7 @@ impl OpLauncher for CudaLauncher<'_> {
                 output,
             } => {
                 let call = self.kernels.add(residual, delta, output, stream)?;
+                // SAFETY: as for the gather.
                 unsafe { decode_ops::add(&call) }?;
             }
         }
@@ -552,7 +548,7 @@ mod tests {
     }
 
     fn plan(dims: &LlamaDims, tokens: usize) -> AttentionPlan {
-        AttentionPlan::new(dims, tokens, PAGE_BLOCK, BLOCK_COLUMNS, SMS)
+        AttentionPlan::new(dims, tokens, PAGE_BLOCK, BLOCK_COLUMNS, SMS).unwrap()
     }
 
     fn statics(dims: &LlamaDims) -> StepStatics {

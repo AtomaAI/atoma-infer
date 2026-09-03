@@ -116,7 +116,6 @@ pub struct DecodeBatch {
     pub tokens: usize,
     /// The leading entries that are live; each samples, so these are the logits rows read back.
     pub live: usize,
-    pub key: GraphKey,
 }
 
 impl DecodeBatch {
@@ -176,7 +175,6 @@ impl DecodeBatch {
             bucket: index,
             tokens: bucket,
             live,
-            key,
         }))
     }
 }
@@ -243,7 +241,6 @@ mod tests {
                 bucket: BucketIdx(2),
                 tokens: 4,
                 live: 3,
-                key,
             })
         );
     }

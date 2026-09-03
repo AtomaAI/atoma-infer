@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use atoma_core::dispatch::{DispatchConfig, GraphKey};
 use atoma_core::types::TokenCount;
-use atoma_models::attention::AttentionPlan;
+use atoma_models::attention::{AttentionError, AttentionPlan};
 use atoma_models::dims::{DimsError, Llama3RopeScaling, LlamaDims, RopeParams};
 use atoma_models::gemm::{GemmError, StepBlas, WORKSPACE_BYTES};
 use atoma_models::kernels::RotaryTensors;
@@ -28,10 +28,10 @@ use atoma_runtime::error::RuntimeError;
 use atoma_runtime::session::{Allocation, Replay};
 use atoma_runtime::tensor::{Dtype, Layout, Tensor, TensorError};
 use candle_core::cuda::CudaStorageSlice;
-use candle_core::{DType, Storage};
+use candle_core::{DType, Storage, Tensor as CandleTensor};
 use cudarc::driver::sys::CUdevice_attribute;
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DevicePtr};
-use models::llama::{Config, Llama3RopeType};
+use models::llama::{Config, Llama, Llama3RopeType};
 use thiserror::Error;
 use tracing::info;
 
@@ -71,6 +71,11 @@ pub enum DecodeStepError {
     NoUsableBucket { captured_max: usize },
     #[error("the device reports {count} multiprocessors, which is not a count")]
     MultiprocessorCount { count: i32 },
+    #[error(
+        "a layer's cache is rank {rank}; candle allocates [2, blocks, block_size, kv_heads, \
+         head_dim]"
+    )]
+    CacheRank { rank: usize },
     #[error(transparent)]
     Dims(#[from] DimsError),
     #[error(transparent)]
@@ -92,7 +97,7 @@ pub enum DecodeStepError {
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
-    Candle(#[from] candle_core::Error),
+    Attention(#[from] AttentionError),
 }
 
 /// What the decode step is sized from: the buckets it serves and the sequence it must hold.
@@ -163,7 +168,7 @@ impl DecodeStep {
             max_position: dims.rope.max_position,
         };
         let sm_count = multiprocessors(stream)?;
-        let plans: Vec<AttentionPlan> = buckets
+        let plans = buckets
             .tokens()
             .iter()
             .map(|&tokens| {
@@ -175,45 +180,17 @@ impl DecodeStep {
                     sm_count,
                 )
             })
-            .collect();
-
-        let arena = CaptureArena::new(
-            dims.layers + 1,
-            LLAMA_LAYER.role_table(&dims),
-            buckets.tokens(),
-            ArenaLayout::Greedy,
-        )?;
-        let arena_memory = zeroed(stream, arena.total_size())?;
-        let memory = Tensor::new(
-            allocation,
-            address(&arena_memory, stream),
-            Layout::contiguous(
-                &[arena.total_size() / Dtype::Bf16.size_in_bytes()],
-                Dtype::Bf16,
-            )?,
-        )?;
+            .collect::<Result<Vec<_>, _>>()?;
+        let sizing = Sizing {
+            dims: &dims,
+            plans: &plans,
+            shape,
+        };
         let inputs = DecodeInputs::new(allocation, stream, shape)?;
         let (statics, step_statics) =
-            allocate_statics(allocation, stream, &dims, &plans, shape, inputs.tensors())?;
-        let sources = SlotSources {
-            memory: &memory,
-            arena: &arena,
-            statics: &step_statics,
-            dims: &dims,
-        };
-        let slots = buckets
-            .tokens()
-            .iter()
-            .zip(&plans)
-            .enumerate()
-            .map(|(index, (&tokens, plan))| {
-                let bucket = Bucket {
-                    index: BucketIdx(index),
-                    tokens,
-                };
-                BucketSlots::resolve(&sources, bucket, *plan)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            allocate_statics(allocation, stream, &sizing, inputs.tensors())?;
+        let (arena_memory, arena_bytes, slots) =
+            resolve_slots(allocation, stream, &sizing, &buckets, &step_statics)?;
         let decode = LlamaDecode::new(
             dims,
             snapshot_weights(allocation, llama, stream)?,
@@ -232,7 +209,7 @@ impl DecodeStep {
         stream.synchronize().map_err(RuntimeError::from)?;
         info!(
             buckets = ?buckets.tokens(),
-            arena_bytes = arena.total_size(),
+            arena_bytes,
             block_table_width = shape.block_table_width,
             multiprocessors = sm_count,
             "decode step over runtime tensors built"
@@ -333,6 +310,60 @@ impl DecodeStep {
     }
 }
 
+/// What the arena, the statics and every bucket's tables are sized from.
+struct Sizing<'a> {
+    dims: &'a LlamaDims,
+    plans: &'a [AttentionPlan],
+    shape: StagingShape,
+}
+
+/// Allocates the arena and resolves every bucket's slot tables over it: the arena's memory (owned
+/// for as long as the tables are read), its size, and the tables in bucket order.
+fn resolve_slots(
+    allocation: &Allocation,
+    stream: &Arc<CudaStream>,
+    sizing: &Sizing<'_>,
+    buckets: &DecodeBuckets,
+    statics: &StepStatics,
+) -> Result<(CudaSlice<u8>, usize, Vec<BucketSlots>), DecodeStepError> {
+    let dims = sizing.dims;
+    let arena = CaptureArena::new(
+        dims.layers + 1,
+        LLAMA_LAYER.role_table(dims),
+        buckets.tokens(),
+        ArenaLayout::Greedy,
+    )?;
+    let arena_memory = zeroed(stream, arena.total_size())?;
+    let memory = Tensor::new(
+        allocation,
+        address(&arena_memory, stream),
+        Layout::contiguous(
+            &[arena.total_size() / Dtype::Bf16.size_in_bytes()],
+            Dtype::Bf16,
+        )?,
+    )?;
+    let sources = SlotSources {
+        memory: &memory,
+        arena: &arena,
+        statics,
+        dims,
+    };
+    let slots = buckets
+        .tokens()
+        .iter()
+        .zip(sizing.plans)
+        .enumerate()
+        .map(|(index, (&tokens, attention))| {
+            let bucket = Bucket {
+                index: BucketIdx(index),
+                tokens,
+            };
+            BucketSlots::resolve(&sources, bucket, *attention)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((arena_memory, arena.total_size(), slots))
+}
+
 /// The dimensions the step reads off the checkpoint's configuration.
 fn llama_dims(config: &Config) -> Result<LlamaDims, DecodeStepError> {
     let scaling = config.rope_scaling.as_ref().and_then(|scaling| {
@@ -392,7 +423,7 @@ fn address<T>(slice: &CudaSlice<T>, stream: &Arc<CudaStream>) -> u64 {
 fn snapshot(
     allocation: &Allocation,
     what: &'static str,
-    tensor: &candle_core::Tensor,
+    tensor: &CandleTensor,
     dims: &[usize],
     stream: &Arc<CudaStream>,
 ) -> Result<Tensor, DecodeStepError> {
@@ -430,10 +461,10 @@ fn snapshot(
 /// Every weight of `llama`, viewed at the address candle loaded it to.
 fn snapshot_weights(
     allocation: &Allocation,
-    llama: &models::llama::Llama,
+    llama: &Llama,
     stream: &Arc<CudaStream>,
 ) -> Result<LlamaWeights, DecodeStepError> {
-    let view = |what: &'static str, tensor: &candle_core::Tensor| {
+    let view = |what: &'static str, tensor: &CandleTensor| {
         snapshot(allocation, what, tensor, tensor.dims(), stream)
     };
     let layers = llama
@@ -475,13 +506,10 @@ fn snapshot_cache(
         .iter()
         .map(|cache| {
             let shape = cache.dims();
-            let (blocks, block_size) = (shape.get(1).copied(), shape.get(2).copied());
-            let view = [
-                2,
-                blocks.unwrap_or(0),
-                block_size.unwrap_or(0),
-                dims.kv_width(),
-            ];
+            if shape.len() != 5 {
+                return Err(DecodeStepError::CacheRank { rank: shape.len() });
+            }
+            let view = [2, shape[1], shape[2], dims.kv_width()];
             snapshot(allocation, "a layer's cache", cache, &view, stream)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -493,24 +521,23 @@ fn snapshot_cache(
 fn allocate_statics(
     allocation: &Allocation,
     stream: &Arc<CudaStream>,
-    dims: &LlamaDims,
-    plans: &[AttentionPlan],
-    shape: StagingShape,
+    sizing: &Sizing<'_>,
     inputs: InputTensors,
 ) -> Result<(Statics, StepStatics), DecodeStepError> {
+    let (dims, plans, shape) = (sizing.dims, sizing.plans, sizing.shape);
     let largest = |bytes: fn(&AttentionPlan) -> usize| plans.iter().map(bytes).max().unwrap_or(0);
-    let f32s = |bytes: usize| -> Result<(CudaSlice<u8>, Tensor), DecodeStepError> {
+    let f32_static = |bytes: usize| -> Result<(CudaSlice<u8>, Tensor), DecodeStepError> {
         let buffer = zeroed(stream, bytes)?;
         let layout = Layout::contiguous(&[bytes / Dtype::F32.size_in_bytes()], Dtype::F32)?;
         let tensor = Tensor::new(allocation, address(&buffer, stream), layout)?;
         Ok((buffer, tensor))
     };
     let logits_bytes = Dtype::F32.width_bytes(shape.max_tokens * dims.vocab);
-    let (logits_buffer, logits_flat) = f32s(logits_bytes)?;
+    let (logits_buffer, logits_flat) = f32_static(logits_bytes)?;
     let logits = logits_flat.reshape(&[shape.max_tokens, dims.vocab])?;
-    let (softmax_lse_buffer, softmax_lse) = f32s(largest(AttentionPlan::softmax_lse_bytes))?;
-    let (lse_accum_buffer, lse_accum) = f32s(largest(AttentionPlan::lse_accum_bytes))?;
-    let (o_accum_buffer, o_accum) = f32s(largest(AttentionPlan::o_accum_bytes))?;
+    let (softmax_lse_buffer, softmax_lse) = f32_static(largest(AttentionPlan::softmax_lse_bytes))?;
+    let (lse_accum_buffer, lse_accum) = f32_static(largest(AttentionPlan::lse_accum_bytes))?;
+    let (o_accum_buffer, o_accum) = f32_static(largest(AttentionPlan::o_accum_bytes))?;
 
     let tables = RotaryTables::new(dims);
     let upload = |values: &[f32]| -> Result<(CudaSlice<f32>, Tensor), DecodeStepError> {

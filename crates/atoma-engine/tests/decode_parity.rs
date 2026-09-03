@@ -54,6 +54,9 @@ const MAX_BATCH: usize = 8;
 /// The largest absolute difference on the f32 logits accepted unless `ATOMA_PARITY_MAX_ABS_DIFF`
 /// says otherwise; the measured value is printed either way.
 const DEFAULT_MAX_ABS_DIFF: f32 = 0.25;
+/// Prompt tokens are drawn below this id: Llama 3's special tokens sit at the top of the
+/// vocabulary, and a prompt of those is not a prompt.
+const TOKEN_ID_CEILING: usize = 120_000;
 
 fn tokens(value: usize) -> TokenCount {
     TokenCount::new(value).expect("nonzero")
@@ -303,16 +306,23 @@ struct Parity {
     max_abs_diff: f32,
 }
 
+/// Both forwards over the sequences under test, and what comparing them has found so far.
+struct Harness {
+    forward: CudaForward,
+    sequences: Vec<Sequence>,
+    dispatcher: Dispatcher,
+    parity: Parity,
+}
+
 /// Runs one decode step over `chosen` through both forwards and compares them row by row, then
 /// advances each chosen sequence by the token candle sampled.
-fn compare_step(
-    forward: &mut CudaForward,
-    sequences: &mut [Sequence],
-    chosen: &[usize],
-    dispatcher: &mut Dispatcher,
-    parity: &mut Parity,
-    step: usize,
-) {
+fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
+    let Harness {
+        forward,
+        sequences,
+        dispatcher,
+        parity,
+    } = harness;
     let dummy_block = u32::try_from(BLOCK_COUNT - 1).expect("fits");
     let live: Vec<(usize, &Sequence)> = chosen
         .iter()
@@ -390,14 +400,14 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     let (session, nodes) =
         record_bucket_of_one(allocation, &mut decode_step, &mut dispatcher, dummy_block);
     println!("capture: the bucket-of-one step recorded as a graph of {nodes} nodes");
-    let mut forward = CudaForward::new(allocated, decode_step, session);
+    let forward = CudaForward::new(allocated, decode_step, session);
 
     let mut random = Lcg(0x5EED_2026_0903);
     let blocks_each = MAX_MODEL_LEN.div_ceil(BLOCK_SIZE);
-    let mut sequences: Vec<Sequence> = (0..SEQUENCES)
+    let sequences: Vec<Sequence> = (0..SEQUENCES)
         .map(|index| Sequence {
             tokens: (0..8 + random.below(40))
-                .map(|_| u32::try_from(random.below(vocab.min(120_000))).expect("fits"))
+                .map(|_| u32::try_from(random.below(vocab.min(TOKEN_ID_CEILING))).expect("fits"))
                 .collect(),
             blocks: (0..blocks_each)
                 .map(|block| u32::try_from(index * blocks_each + block).expect("fits"))
@@ -405,9 +415,14 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
             context_len: 0,
         })
         .collect();
-    prefill(&mut forward, &mut sequences);
+    let mut harness = Harness {
+        forward,
+        sequences,
+        dispatcher,
+        parity: Parity::default(),
+    };
+    prefill(&mut harness.forward, &mut harness.sequences);
 
-    let mut parity = Parity::default();
     for step in 0..STEPS {
         let mut chosen: Vec<usize> = (0..SEQUENCES).collect();
         for index in (1..SEQUENCES).rev() {
@@ -415,15 +430,9 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
         }
         chosen.truncate(1 + random.below(SEQUENCES));
         chosen.sort_unstable();
-        compare_step(
-            &mut forward,
-            &mut sequences,
-            &chosen,
-            &mut dispatcher,
-            &mut parity,
-            step,
-        );
+        compare_step(&mut harness, &chosen, step);
     }
+    let parity = harness.parity;
 
     println!("=============== decode parity evidence ===============");
     println!("model:                {}", model.id);

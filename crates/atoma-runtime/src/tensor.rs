@@ -103,6 +103,10 @@ pub struct Layout {
 
 impl Layout {
     /// A row-major layout of `dims` with no gaps between elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::RankTooHigh`] when `dims` has more than [`MAX_RANK`] dimensions.
     pub fn contiguous(dims: &[usize], dtype: Dtype) -> Result<Self, TensorError> {
         let rank = check_rank(dims.len())?;
         let mut layout = Self {
@@ -121,6 +125,11 @@ impl Layout {
     }
 
     /// A layout of `dims` whose elements sit `strides` elements apart along each dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::RankTooHigh`] when `dims` has more than [`MAX_RANK`] dimensions, or
+    /// [`TensorError::StrideCountMismatch`] when `strides` does not have one per dimension.
     pub fn strided(dims: &[usize], strides: &[usize], dtype: Dtype) -> Result<Self, TensorError> {
         let rank = check_rank(dims.len())?;
         if strides.len() != rank {
@@ -217,6 +226,11 @@ impl Layout {
     }
 
     /// The byte offset of the element at `index` from the first element.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::DimOutOfRange`] when `index` does not have one entry per dimension,
+    /// or [`TensorError::IndexOutOfBounds`] when an entry is past its dimension.
     pub fn byte_offset(&self, index: &[usize]) -> Result<usize, TensorError> {
         if index.len() != self.rank {
             return Err(TensorError::DimOutOfRange {
@@ -241,6 +255,11 @@ impl Layout {
     /// The layout of `len` consecutive positions from `start` along `dim`, and the byte offset
     /// of its first element. Strides are unchanged, so narrowing an inner dimension yields a
     /// gapped view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::DimOutOfRange`] when `dim` is not a dimension, or
+    /// [`TensorError::NarrowOutOfBounds`] when the range leaves it.
     pub fn narrow(
         &self,
         dim: usize,
@@ -267,6 +286,11 @@ impl Layout {
 
     /// The layout with dimension `dim` fixed at `index` and dropped, and the byte offset of its
     /// first element.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::DimOutOfRange`] when `dim` is not a dimension, or
+    /// [`TensorError::IndexOutOfBounds`] when `index` is past it.
     pub fn select(&self, dim: usize, index: usize) -> Result<(Self, usize), TensorError> {
         self.check_dim(dim)?;
         let size = self.dims[dim];
@@ -292,6 +316,11 @@ impl Layout {
 
     /// The same elements viewed as `dims`, row-major. Only a contiguous layout has one order of
     /// elements to reinterpret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::NotContiguous`] for a gapped layout, or
+    /// [`TensorError::ElementCountMismatch`] when `dims` holds another number of elements.
     pub fn reshape(&self, dims: &[usize]) -> Result<Self, TensorError> {
         if !self.is_contiguous() {
             return Err(TensorError::NotContiguous {
@@ -343,6 +372,11 @@ impl Tensor {
     ///
     /// Rejects an address that is not aligned to the dtype's element size: a kernel reading
     /// such a view faults.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::Misaligned`] when `address` is not aligned to the layout's element
+    /// size.
     pub fn new(
         _allocation: &Allocation,
         address: sys::CUdeviceptr,
@@ -412,18 +446,30 @@ impl Tensor {
     }
 
     /// The view of `len` consecutive positions from `start` along `dim`.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Layout::narrow`] returns.
     pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Self, TensorError> {
         let (layout, offset) = self.layout.narrow(dim, start, len)?;
         Ok(self.shifted(layout, offset))
     }
 
     /// The view with dimension `dim` fixed at `index` and dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Layout::select`] returns.
     pub fn select(&self, dim: usize, index: usize) -> Result<Self, TensorError> {
         let (layout, offset) = self.layout.select(dim, index)?;
         Ok(self.shifted(layout, offset))
     }
 
     /// The same elements viewed as `dims`, row-major; see [`Layout::reshape`].
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Layout::reshape`] returns.
     pub fn reshape(&self, dims: &[usize]) -> Result<Self, TensorError> {
         Ok(Self {
             address: self.address,

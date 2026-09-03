@@ -12,8 +12,10 @@
 //! explicit workspace at the same time. cuBLAS allocates a workspace on first use otherwise, and
 //! an allocation inside a captured region invalidates the capture.
 
+use core::ffi::c_void;
+
 use atoma_runtime::session::Allocation;
-use atoma_runtime::tensor::{Dtype, Layout};
+use atoma_runtime::tensor::{Dtype, Layout, Tensor};
 use cudarc::cublas::{result as cublas, sys};
 use cudarc::driver::{CudaSlice, DevicePtr};
 use thiserror::Error;
@@ -52,6 +54,23 @@ impl From<cublas::CublasError> for GemmError {
     }
 }
 
+/// The element type a multiplication writes: bf16 for an activation, f32 for logits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemmOutput {
+    Bf16,
+    F32,
+}
+
+impl GemmOutput {
+    /// The cuBLAS data type of the output.
+    fn data_type(self) -> sys::cudaDataType {
+        match self {
+            GemmOutput::Bf16 => sys::cudaDataType::CUDA_R_16BF,
+            GemmOutput::F32 => sys::cudaDataType::CUDA_R_32F,
+        }
+    }
+}
+
 /// One `y = x · wᵀ` multiplication, as cuBLAS takes it.
 ///
 /// In column-major terms the same call reads `Y(out × tokens) = W(in × out)ᵀ · X(in × tokens)`:
@@ -72,8 +91,7 @@ pub struct GemmShape {
     /// Leading dimension of the output, its row stride in elements. A projection writing into a
     /// column range of a fused row leaves this at the fused row's width.
     pub output_stride: usize,
-    /// The output's element type: bf16 for an activation, f32 for logits.
-    pub output_dtype: Dtype,
+    pub output: GemmOutput,
 }
 
 impl GemmShape {
@@ -96,12 +114,11 @@ impl GemmShape {
         for (operand, layout) in [("the activations", x), ("the weight", w)] {
             operand::dtype(Operand::model(operand), layout, Dtype::Bf16)?;
         }
-        let output_dtype = y.dtype();
-        if !matches!(output_dtype, Dtype::Bf16 | Dtype::F32) {
-            return Err(GemmError::OutputDtype {
-                dtype: output_dtype,
-            });
-        }
+        let output = match y.dtype() {
+            Dtype::Bf16 => GemmOutput::Bf16,
+            Dtype::F32 => GemmOutput::F32,
+            dtype => return Err(GemmError::OutputDtype { dtype }),
+        };
         let (tokens, input_in) = (x.dim(0), x.dim(1));
         let (out_features, weight_in) = (w.dim(0), w.dim(1));
         if weight_in != input_in {
@@ -125,17 +142,8 @@ impl GemmShape {
             weight_stride: w.stride(0),
             input_stride: x.stride(0),
             output_stride: y.stride(0),
-            output_dtype,
+            output,
         })
-    }
-
-    /// The cuBLAS data type of the output.
-    fn output_data_type(self) -> sys::cudaDataType {
-        match self.output_dtype {
-            Dtype::F32 => sys::cudaDataType::CUDA_R_32F,
-            // Every other output dtype was refused when the shape was derived.
-            _ => sys::cudaDataType::CUDA_R_16BF,
-        }
     }
 }
 
@@ -187,27 +195,29 @@ impl StepBlas {
         // SAFETY: `address` is the buffer this value owns and it holds `bytes` bytes; cuBLAS
         // keeps the pointer for the handle's lifetime, which ends first because the destructor
         // destroys the handle before the field is dropped.
-        unsafe { sys::cublasSetWorkspace_v2(handle, address as *mut std::ffi::c_void, bytes) }
-            .result()?;
+        unsafe { sys::cublasSetWorkspace_v2(handle, address as *mut c_void, bytes) }.result()?;
         Ok(blas)
     }
 
-    /// Enqueues `y = x · wᵀ` on the bound capture stream.
+    /// Enqueues `output = input · weightᵀ` on the bound capture stream, the shape read off the
+    /// three views.
     ///
     /// # Errors
     ///
-    /// Returns [`GemmError`] when a dimension does not fit cuBLAS or the call is refused.
+    /// Returns [`GemmError`] when the views do not describe one multiplication, a dimension does
+    /// not fit cuBLAS, or the call is refused.
     ///
     /// # Safety
     ///
-    /// Every address must be live on the stream's device and hold what `shape` describes.
+    /// Every view must be over live device memory.
     pub unsafe fn enqueue(
         &self,
-        shape: GemmShape,
-        weight: u64,
-        input: u64,
-        output: u64,
+        input: &Tensor,
+        weight: &Tensor,
+        output: &Tensor,
     ) -> Result<(), GemmError> {
+        let shape = GemmShape::x_wt(input.layout(), weight.layout(), output.layout())?;
+        let (weight, input, output) = (weight.address(), input.address(), output.address());
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
         let m = dimension("the output feature count", shape.out_features)?;
@@ -227,15 +237,15 @@ impl StepBlas {
                 n,
                 k,
                 (&raw const alpha).cast(),
-                weight as *const std::ffi::c_void,
+                weight as *const c_void,
                 sys::cudaDataType::CUDA_R_16BF,
                 lda,
-                input as *const std::ffi::c_void,
+                input as *const c_void,
                 sys::cudaDataType::CUDA_R_16BF,
                 ldb,
                 (&raw const beta).cast(),
-                output as *mut std::ffi::c_void,
-                shape.output_data_type(),
+                output as *mut c_void,
+                shape.output.data_type(),
                 ldc,
                 sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
@@ -280,7 +290,7 @@ mod tests {
                 weight_stride: 4096,
                 input_stride: 4096,
                 output_stride: 14336,
-                output_dtype: Dtype::Bf16,
+                output: GemmOutput::Bf16,
             }
         );
     }
@@ -315,8 +325,8 @@ mod tests {
 
         let shape = GemmShape::x_wt(&x, &w, &logits).unwrap();
 
-        assert_eq!(shape.output_dtype, Dtype::F32);
-        assert_eq!(shape.output_data_type(), sys::cudaDataType::CUDA_R_32F);
+        assert_eq!(shape.output, GemmOutput::F32);
+        assert_eq!(shape.output.data_type(), sys::cudaDataType::CUDA_R_32F);
     }
 
     #[test]
