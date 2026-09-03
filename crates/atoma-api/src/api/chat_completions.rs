@@ -639,18 +639,68 @@ pub struct ToolCall {
     function: ToolCallFunction,
 }
 
+/// Writes JSON as Python's `json.dumps` writes it: a space after every colon and after every
+/// comma, where `serde_json` writes neither.
+///
+/// A chat template renders a tool call's arguments through Jinja's `tojson`, which is
+/// `json.dumps` with `ensure_ascii=False`. Its spacing is part of the prompt, so a server that
+/// writes the compact form sends the model a different token sequence for the same tool call.
+struct JsonDumpsFormatter;
+
+impl serde_json::ser::Formatter for JsonDumpsFormatter {
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        writer.write_all(b": ")
+    }
+
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+}
+
+/// Renders `value` the way a chat template's `tojson` renders it.
+///
+/// The keys come out in the order the caller sent them, which is `preserve_order` on this
+/// crate's `serde_json`: `json.dumps` writes a dict in its own order, and without the feature a
+/// [`Value`] would sort them.
+fn json_dumps(value: &Value) -> String {
+    let mut written = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut written, JsonDumpsFormatter);
+    value
+        .serialize(&mut serializer)
+        .expect("a Value serializes into a Vec without failing");
+    String::from_utf8(written).expect("serde_json writes UTF-8")
+}
+
 impl ToolCall {
     pub fn function_call_string(&self, model: Model) -> String {
         match model {
             Model::HermesLlama318b | Model::HermesLlama3170b | Model::HermesLlama31405b => {
-                let formatted_arguments = serde_json::to_string(&self.function.arguments)
-                    .unwrap()
-                    .replace("\":\"", "\": \""); // Add a space after the colon
-
                 // The template writes the name before the arguments.
                 format!(
                     "{{\"name\": \"{}\", \"arguments\": {}}}",
-                    self.function.name, formatted_arguments
+                    self.function.name,
+                    json_dumps(&self.function.arguments)
                 )
             }
             Model::Llama38b
@@ -2046,6 +2096,42 @@ pub mod tests {
             "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
+    }
+
+    /// The template's `tojson` is `json.dumps`, which spaces every colon and every comma and
+    /// writes a dict in its own order. A single string-valued argument is the one shape a colon
+    /// substitution also gets right, so the arguments here are the ones that told the two apart.
+    /// Every object below is written out of alphabetical order, which a sorted map would not
+    /// preserve.
+    #[test]
+    fn hermes3_tool_call_arguments_are_spaced_the_way_the_template_writes_them() {
+        let call = |arguments: serde_json::Value| {
+            ToolCall {
+                id: "1".to_string(),
+                r#type: "function".to_string(),
+                function: ToolCallFunction {
+                    name: "f".to_string(),
+                    arguments,
+                },
+            }
+            .function_call_string(Model::HermesLlama318b)
+        };
+
+        assert_eq!(
+            call(json!({ "symbol": "TSLA", "shares": 5 })),
+            "{\"name\": \"f\", \"arguments\": {\"symbol\": \"TSLA\", \"shares\": 5}}",
+            "the caller's order, spaced after the colon whatever the value's type"
+        );
+        assert_eq!(
+            call(json!({ "nested": { "a": 1 }, "list": [1, 2], "ok": true })),
+            "{\"name\": \"f\", \"arguments\": \
+             {\"nested\": {\"a\": 1}, \"list\": [1, 2], \"ok\": true}}"
+        );
+        assert_eq!(
+            call(json!({})),
+            "{\"name\": \"f\", \"arguments\": {}}",
+            "an empty object carries no separator to space"
+        );
     }
 
     /// The template writes one `<tool_call>` block per call rather than one block holding every
