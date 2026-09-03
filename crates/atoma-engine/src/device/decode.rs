@@ -188,7 +188,7 @@ impl DecodeStep {
         };
         let inputs = DecodeInputs::new(allocation, stream, shape)?;
         let (statics, step_statics) =
-            allocate_statics(allocation, stream, &sizing, inputs.tensors())?;
+            allocate_statics(allocation, stream, &sizing, &inputs.tensors())?;
         let (arena_memory, arena_bytes, slots) =
             resolve_slots(allocation, stream, &sizing, &buckets, &step_statics)?;
         let decode = LlamaDecode::new(
@@ -522,7 +522,7 @@ fn allocate_statics(
     allocation: &Allocation,
     stream: &Arc<CudaStream>,
     sizing: &Sizing<'_>,
-    inputs: InputTensors,
+    inputs: &InputTensors,
 ) -> Result<(Statics, StepStatics), DecodeStepError> {
     let (dims, plans, shape) = (sizing.dims, sizing.plans, sizing.shape);
     let largest = |bytes: fn(&AttentionPlan) -> usize| plans.iter().map(bytes).max().unwrap_or(0);
