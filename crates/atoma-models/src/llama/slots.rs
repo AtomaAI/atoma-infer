@@ -294,18 +294,28 @@ impl ActivationSlots {
         &self.rows[row.0]
     }
 
-    /// The view `role` names from `layer`'s frame: the layer's own row, or the next.
+    /// The row `at` names from `layer`'s frame: the layer's own, or the next.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the row named is past the rows resolved.
+    #[must_use]
+    pub fn frame(&self, layer: LayerIdx, at: LayerOffset) -> &LayerSlots {
+        let row = match at {
+            LayerOffset::Same => layer.0,
+            LayerOffset::Next => layer.0 + 1,
+        };
+        &self.rows[row]
+    }
+
+    /// The view `role` names from `layer`'s frame.
     ///
     /// # Panics
     ///
     /// Panics when the row named is past the rows resolved.
     #[must_use]
     pub fn role(&self, layer: LayerIdx, role: RoleRef) -> &Tensor {
-        let row = match role.layer {
-            LayerOffset::Same => layer.0,
-            LayerOffset::Next => layer.0 + 1,
-        };
-        self.rows[row].role(role.role)
+        self.frame(layer, role.layer).role(role.role)
     }
 
     /// The row after the last layer: what the final norm reads and writes.
