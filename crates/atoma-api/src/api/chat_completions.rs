@@ -269,6 +269,12 @@ impl Message {
             }
         }
     }
+
+    /// Whether this is a tool message. The Hermes 3 `tool_use` template gives a run of
+    /// consecutive tool messages one turn, so rendering one asks this of its neighbours.
+    fn is_tool(&self) -> bool {
+        matches!(self, Message::Tool { .. })
+    }
 }
 
 pub(crate) mod messages {
@@ -426,8 +432,10 @@ pub(crate) mod messages {
     /// The token that ends one Hermes 3 turn.
     const HERMES3_END_OF_TURN: &str = "<|im_end|>";
 
-    /// Closes one Hermes 3 turn. The template writes the end-of-turn token straight after the
-    /// turn's content, so nothing separates them.
+    /// Closes one Hermes 3 turn: the end-of-turn token straight after the turn's content, with
+    /// nothing between them, and the newline the template writes before the next turn.
+    ///
+    /// A run of tool messages departs from both, and closes its own turn.
     fn push_hermes3_end_of_turn(prompt: &mut String) {
         prompt.push_str(HERMES3_END_OF_TURN);
         prompt.push('\n');
@@ -465,19 +473,51 @@ pub(crate) mod messages {
         push_hermes3_end_of_turn(prompt);
     }
 
-    /// Writes one Hermes 3 tool message as a `<tool_response>` block, the way the `tool_use`
-    /// template writes it. Consecutive tool messages share one turn.
+    /// Where one tool message sits among its neighbours, which is all the `tool_use` template's
+    /// tool branch asks of the conversation around one.
+    struct ToolRunPosition {
+        /// Whether a message of another role comes before it, which is when the template writes
+        /// the role line.
+        opens_a_turn: bool,
+        /// Whether another tool message follows, which is when the turn stays open for it.
+        run_continues: bool,
+        /// Whether anything follows at all, which is when the block takes a trailing newline.
+        conversation_continues: bool,
+    }
+
+    impl ToolRunPosition {
+        /// Reads the position of the message at `index` from the messages either side of it.
+        fn of(messages: &[Message], index: usize) -> Self {
+            let previous = index.checked_sub(1).map(|previous| &messages[previous]);
+            let next = messages.get(index + 1);
+            Self {
+                opens_a_turn: previous.is_some_and(|previous| !previous.is_tool()),
+                run_continues: next.is_some_and(|next| next.is_tool()),
+                conversation_continues: next.is_some(),
+            }
+        }
+    }
+
+    /// Writes one Hermes 3 tool message as the `<tool_response>` block the `tool_use` template
+    /// frames it in, where a message of any other role is a turn of its own content.
     ///
-    /// The role line is written only when the message before this one is not a tool message, so a
-    /// conversation that opens with a tool message gets none. The end-of-turn token is written
-    /// without the newline every other role's turn ends in.
+    /// Two details of that template come with the shape. The role line is written only when a
+    /// message of another role comes before this one, so a conversation opening with a tool
+    /// message gets none. And the turn ends in the bare end-of-turn token: the newline every
+    /// other role's turn ends in is written inside the run instead, after every block but the
+    /// conversation's last.
     fn push_hermes3_tool_response(
         prompt: &mut String,
         content: Option<&MessageContent>,
-        previous: Option<&Message>,
-        next: Option<&Message>,
+        position: ToolRunPosition,
     ) {
-        if previous.is_some_and(|previous| !matches!(previous, Message::Tool { .. })) {
+        let ToolRunPosition {
+            opens_a_turn,
+            run_continues,
+            conversation_continues,
+        } = position;
+
+        if opens_a_turn {
             push_hermes3_header(prompt, "tool");
         }
         prompt.push_str("<tool_response>\n");
@@ -485,10 +525,10 @@ pub(crate) mod messages {
             prompt.push_str(&content.to_string());
         }
         prompt.push_str("\n</tool_response>");
-        if next.is_some() {
+        if conversation_continues {
             prompt.push('\n');
         }
-        if !next.is_some_and(|next| matches!(next, Message::Tool { .. })) {
+        if !run_continues {
             prompt.push_str(HERMES3_END_OF_TURN);
         }
     }
@@ -536,8 +576,7 @@ pub(crate) mod messages {
                     push_hermes3_tool_response(
                         &mut prompt,
                         content.as_ref(),
-                        messages[..index].last(),
-                        messages.get(index + 1),
+                        ToolRunPosition::of(messages, index),
                     );
                 }
             }
