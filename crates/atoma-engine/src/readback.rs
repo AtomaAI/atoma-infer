@@ -10,9 +10,9 @@
 //! value of every row, and reads from write-combined memory are uncached.
 //!
 //! Two paths reach the buffer. The candle forward copies from a device tensor on candle's stream
-//! and waits in one call. The tensor path enqueues the copy through the descriptor seam, as the
-//! last descriptor of a step on the capture stream, and waits on it separately once the step is
-//! enqueued.
+//! and waits in one call. The decode step over runtime tensors enqueues the copy through the seam,
+//! as the last descriptor of a step on the capture stream, and waits on it separately once the step
+//! is enqueued.
 
 use std::ffi::c_void;
 use std::mem::size_of;

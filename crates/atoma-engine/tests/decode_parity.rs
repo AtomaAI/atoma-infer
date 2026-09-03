@@ -29,7 +29,7 @@ use atoma_engine::batch::BatchLayout;
 use atoma_engine::config::{DeviceOrdinal, Dtype, ModelConfig};
 use atoma_engine::decode::batch::Route;
 use atoma_engine::decode::declaration;
-use atoma_engine::device::decode::{TensorPath, TensorPathPlan};
+use atoma_engine::device::decode::{DecodeStep, DecodeStepPlan};
 use atoma_engine::device::forward::{Allocated, CudaForward};
 use atoma_engine::device::{Checkpoint, KvCache, KvGeometry, RankDevice, Weights};
 use atoma_engine::forward::Forward;
@@ -178,7 +178,7 @@ fn decode_commands(
 struct Rig {
     allocation: Allocation,
     allocated: Allocated,
-    tensor_path: TensorPath,
+    decode_step: DecodeStep,
     vocab: usize,
 }
 
@@ -206,14 +206,14 @@ fn open(model: &ModelConfig) -> Rig {
         config.vocab_size,
     )
     .expect("the readback pins");
-    let plan = TensorPathPlan {
+    let plan = DecodeStepPlan {
         dispatch: dispatch_config(),
         max_model_len: tokens(MAX_MODEL_LEN),
         block_size: tokens(BLOCK_SIZE),
         dtype: model.dtype,
     };
-    let tensor_path = TensorPath::build(&allocation, &device, &weights, &kv_cache, &plan)
-        .expect("the tensor path builds");
+    let decode_step = DecodeStep::build(&allocation, &device, &weights, &kv_cache, &plan)
+        .expect("the decode step builds");
     Rig {
         allocation,
         allocated: Allocated {
@@ -223,7 +223,7 @@ fn open(model: &ModelConfig) -> Rig {
             readback: Some(readback),
             vocab: config.vocab_size,
         },
-        tensor_path,
+        decode_step,
         vocab: config.vocab_size,
     }
 }
@@ -233,7 +233,7 @@ fn open(model: &ModelConfig) -> Rig {
 /// count.
 fn record_bucket_of_one(
     allocation: Allocation,
-    tensor_path: &mut TensorPath,
+    decode_step: &mut DecodeStep,
     dispatcher: &mut Dispatcher,
     dummy_block: u32,
 ) -> (Replay, usize) {
@@ -247,20 +247,20 @@ fn record_bucket_of_one(
     let DispatchDecision::FullReplay(key) = layout.dispatch else {
         panic!("keyed");
     };
-    let Route::Bucket(batch) = tensor_path.route(&layout, key).expect("routes") else {
+    let Route::Bucket(batch) = decode_step.route(&layout, key).expect("routes") else {
         panic!("the bucket of one serves one decode");
     };
-    tensor_path.stage(&layout, &batch).expect("stages");
+    decode_step.stage(&layout, &batch).expect("stages");
     let mut capture = allocation.into_capture();
     capture
-        .warm_up(&mut tensor_path.upload(&batch))
+        .warm_up(&mut decode_step.upload(&batch))
         .expect("the upload runs eagerly");
     capture
-        .warm_up(&mut tensor_path.descriptor(BucketIdx(0)).expect("bucket 0"))
+        .warm_up(&mut decode_step.descriptor(BucketIdx(0)).expect("bucket 0"))
         .expect("the step warms up");
     let graph = capture
         .record(
-            &mut tensor_path.descriptor(BucketIdx(0)).expect("bucket 0"),
+            &mut decode_step.descriptor(BucketIdx(0)).expect("bucket 0"),
             BakedBuffers::default(),
         )
         .expect("the step records without invalidating the capture");
@@ -318,7 +318,7 @@ fn compare_step(
     let tensor_logits: Vec<Vec<f32>> = {
         let logits = forward
             .forward(&lay_out(&keyed))
-            .expect("the keyed step runs on the tensor path");
+            .expect("the keyed batch runs on the decode step");
         (0..logits.rows())
             .map(|row| logits.row(row).expect("row").to_vec())
             .collect()
@@ -334,7 +334,7 @@ fn compare_step(
         let (ours, theirs) = (argmax(tensor_row), argmax(candle_row));
         if ours != theirs {
             parity.argmax_disagreements += 1;
-            eprintln!("step {step} row {row}: tensor path argmax {ours}, candle argmax {theirs}");
+            eprintln!("step {step} row {row}: decode step argmax {ours}, candle argmax {theirs}");
         }
         let diff = tensor_row
             .iter()
@@ -368,7 +368,7 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     let Rig {
         allocation,
         allocated,
-        mut tensor_path,
+        mut decode_step,
         vocab,
     } = open(&model);
     let contract = CaptureContract::resolve(&[declaration()], &ModelDeclaration::new("llama"));
@@ -376,9 +376,9 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     let dummy_block = u32::try_from(BLOCK_COUNT - 1).expect("fits");
 
     let (session, nodes) =
-        record_bucket_of_one(allocation, &mut tensor_path, &mut dispatcher, dummy_block);
+        record_bucket_of_one(allocation, &mut decode_step, &mut dispatcher, dummy_block);
     println!("capture: the bucket-of-one step recorded as a graph of {nodes} nodes");
-    let mut forward = CudaForward::new(allocated, tensor_path, session);
+    let mut forward = CudaForward::new(allocated, decode_step, session);
 
     let mut random = Lcg(0x5EED_2026_0903);
     let blocks_each = MAX_MODEL_LEN.div_ceil(BLOCK_SIZE);

@@ -11,7 +11,7 @@
 //! step precede the readback on the same stream, so by the time the host writes the next step's
 //! inputs the previous step has finished reading both copies.
 //!
-//! The fence descriptor orders the tensor path after candle's stream: a prefill runs there, and
+//! The fence descriptor orders the decode step after candle's stream: a prefill runs there, and
 //! the step must not read the cache it wrote until it is written.
 
 use std::ffi::c_void;

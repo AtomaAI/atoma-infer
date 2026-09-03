@@ -24,7 +24,7 @@ use tracing::debug;
 #[cfg(not(feature = "nccl"))]
 use crate::decode::batch::{DecodeBatch, Route};
 #[cfg(not(feature = "nccl"))]
-use crate::device::decode::{TensorPath, TensorPathError};
+use crate::device::decode::{DecodeStep, DecodeStepError};
 
 /// Why a step could not be run on the device.
 #[derive(Debug, Error)]
@@ -35,7 +35,7 @@ pub enum CudaForwardError {
     Readback(#[from] ReadbackError),
     #[cfg(not(feature = "nccl"))]
     #[error(transparent)]
-    TensorPath(#[from] TensorPathError),
+    DecodeStep(#[from] DecodeStepError),
     /// The forward's logits came back on the host, which no device forward should produce.
     #[error("the logits are not on the device")]
     LogitsNotOnDevice,
@@ -60,7 +60,7 @@ pub struct Allocated {
 pub struct CudaForward {
     allocated: Allocated,
     #[cfg(not(feature = "nccl"))]
-    tensor_path: TensorPath,
+    decode_step: DecodeStep,
     session: Replay,
 }
 
@@ -68,18 +68,18 @@ impl CudaForward {
     #[must_use]
     pub fn new(
         allocated: Allocated,
-        #[cfg(not(feature = "nccl"))] tensor_path: TensorPath,
+        #[cfg(not(feature = "nccl"))] decode_step: DecodeStep,
         session: Replay,
     ) -> Self {
         Self {
             allocated,
             #[cfg(not(feature = "nccl"))]
-            tensor_path,
+            decode_step,
             session,
         }
     }
 
-    /// The batch as the tensor path serves it, when the layout is keyed and the shape its graphs
+    /// The batch as the decode step serves it, when the layout is keyed and the shape its graphs
     /// bake; a keyed batch it does not serve is logged and runs on candle.
     #[cfg(not(feature = "nccl"))]
     fn keyed_batch(&self, layout: &BatchLayout) -> Result<Option<DecodeBatch>, CudaForwardError> {
@@ -87,7 +87,7 @@ impl CudaForward {
             DispatchDecision::FullReplay(key) | DispatchDecision::SegmentedReplay(key) => key,
             DispatchDecision::Eager(_) => return Ok(None),
         };
-        match self.tensor_path.route(layout, key)? {
+        match self.decode_step.route(layout, key)? {
             Route::Bucket(batch) => Ok(Some(batch)),
             Route::Eager(reason) => {
                 debug!(%reason, "keyed batch served on candle");
@@ -98,20 +98,20 @@ impl CudaForward {
 
     /// Runs `batch` on the step over runtime tensors and reads its live rows back.
     #[cfg(not(feature = "nccl"))]
-    fn tensor_step(
+    fn run_decode_step(
         &mut self,
         layout: &BatchLayout,
         batch: DecodeBatch,
     ) -> Result<Logits<'_>, CudaForwardError> {
         let Self {
             allocated,
-            tensor_path,
+            decode_step,
             session,
         } = self;
         let Some(readback) = allocated.readback.as_mut() else {
             return Ok(Logits::new(&[], allocated.vocab));
         };
-        Ok(tensor_path.step(session, layout, batch, readback)?)
+        Ok(decode_step.run(session, layout, batch, readback)?)
     }
 
     /// Runs `layout` through the Llama forward on candle's stream and reads the selected rows
@@ -135,7 +135,7 @@ impl CudaForward {
             .llama_mut()
             .forward(&tokens, &positions, &selected, &kv_caches, metadata)?;
         #[cfg(not(feature = "nccl"))]
-        self.tensor_path.after_candle(device.stream())?;
+        self.decode_step.after_candle(device.stream())?;
         let rows = layout.selected.len();
         let Some(readback) = readback else {
             return Ok(Logits::new(&[], *vocab));
@@ -199,7 +199,7 @@ impl Forward for CudaForward {
     fn forward(&mut self, layout: &BatchLayout) -> Result<Logits<'_>, CudaForwardError> {
         #[cfg(not(feature = "nccl"))]
         if let Some(batch) = self.keyed_batch(layout)? {
-            return self.tensor_step(layout, batch);
+            return self.run_decode_step(layout, batch);
         }
         self.candle_forward(layout)
     }

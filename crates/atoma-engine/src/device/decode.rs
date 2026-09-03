@@ -44,9 +44,9 @@ use crate::device::{KvCache, RankDevice, Weights};
 use crate::logits::Logits;
 use crate::readback::{Readback, ReadbackError};
 
-/// Why the tensor path could not be built or a step could not be run on it.
+/// Why the decode step could not be built or run.
 #[derive(Debug, Error)]
-pub enum TensorPathError {
+pub enum DecodeStepError {
     #[error(
         "model.dtype is {dtype:?}; the decode step over runtime tensors runs bf16 only, so set \
          model.dtype = \"bf16\""
@@ -95,9 +95,9 @@ pub enum TensorPathError {
     Candle(#[from] candle_core::Error),
 }
 
-/// What the tensor path is sized from: the buckets it serves and the sequence it must hold.
+/// What the decode step is sized from: the buckets it serves and the sequence it must hold.
 #[derive(Debug, Clone)]
-pub struct TensorPathPlan {
+pub struct DecodeStepPlan {
     pub dispatch: DispatchConfig,
     pub max_model_len: TokenCount,
     pub block_size: TokenCount,
@@ -116,7 +116,7 @@ struct Statics {
 }
 
 /// The decode step over runtime-owned tensors, and everything it addresses.
-pub struct TensorPath {
+pub struct DecodeStep {
     buckets: DecodeBuckets,
     inputs: DecodeInputs,
     decode: LlamaDecode,
@@ -127,27 +127,27 @@ pub struct TensorPath {
     _statics: Statics,
 }
 
-impl TensorPath {
+impl DecodeStep {
     /// Builds the path over `weights` and `kv_cache` as candle loaded them, for the buckets
     /// `plan` makes usable, during the Allocation phase.
     ///
     /// # Errors
     ///
-    /// Returns [`TensorPathError`] when the model is not loaded in bf16, no bucket is usable, a
+    /// Returns [`DecodeStepError`] when the model is not loaded in bf16, no bucket is usable, a
     /// weight or cache is not the shape the step reads, or the device refuses an allocation.
     pub fn build(
         allocation: &Allocation,
         device: &RankDevice,
         weights: &Weights,
         kv_cache: &KvCache,
-        plan: &TensorPathPlan,
-    ) -> Result<Self, TensorPathError> {
+        plan: &DecodeStepPlan,
+    ) -> Result<Self, DecodeStepError> {
         if plan.dtype != ConfiguredDtype::Bf16 {
-            return Err(TensorPathError::NotBf16 { dtype: plan.dtype });
+            return Err(DecodeStepError::NotBf16 { dtype: plan.dtype });
         }
         let buckets = DecodeBuckets::usable(&plan.dispatch);
         if buckets.tokens().is_empty() {
-            return Err(TensorPathError::NoUsableBucket {
+            return Err(DecodeStepError::NoUsableBucket {
                 captured_max: plan.dispatch.captured_max_requests.get(),
             });
         }
@@ -248,8 +248,8 @@ impl TensorPath {
     ///
     /// # Errors
     ///
-    /// Returns [`TensorPathError::Batch`] when the layout contradicts its key.
-    pub fn route(&self, layout: &BatchLayout, key: GraphKey) -> Result<Route, TensorPathError> {
+    /// Returns [`DecodeStepError::Batch`] when the layout contradicts its key.
+    pub fn route(&self, layout: &BatchLayout, key: GraphKey) -> Result<Route, DecodeStepError> {
         Ok(DecodeBatch::route(
             layout,
             key,
@@ -264,15 +264,15 @@ impl TensorPath {
     ///
     /// # Errors
     ///
-    /// Returns [`TensorPathError`] when the inputs cannot be staged, a descriptor cannot be
+    /// Returns [`DecodeStepError`] when the inputs cannot be staged, a descriptor cannot be
     /// enqueued, or the readback fails.
-    pub fn step<'a>(
+    pub fn run<'a>(
         &mut self,
         session: &Replay,
         layout: &BatchLayout,
         batch: DecodeBatch,
         readback: &'a mut Readback,
-    ) -> Result<Logits<'a>, TensorPathError> {
+    ) -> Result<Logits<'a>, DecodeStepError> {
         self.stage(layout, &batch)?;
         session.run(&mut Fence::new(&self.candle_done))?;
         session.run(&mut self.upload(&batch))?;
@@ -286,12 +286,12 @@ impl TensorPath {
     ///
     /// # Errors
     ///
-    /// Returns [`TensorPathError::Inputs`] when the layout cannot be staged.
+    /// Returns [`DecodeStepError::Inputs`] when the layout cannot be staged.
     pub fn stage(
         &mut self,
         layout: &BatchLayout,
         batch: &DecodeBatch,
-    ) -> Result<(), TensorPathError> {
+    ) -> Result<(), DecodeStepError> {
         Ok(self.inputs.stage(layout, batch)?)
     }
 
@@ -305,8 +305,8 @@ impl TensorPath {
     ///
     /// # Errors
     ///
-    /// Returns [`TensorPathError::Step`] when no such bucket was resolved.
-    pub fn descriptor(&self, bucket: BucketIdx) -> Result<LlamaStep<'_>, TensorPathError> {
+    /// Returns [`DecodeStepError::Step`] when no such bucket was resolved.
+    pub fn descriptor(&self, bucket: BucketIdx) -> Result<LlamaStep<'_>, DecodeStepError> {
         Ok(self.decode.step(bucket, &self.blas)?)
     }
 
@@ -315,8 +315,8 @@ impl TensorPath {
     ///
     /// # Errors
     ///
-    /// Returns [`TensorPathError::Runtime`] when the event cannot be recorded.
-    pub fn after_candle(&self, stream: &Arc<CudaStream>) -> Result<(), TensorPathError> {
+    /// Returns [`DecodeStepError::Runtime`] when the event cannot be recorded.
+    pub fn after_candle(&self, stream: &Arc<CudaStream>) -> Result<(), DecodeStepError> {
         self.candle_done
             .record(stream)
             .map_err(RuntimeError::from)?;
@@ -325,7 +325,7 @@ impl TensorPath {
 }
 
 /// The dimensions the step reads off the checkpoint's configuration.
-fn llama_dims(config: &Config) -> Result<LlamaDims, TensorPathError> {
+fn llama_dims(config: &Config) -> Result<LlamaDims, DecodeStepError> {
     let scaling = config.rope_scaling.as_ref().and_then(|scaling| {
         matches!(scaling.rope_type, Llama3RopeType::Llama3).then(|| Llama3RopeScaling {
             factor: scaling.factor,
@@ -357,16 +357,16 @@ fn llama_dims(config: &Config) -> Result<LlamaDims, TensorPathError> {
 }
 
 /// The device's multiprocessor count, which the attention split heuristic sizes by.
-fn multiprocessors(stream: &Arc<CudaStream>) -> Result<usize, TensorPathError> {
+fn multiprocessors(stream: &Arc<CudaStream>) -> Result<usize, DecodeStepError> {
     let count = stream
         .context()
         .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
         .map_err(RuntimeError::from)?;
-    usize::try_from(count).map_err(|_| TensorPathError::MultiprocessorCount { count })
+    usize::try_from(count).map_err(|_| DecodeStepError::MultiprocessorCount { count })
 }
 
 /// `bytes` zeroed bytes on `stream`'s device.
-fn zeroed(stream: &Arc<CudaStream>, bytes: usize) -> Result<CudaSlice<u8>, TensorPathError> {
+fn zeroed(stream: &Arc<CudaStream>, bytes: usize) -> Result<CudaSlice<u8>, DecodeStepError> {
     Ok(stream
         .alloc_zeros::<u8>(bytes)
         .map_err(RuntimeError::from)?)
@@ -386,16 +386,16 @@ fn snapshot(
     tensor: &candle_core::Tensor,
     dims: &[usize],
     stream: &Arc<CudaStream>,
-) -> Result<Tensor, TensorPathError> {
+) -> Result<Tensor, DecodeStepError> {
     let (storage, layout) = tensor.storage_and_layout();
     let Storage::Cuda(storage) = &*storage else {
-        return Err(TensorPathError::NotOnDevice { what });
+        return Err(DecodeStepError::NotOnDevice { what });
     };
     if !layout.is_contiguous() {
-        return Err(TensorPathError::NotContiguous { what });
+        return Err(DecodeStepError::NotContiguous { what });
     }
     let CudaStorageSlice::BF16(slice) = &storage.slice else {
-        return Err(TensorPathError::WeightDtype {
+        return Err(DecodeStepError::WeightDtype {
             what,
             dtype: tensor.dtype(),
         });
@@ -403,7 +403,7 @@ fn snapshot(
     let expected: usize = dims.iter().product();
     let held = layout.shape().elem_count();
     if held != expected {
-        return Err(TensorPathError::ElementCount {
+        return Err(DecodeStepError::ElementCount {
             what,
             held,
             expected,
@@ -423,7 +423,7 @@ fn snapshot_weights(
     allocation: &Allocation,
     llama: &models::llama::Llama,
     stream: &Arc<CudaStream>,
-) -> Result<LlamaWeights, TensorPathError> {
+) -> Result<LlamaWeights, DecodeStepError> {
     let view = |what: &'static str, tensor: &candle_core::Tensor| {
         snapshot(allocation, what, tensor, tensor.dims(), stream)
     };
@@ -443,7 +443,7 @@ fn snapshot_weights(
                 down: view("a down projection", layer.down_proj)?,
             })
         })
-        .collect::<Result<Vec<_>, TensorPathError>>()?;
+        .collect::<Result<Vec<_>, DecodeStepError>>()?;
     Ok(LlamaWeights {
         embedding: view("the embedding table", llama.embeddings())?,
         layers,
@@ -460,7 +460,7 @@ fn snapshot_cache(
     kv_cache: &KvCache,
     dims: &LlamaDims,
     stream: &Arc<CudaStream>,
-) -> Result<LlamaCache, TensorPathError> {
+) -> Result<LlamaCache, DecodeStepError> {
     let caches = kv_cache
         .layers()
         .iter()
@@ -488,9 +488,9 @@ fn allocate_statics(
     plans: &[AttentionPlan],
     shape: StagingShape,
     inputs: InputTensors,
-) -> Result<(Statics, StepStatics), TensorPathError> {
+) -> Result<(Statics, StepStatics), DecodeStepError> {
     let largest = |bytes: fn(&AttentionPlan) -> usize| plans.iter().map(bytes).max().unwrap_or(0);
-    let f32s = |bytes: usize| -> Result<(CudaSlice<u8>, Tensor), TensorPathError> {
+    let f32s = |bytes: usize| -> Result<(CudaSlice<u8>, Tensor), DecodeStepError> {
         let buffer = zeroed(stream, bytes)?;
         let layout = Layout::contiguous(&[bytes / Dtype::F32.size_in_bytes()], Dtype::F32)?;
         let tensor = Tensor::new(allocation, address(&buffer, stream), layout)?;
@@ -504,7 +504,7 @@ fn allocate_statics(
     let (o_accum_buffer, o_accum) = f32s(largest(AttentionPlan::o_accum_bytes))?;
 
     let tables = RotaryTables::new(dims);
-    let upload = |values: &[f32]| -> Result<(CudaSlice<f32>, Tensor), TensorPathError> {
+    let upload = |values: &[f32]| -> Result<(CudaSlice<f32>, Tensor), DecodeStepError> {
         let buffer = stream.memcpy_stod(values).map_err(RuntimeError::from)?;
         let layout = Layout::contiguous(&[tables.max_position(), tables.pairs()], Dtype::F32)?;
         let tensor = Tensor::new(allocation, address(&buffer, stream), layout)?;

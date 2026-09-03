@@ -1,5 +1,5 @@
 [package]
-description = "Model definitions on the runtime tensor path: the Llama decode step over engine-owned device memory"
+description = "The Llama decode step over engine-owned device memory, addressed through tensor views"
 edition     = { workspace = true }
 license     = "Apache-2.0"
 name        = "atoma-models"

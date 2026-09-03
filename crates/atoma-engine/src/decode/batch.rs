@@ -1,11 +1,11 @@
-//! A keyed batch held to its bucket, and the buckets the tensor path serves.
+//! A keyed batch held to its bucket, and the buckets the decode step serves.
 //!
 //! The engine pads a uniform-decode batch to its bucket and keys it; the executor acts on the key
-//! without re-deriving it. What the tensor path still has to establish is that the batch it was
+//! without re-deriving it. What the decode step still has to establish is that the batch it was
 //! handed is the shape its graphs bake: one token per entry, as many entries as the bucket, the
 //! live entries leading and every one of them sampling, so the logits it reads back are exactly
 //! the leading rows. A batch that is keyed but not that shape is not an error: a one-token
-//! prefill chunk that does not sample yet, or a bucket the tensor path did not resolve, is named
+//! prefill chunk that does not sample yet, or a bucket the decode step did not resolve, is named
 //! and served eagerly. A batch that contradicts its own key is the engine breaking the step
 //! protocol, and is refused.
 
@@ -30,23 +30,23 @@ pub enum DecodeBatchError {
     #[error("a padding dummy at entry {entry} samples")]
     DummySamples { entry: usize },
     #[error(
-        "the block table is {width} blocks wide; the tensor path stages {max_width}, the most \
+        "the block table is {width} blocks wide; the decode step stages {max_width}, the most \
          a sequence can hold"
     )]
     BlockTableTooWide { width: usize, max_width: usize },
 }
 
-/// Why a keyed batch runs eagerly after all: a shape the tensor path does not serve.
+/// Why a keyed batch runs eagerly after all: a shape the decode step does not serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum Unservable {
     /// A live entry that does not sample: a prefill chunk whose last token is not the prompt's.
     /// The logits read back are the leading rows, one per live entry, so every live entry must
     /// want one.
     #[error(
-        "live entry {entry} does not sample; the tensor path reads back one row per live entry"
+        "live entry {entry} does not sample; the decode step reads back one row per live entry"
     )]
     LiveEntryNotSampling { entry: usize },
-    /// The key's bucket is above every bucket the tensor path resolved.
+    /// The key's bucket is above every bucket the decode step resolved.
     #[error("no resolved bucket holds {tokens} tokens; the largest is {largest}")]
     NoBucket { tokens: usize, largest: usize },
 }
@@ -54,13 +54,13 @@ pub enum Unservable {
 /// Where a keyed batch runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
-    /// The tensor path, at this bucket.
+    /// The decode step, at this bucket.
     Bucket(DecodeBatch),
     /// The eager path, for this reason.
     Eager(Unservable),
 }
 
-/// The buckets the tensor path serves: the configured ladder's rungs at or below the captured
+/// The buckets the decode step serves: the configured ladder's rungs at or below the captured
 /// maximum, in configured order. The arena and every slot table are built over exactly these, so
 /// a rung's position here is its bucket index everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,7 +107,7 @@ impl DecodeBuckets {
     }
 }
 
-/// A keyed batch the tensor path serves: its bucket, and how many of the bucket's rows are live.
+/// A keyed batch the decode step serves: its bucket, and how many of the bucket's rows are live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeBatch {
     pub bucket: BucketIdx,
@@ -119,7 +119,7 @@ pub struct DecodeBatch {
 }
 
 impl DecodeBatch {
-    /// Holds `layout`, keyed by `key`, to the shape the tensor path bakes, and finds its bucket
+    /// Holds `layout`, keyed by `key`, to the shape the decode step bakes, and finds its bucket
     /// among `buckets`; the block table must fit `max_block_table_width` columns.
     ///
     /// # Errors
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bucket_the_tensor_path_did_not_resolve_goes_eager_with_the_largest_it_has() {
+    fn a_bucket_the_decode_step_did_not_resolve_goes_eager_with_the_largest_it_has() {
         let (layout, key) = keyed(vec![
             entry(1, 3, vec![9], &[10], true),
             entry(2, 3, vec![9], &[20], true),

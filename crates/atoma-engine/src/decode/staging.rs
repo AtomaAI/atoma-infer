@@ -202,7 +202,7 @@ mod tests {
         let buckets = DecodeBuckets::usable(&engine_config().dispatch);
         let Route::Bucket(batch) = DecodeBatch::route(&layout, key, &buckets, WIDTH).unwrap()
         else {
-            panic!("served on the tensor path");
+            panic!("served by the decode step");
         };
         (layout, batch)
     }

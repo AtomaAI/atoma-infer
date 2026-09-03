@@ -1,4 +1,5 @@
-//! The Llama decode step on the tensor path: where it reads and writes, and how it is enqueued.
+//! The Llama decode step over runtime-owned tensors: where it reads and writes, and how it is
+//! enqueued.
 //!
 //! | Module | Responsibility |
 //! |---|---|

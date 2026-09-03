@@ -1,5 +1,5 @@
-//! Model definitions on the runtime tensor path: the Llama decode step over engine-owned device
-//! memory, addressed through [`atoma_runtime::tensor::Tensor`] views.
+//! The Llama decode step over engine-owned device memory, addressed through
+//! [`atoma_runtime::tensor::Tensor`] views.
 //!
 //! Candle is not a dependency. Weights and the KV cache are loaded and allocated elsewhere; this
 //! crate receives their device addresses at Allocation and describes the step over them. What a

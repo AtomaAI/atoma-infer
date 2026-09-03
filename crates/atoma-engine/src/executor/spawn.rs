@@ -16,7 +16,7 @@ use tracing::info;
 
 use crate::config::{DeviceOrdinal, ExecutorConfig, ModelConfig, Rank, RankConfig};
 #[cfg(not(feature = "nccl"))]
-use crate::device::decode::{TensorPath, TensorPathPlan};
+use crate::device::decode::{DecodeStep, DecodeStepPlan};
 use crate::device::forward::{Allocated, CudaForward};
 use crate::device::{Checkpoint, KvCache, KvGeometry, RankDevice, Weights};
 use crate::executor::{
@@ -61,7 +61,7 @@ struct RankPlan {
     dtype: DType,
     files: ModelFiles,
     #[cfg(not(feature = "nccl"))]
-    tensor_path: TensorPathPlan,
+    decode_step: DecodeStepPlan,
     #[cfg(feature = "nccl")]
     collective: Id,
 }
@@ -100,7 +100,7 @@ pub fn spawn_ranks(
         dtype: model.dtype.into(),
         files: files.clone(),
         #[cfg(not(feature = "nccl"))]
-        tensor_path: TensorPathPlan {
+        decode_step: DecodeStepPlan {
             dispatch: engine.dispatch.clone(),
             max_model_len: engine.scheduler.max_model_len,
             block_size: engine.scheduler.block_size,
@@ -173,8 +173,8 @@ fn open_forward(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<C
         None
     };
     #[cfg(not(feature = "nccl"))]
-    let tensor_path =
-        TensorPath::build(&allocation, &device, &weights, &kv_cache, &plan.tensor_path)?;
+    let decode_step =
+        DecodeStep::build(&allocation, &device, &weights, &kv_cache, &plan.decode_step)?;
     let session = allocation.into_capture().into_replay();
     info!(%rank, "session in its Replay phase; serving through it");
     Ok(CudaForward::new(
@@ -186,7 +186,7 @@ fn open_forward(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<C
             vocab: config.vocab_size,
         },
         #[cfg(not(feature = "nccl"))]
-        tensor_path,
+        decode_step,
         session,
     ))
 }
