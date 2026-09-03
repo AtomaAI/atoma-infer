@@ -6,8 +6,13 @@ name        = "atoma-models"
 version     = { workspace = true }
 
 [dependencies]
+atoma-kernels = { workspace = true }
 atoma-runtime = { workspace = true }
+cudarc        = { workspace = true }
 thiserror     = { workspace = true }
+
+[features]
+cuda = [ "atoma-kernels/cuda" ]
 
 [lints.clippy]
 await_holding_lock      = "deny"

@@ -226,7 +226,9 @@ dependencies = [
 name = "atoma-models"
 version = "0.1.0"
 dependencies = [
+ "atoma-kernels",
  "atoma-runtime",
+ "cudarc 0.19.8",
  "thiserror 2.0.19",
 ]
 
