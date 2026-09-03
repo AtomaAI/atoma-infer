@@ -449,12 +449,14 @@ pub(crate) mod messages {
                 } => {
                     push_hermes3_header(&mut prompt, "assistant");
                     if !tool_calls.is_empty() {
-                        prompt.push_str("<tool_call>");
+                        // Every Hermes 3 model renders a tool call the same way, so one variant
+                        // stands for the family.
                         let tool_calls_str = tool_calls
                             .iter()
-                            .map(|tc| tc.function_call_string(Model::HermesLlama318b)) // all hermes3 model versions have the same functionality
+                            .map(|tc| tc.function_call_string(Model::HermesLlama318b))
                             .collect::<Vec<_>>()
                             .join(", ");
+                        prompt.push_str("<tool_call>");
                         prompt.push_str(&tool_calls_str);
                         prompt.push_str("</tool_call>");
                     } else if let Some(content) = content {
