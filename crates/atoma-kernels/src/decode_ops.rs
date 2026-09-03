@@ -4,15 +4,16 @@
 //! The sources are in-house (`kernels/decode_ops.cu`), compiled by nvcc under the `cuda` feature
 //! into a library of their own, apart from the vendored flash-attention build and its fast-math
 //! flags. Each launcher returns its launch status and takes the caller's stream; the wrappers
-//! here turn the status into [`KernelError`]. Without the feature the same functions return
-//! [`KernelError::NotCompiled`], so the crates built on this one compile and test without a
-//! toolkit.
+//! here turn the status into [`KernelError`](crate::error::KernelError). Without the feature the
+//! same functions return [`KernelError::NotCompiled`](crate::error::KernelError::NotCompiled), so
+//! the crates built on this one compile and test without a toolkit.
 //!
 //! The rotary embedding reads cos and sin from tables indexed by position rather than computing
 //! them: the frequencies a model scales (Llama 3) are the caller's to compute on the host, once.
 
 use core::ffi::c_void;
 
+#[cfg(not(feature = "cuda"))]
 use crate::error::KernelError;
 
 /// Gathers one embedding row per token: `out[t] = table[token_ids[t]]`.
@@ -298,6 +299,7 @@ pub unsafe fn add(_call: &AddCall) -> Result<(), KernelError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "cuda"))]
     use super::*;
 
     /// The kernel sources, so the launcher list and the sources are held to the same names.

@@ -8,11 +8,13 @@
 //! the candle wrapper follows for the same case, so the two paths run the same kernel with the
 //! same arguments.
 //!
-//! Without the `cuda` feature the same API compiles to [`KernelError::NotCompiled`], so a crate
-//! built on it type-checks and unit-tests on a machine with no toolkit.
+//! Without the `cuda` feature the same API compiles to
+//! [`KernelError::NotCompiled`](crate::error::KernelError::NotCompiled), so a crate built on it
+//! type-checks and unit-tests on a machine with no toolkit.
 
 use core::ffi::c_void;
 
+#[cfg(not(feature = "cuda"))]
 use crate::error::KernelError;
 
 /// The element type the attention operands and the cache hold.
