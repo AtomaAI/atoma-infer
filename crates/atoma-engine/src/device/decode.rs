@@ -541,7 +541,7 @@ fn allocate_statics(
 
     let tables = RotaryTables::new(dims);
     let upload = |values: &[f32]| -> Result<(CudaSlice<f32>, Tensor), DecodeStepError> {
-        let buffer = stream.memcpy_stod(values).map_err(RuntimeError::from)?;
+        let buffer = stream.clone_htod(values).map_err(RuntimeError::from)?;
         let layout = Layout::contiguous(&[tables.max_position(), tables.pairs()], Dtype::F32)?;
         let tensor = Tensor::new(allocation, address(&buffer, stream), layout)?;
         Ok((buffer, tensor))
