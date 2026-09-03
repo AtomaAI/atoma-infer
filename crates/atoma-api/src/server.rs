@@ -31,7 +31,7 @@ use tokenizers::{Error as TokenizerError, Tokenizer};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::{signal, task, time};
-use tracing::{error, info, instrument, warn, Span};
+use tracing::{debug, error, info, instrument, warn, Span};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
@@ -362,7 +362,9 @@ where
             Ok(Json(body)) => Ok(Self(body)),
             Err(rejection) => {
                 let request_id = next_request_id().to_string();
-                warn!(request_id, cause = %rejection, "the request body cannot be read");
+                // A body the caller malformed is diagnostic, not degradation, and any caller can
+                // send one as often as it likes.
+                debug!(request_id, cause = %rejection, "the request body cannot be read");
                 Err(ApiError::unreadable_body(&rejection, &request_id))
             }
         }
@@ -730,21 +732,27 @@ mod tests {
         }
     }
 
+    const JSON: &str = "application/json";
+
     async fn post(router: Router, body: Value) -> (StatusCode, String) {
-        post_text(router, body.to_string()).await
+        post_as(router, body.to_string(), Some(JSON)).await
     }
 
-    /// Posts a body as it stands, for the bodies a [`Value`] cannot express.
-    async fn post_text(router: Router, body: String) -> (StatusCode, String) {
+    /// Posts a body as it stands, under a content type of the caller's choosing or none at all:
+    /// for the requests a [`Value`] and a well-formed header cannot express.
+    async fn post_as(
+        router: Router,
+        body: String,
+        content_type: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(CHAT_COMPLETIONS_PATH);
+        if let Some(content_type) = content_type {
+            request = request.header(header::CONTENT_TYPE, content_type);
+        }
         let response = router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(CHAT_COMPLETIONS_PATH)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
+            .oneshot(request.body(Body::from(body)).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -924,23 +932,31 @@ mod tests {
     }
 
     /// A body the extractor cannot read is refused like any other: the same envelope under a
-    /// request id, rather than the extractor's own status and plain text.
+    /// request id, saying what could not be read. A missing content type is refused the same way,
+    /// where the extractor would have answered a 415, and a broken body where it would have
+    /// answered a 422 and a line of text.
     #[tokio::test]
     async fn a_body_that_cannot_be_read_is_refused_in_the_envelope() {
         let served = serve("a", Duration::from_secs(30));
-        let syntax = "{ not json".to_owned();
-        let wrong_type =
-            json!({ "model": "meta-llama/Llama-3.2-1B-Instruct", "messages": 3 }).to_string();
-        for posted in [syntax, wrong_type] {
-            let (status, body) = post_text(served.router(), posted.clone()).await;
+        let cases = [
+            ("{ not json".to_owned(), Some(JSON), "parse"),
+            (
+                json!({ "model": "meta-llama/Llama-3.2-1B-Instruct", "messages": 3 }).to_string(),
+                Some(JSON),
+                "messages",
+            ),
+            (completion_body(json!({})).to_string(), None, "Content-Type"),
+        ];
+        for (posted, content_type, said) in cases {
+            let (status, body) = post_as(served.router(), posted.clone(), content_type).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{posted}: {body}");
             let body: Value = serde_json::from_str(&body)
                 .unwrap_or_else(|_| panic!("{posted} answered outside the envelope: {body}"));
             assert_eq!(body["error"]["type"], "invalid_request_error");
             assert!(body["error"]["request_id"].is_string(), "{body}");
             assert!(
-                !body["error"]["message"].as_str().unwrap().is_empty(),
-                "{body}"
+                body["error"]["message"].as_str().unwrap().contains(said),
+                "{posted} was refused without saying {said}: {body}"
             );
         }
         served.shutdown();

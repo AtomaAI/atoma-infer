@@ -409,11 +409,16 @@ pub(crate) mod messages {
         prompt
     }
 
-    /// Writes one Hermes 3 role line: the start-of-turn token, the role, and the newline the
-    /// template puts before a turn's content.
-    fn push_hermes3_header(prompt: &mut String, role: &str) {
+    /// Opens one Hermes 3 turn: the start-of-turn token and the role, and nothing after them.
+    fn push_hermes3_turn_start(prompt: &mut String, role: &str) {
         prompt.push_str("<|im_start|>");
         prompt.push_str(role);
+    }
+
+    /// Writes one Hermes 3 role line: the turn's opening, and the newline the template puts
+    /// before a turn's content.
+    fn push_hermes3_header(prompt: &mut String, role: &str) {
+        push_hermes3_turn_start(prompt, role);
         prompt.push('\n');
     }
 
@@ -448,7 +453,7 @@ pub(crate) mod messages {
     /// The role line carries no newline of its own here: the template opens the turn with the
     /// role alone, and the first block opens with the newline that would have followed it.
     fn push_hermes3_tool_call_turn(prompt: &mut String, tool_calls: &[ToolCall]) {
-        prompt.push_str("<|im_start|>assistant");
+        push_hermes3_turn_start(prompt, "assistant");
         for tool_call in tool_calls {
             push_hermes3_tool_call(prompt, tool_call);
         }
@@ -1828,8 +1833,9 @@ pub mod tests {
         assert_eq!(result, expected);
     }
 
-    /// One conversation per trailing role, and the empty one.
-    fn every_trailing_role() -> [Vec<Message>; 5] {
+    /// One conversation per trailing role, the assistant's two ways of speaking, and the empty
+    /// one.
+    fn every_trailing_role() -> [Vec<Message>; 6] {
         let text = |text: &str| Some(MessageContent::Text(text.to_string()));
         [
             vec![],
@@ -1846,6 +1852,19 @@ pub mod tests {
                 name: None,
                 refusal: None,
                 tool_calls: vec![],
+            }],
+            vec![Message::Assistant {
+                content: None,
+                name: None,
+                refusal: None,
+                tool_calls: vec![ToolCall {
+                    id: "1".to_string(),
+                    r#type: "function".to_string(),
+                    function: ToolCallFunction {
+                        name: "get_weather".to_string(),
+                        arguments: serde_json::json!({ "city": "Lisbon" }),
+                    },
+                }],
             }],
             vec![Message::Tool {
                 content: text("25 C"),
@@ -2120,19 +2139,39 @@ pub mod tests {
     /// it from inside its loop over the messages, so an empty conversation gets none.
     #[test]
     fn a_hermes3_conversation_is_given_the_templates_system_turn_where_it_writes_one() {
-        let system_turn = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n";
-        for messages in every_trailing_role() {
-            let prompt = messages::messages_to_hermes3_prompt(&messages);
-            let expected = !matches!(messages.first(), None | Some(Message::System { .. }));
-            assert_eq!(
-                prompt.contains(system_turn),
-                expected,
-                "{messages:?} rendered as {prompt:?}"
-            );
-        }
+        let user = || Message::User {
+            content: Some(MessageContent::Text("Hi".to_string())),
+            name: None,
+        };
+        let system = || Message::System {
+            content: Some(MessageContent::Text("Be brief.".to_string())),
+            name: None,
+        };
+
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[user()]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<|im_start|>user\nHi<|im_end|>\n",
+                "<|im_start|>assistant\n",
+            ),
+            "written ahead of the conversation, not anywhere in it"
+        );
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[system(), user()]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nBe brief.<|im_end|>\n",
+                "<|im_start|>user\nHi<|im_end|>\n",
+                "<|im_start|>assistant\n",
+            ),
+            "a system message of the conversation's own is not doubled"
+        );
         assert_eq!(
             messages::messages_to_hermes3_prompt(&[]),
-            "<|begin_of_text|><|im_start|>assistant\n"
+            "<|begin_of_text|><|im_start|>assistant\n",
+            "the template writes its system turn from inside its loop over the messages"
         );
     }
 
@@ -2147,6 +2186,14 @@ pub mod tests {
                 "{messages:?} rendered as {prompt:?}"
             );
         }
+        assert!(
+            messages::messages_to_hermes3_prompt(&[Message::User {
+                content: Some(MessageContent::Text("Hi".to_string())),
+                name: None,
+            }])
+            .contains("<|im_start|>user\nHi<|im_end|>\n"),
+            "the content runs straight into the tag, rather than the tag being absent"
+        );
     }
 
     /// The Hermes 3 template ends in `<|im_start|>assistant` and a newline under its generation
