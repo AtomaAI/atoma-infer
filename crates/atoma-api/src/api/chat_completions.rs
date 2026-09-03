@@ -715,8 +715,14 @@ pub enum StopCondition {
     String(String),
 }
 
+/// What a chat completion request asks for.
+///
+/// Every field the API serves is declared here, and a body carrying one that is not is refused
+/// rather than served as though it were absent: an unserved parameter and a misspelt budget both
+/// change what the caller gets back, and dropping either in silence hides that.
 #[derive(Debug, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename(serialize = "requestBody", deserialize = "requestBody"))]
+#[serde(deny_unknown_fields)]
 pub struct RequestBody {
     /// A list of messages comprising the conversation so far.
     messages: Vec<Message>,
@@ -1197,6 +1203,25 @@ pub mod tests {
         assert!(request.stream);
         assert!(request.prompt.contains("Hello"));
         assert!(request.stop.is_empty());
+    }
+
+    /// A field the API does not declare changes what the caller gets back — a misspelt budget
+    /// lets generation run to the model's own stop — so the body is refused rather than served
+    /// with the field dropped.
+    #[test]
+    fn a_field_the_api_does_not_declare_is_refused_by_name() {
+        let error = serde_json::from_value::<RequestBody>(json!({
+            "model": "meta-llama/Llama-3.2-1B-Instruct",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "max_completion_token": 8
+        }))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `max_completion_token`"),
+            "{error}"
+        );
     }
 
     fn body(fields: serde_json::Value) -> RequestBody {

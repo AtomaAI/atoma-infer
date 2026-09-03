@@ -900,6 +900,29 @@ mod tests {
         served.shutdown();
     }
 
+    /// A misspelt budget is refused by name rather than dropped, which would have served the
+    /// request as though no budget were asked for.
+    #[tokio::test]
+    async fn a_field_the_api_does_not_declare_is_a_400() {
+        let served = serve("a", Duration::from_secs(30));
+        let (status, body) = post(
+            served.router(),
+            completion_body(json!({ "max_completion_token": 8 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown field `max_completion_token`"),
+            "{body}"
+        );
+        served.shutdown();
+    }
+
     /// A body the extractor cannot read is refused like any other: the same envelope under a
     /// request id, rather than the extractor's own status and plain text.
     #[tokio::test]
