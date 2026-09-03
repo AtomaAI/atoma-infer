@@ -271,7 +271,7 @@ impl Message {
 }
 
 pub(crate) mod messages {
-    use super::{Message, Model};
+    use super::{Message, MessageContent, Model};
     use tracing::warn;
 
     /// Function to convert a list of messages to a prompt string in Llama2 format.
@@ -335,7 +335,26 @@ pub(crate) mod messages {
         prompt
     }
 
-    /// Function to convert a list of messages to a prompt string in Llama3 format.
+    /// Writes one Llama 3 role header: the role between its delimiters, then the blank line the
+    /// template puts before a turn's content.
+    fn push_llama3_header(prompt: &mut String, role: &str) {
+        prompt.push_str("<|start_header_id|>");
+        prompt.push_str(role);
+        prompt.push_str("<|end_header_id|>\n\n");
+    }
+
+    /// Writes one Llama 3 turn whose content is text alone: the role header, the content if any,
+    /// and the end-of-turn token.
+    fn push_llama3_turn(prompt: &mut String, role: &str, content: Option<&MessageContent>) {
+        push_llama3_header(prompt, role);
+        if let Some(content) = content {
+            prompt.push_str(&content.to_string());
+        }
+        prompt.push_str("<|eot_id|>");
+    }
+
+    /// Renders a conversation in the Llama 3 chat format, ending in the assistant header so that
+    /// generation starts inside the assistant turn.
     pub(crate) fn messages_to_llama3_prompt(messages: &[Message]) -> String {
         let mut prompt = String::new();
         prompt.push_str("<|begin_of_text|>");
@@ -343,22 +362,18 @@ pub(crate) mod messages {
         for message in messages {
             match message {
                 Message::System { content, name } => {
-                    prompt.push_str("<|start_header_id|>");
-                    prompt.push_str(name.as_deref().unwrap_or("system"));
-                    prompt.push_str("<|end_header_id|>\n\n");
-                    if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
-                    }
-                    prompt.push_str("<|eot_id|>");
+                    push_llama3_turn(
+                        &mut prompt,
+                        name.as_deref().unwrap_or("system"),
+                        content.as_ref(),
+                    );
                 }
                 Message::User { content, name } => {
-                    prompt.push_str("<|start_header_id|>");
-                    prompt.push_str(name.as_deref().unwrap_or("user"));
-                    prompt.push_str("<|end_header_id|>\n\n");
-                    if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
-                    }
-                    prompt.push_str("<|eot_id|>");
+                    push_llama3_turn(
+                        &mut prompt,
+                        name.as_deref().unwrap_or("user"),
+                        content.as_ref(),
+                    );
                 }
                 Message::Assistant {
                     content,
@@ -366,77 +381,82 @@ pub(crate) mod messages {
                     tool_calls,
                     ..
                 } => {
-                    prompt.push_str("<|start_header_id|>");
-                    prompt.push_str(name.as_deref().unwrap_or("assistant"));
-                    prompt.push_str("<|end_header_id|>\n\n");
+                    push_llama3_header(&mut prompt, name.as_deref().unwrap_or("assistant"));
                     if !tool_calls.is_empty() {
-                        prompt.push_str("<|python_tag|>[");
+                        // Every Llama 3 model renders a tool call the same way, so one variant
+                        // stands for the family.
                         let tool_calls_str = tool_calls
                             .iter()
-                            .map(|tc| tc.function_call_string(Model::Llama318bInstruct)) // all llama3 model versions have the same functionality
+                            .map(|tc| tc.function_call_string(Model::Llama318bInstruct))
                             .collect::<Vec<_>>()
                             .join(", ");
+                        prompt.push_str("<|python_tag|>[");
                         prompt.push_str(&tool_calls_str);
-                        prompt.push_str("]<|eot_id|>");
+                        prompt.push(']');
                     } else if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
-                        prompt.push_str("<|eot_id|>");
-                    } else {
-                        // If both content and tool_calls are empty, just add <|eot_id|>
-                        prompt.push_str("<|eot_id|>");
-                    }
-                }
-                Message::Tool {
-                    content,
-                    tool_call_id: _,
-                } => {
-                    prompt.push_str("<|start_header_id|>");
-                    prompt.push_str("ipython");
-                    prompt.push_str("<|end_header_id|>\n\n");
-                    if let Some(content) = content {
                         prompt.push_str(&content.to_string());
                     }
                     prompt.push_str("<|eot_id|>");
                 }
+                Message::Tool {
+                    content,
+                    tool_call_id: _,
+                } => push_llama3_turn(&mut prompt, "ipython", content.as_ref()),
             }
         }
 
+        push_llama3_header(&mut prompt, "assistant");
         prompt
     }
 
-    /// Function to convert a list of messages to a prompt string in Hermes3 format.
+    /// Writes one Hermes 3 role line: the start-of-turn token, the role, and the newline the
+    /// template puts before a turn's content.
+    fn push_hermes3_header(prompt: &mut String, role: &str) {
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+    }
+
+    /// Writes one Hermes 3 turn whose content is text alone: the role line, the content if any,
+    /// and the end-of-turn line.
+    fn push_hermes3_turn(prompt: &mut String, role: &str, content: Option<&MessageContent>) {
+        push_hermes3_header(prompt, role);
+        if let Some(content) = content {
+            prompt.push_str(&content.to_string());
+        }
+        prompt.push_str("\n<|im_end|>\n");
+    }
+
+    /// Renders a conversation in the Hermes 3 chat format: the BOS token its template starts
+    /// with, each turn, and the assistant header so that generation starts inside the assistant
+    /// turn.
     pub(crate) fn messages_to_hermes3_prompt(messages: &[Message]) -> String {
         let mut prompt = String::new();
+        prompt.push_str("<|begin_of_text|>");
 
         for message in messages {
             match message {
                 Message::System { content, .. } => {
-                    prompt.push_str("<|im_start|>system\n");
-                    if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
-                    }
-                    prompt.push_str("\n<|im_end|>\n");
+                    push_hermes3_turn(&mut prompt, "system", content.as_ref());
                 }
                 Message::User { content, .. } => {
-                    prompt.push_str("<|im_start|>user\n");
-                    if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
-                    }
-                    prompt.push_str("\n<|im_end|>\n");
+                    push_hermes3_turn(&mut prompt, "user", content.as_ref());
                 }
                 Message::Assistant {
                     content,
                     tool_calls,
                     ..
                 } => {
-                    prompt.push_str("<|im_start|>assistant\n");
+                    push_hermes3_header(&mut prompt, "assistant");
                     if !tool_calls.is_empty() {
-                        prompt.push_str("<tool_call>");
+                        // Every Hermes 3 model renders a tool call the same way, so one variant
+                        // stands for the family.
                         let tool_calls_str = tool_calls
                             .iter()
-                            .map(|tc| tc.function_call_string(Model::HermesLlama318b)) // all hermes3 model versions have the same functionality
+                            .map(|tc| tc.function_call_string(Model::HermesLlama318b))
                             .collect::<Vec<_>>()
                             .join(", ");
+                        prompt.push_str("<tool_call>");
                         prompt.push_str(&tool_calls_str);
                         prompt.push_str("</tool_call>");
                     } else if let Some(content) = content {
@@ -445,15 +465,12 @@ pub(crate) mod messages {
                     prompt.push_str("\n<|im_end|>\n");
                 }
                 Message::Tool { content, .. } => {
-                    prompt.push_str("<|im_start|>tool\n");
-                    if let Some(content) = content {
-                        prompt.push_str(&content.to_string());
-                    }
-                    prompt.push_str("\n<|im_end|>\n");
+                    push_hermes3_turn(&mut prompt, "tool", content.as_ref());
                 }
             }
         }
 
+        push_hermes3_header(&mut prompt, "assistant");
         prompt
     }
 }
@@ -727,6 +744,10 @@ pub struct RequestBody {
     /// An upper bound for the number of tokens that can be generated for a completion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+    /// The deprecated name for `max_completion_tokens`, and still what most clients send. Read
+    /// when `max_completion_tokens` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     /// How many chat completion choices to generate for each input message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     n: Option<usize>,
@@ -769,66 +790,6 @@ impl RequestBody {
     pub fn model(&self) -> &Model {
         &self.model
     }
-
-    pub fn messages(&self) -> &Vec<Message> {
-        &self.messages
-    }
-
-    pub fn frequency_penalty(&self) -> Option<f32> {
-        self.frequency_penalty
-    }
-
-    pub fn logit_bias(&self) -> Option<HashMap<String, f32>> {
-        self.logit_bias.clone()
-    }
-
-    pub fn logprobs(&self) -> Option<bool> {
-        self.logprobs
-    }
-
-    pub fn top_logprobs(&self) -> Option<i32> {
-        self.top_logprobs
-    }
-
-    pub fn max_completion_tokens(&self) -> Option<u32> {
-        self.max_completion_tokens
-    }
-
-    pub fn n(&self) -> Option<usize> {
-        self.n
-    }
-
-    pub fn presence_penalty(&self) -> Option<f32> {
-        self.presence_penalty
-    }
-
-    pub fn seed(&self) -> Option<u64> {
-        self.seed
-    }
-
-    pub fn stop(&self) -> Option<&StopCondition> {
-        self.stop.as_ref()
-    }
-
-    pub fn stream(&self) -> Option<bool> {
-        self.stream
-    }
-
-    pub fn temperature(&self) -> Option<f32> {
-        self.temperature
-    }
-
-    pub fn top_p(&self) -> Option<f32> {
-        self.top_p
-    }
-
-    pub fn tools(&self) -> Option<&Vec<Tool>> {
-        self.tools.as_ref()
-    }
-
-    pub fn user(&self) -> Option<&String> {
-        self.user.as_ref()
-    }
 }
 
 /// What the engine is asked on a chat completion's behalf, before the prompt is tokenized.
@@ -868,7 +829,9 @@ pub enum Refused {
     #[error("top_p must be between 0 and 1, not {top_p}")]
     TopP { top_p: f32 },
     #[error("max_completion_tokens must be at least 1")]
-    NoCompletionTokens,
+    ZeroCompletionTokens,
+    #[error("max_tokens must be at least 1")]
+    ZeroMaxTokens,
 }
 
 impl RequestBody {
@@ -877,14 +840,16 @@ impl RequestBody {
     /// Sampling is on, as the API's default is the model's own distribution; a temperature of
     /// zero is the request for greedy decoding, honoured by the sampler. `seed` is used when
     /// given and `fresh_seed` otherwise, so an unseeded request is not reproducible by
-    /// accident. `user` is the caller's own identifier and is accepted without being acted on.
+    /// accident. The completion budget is `max_completion_tokens`, or the deprecated
+    /// `max_tokens` when that is absent. `user` is the caller's own identifier and is accepted
+    /// without being acted on.
     ///
     /// # Errors
     ///
     /// Returns [`Refused`] for what the engine does not serve — `logprobs`, `top_logprobs`,
     /// more than one choice, `logit_bias`, `tools`, a non-zero `frequency_penalty` or
     /// `presence_penalty` — and for a temperature outside 0 to 2, a `top_p` outside 0 to 1, or
-    /// a completion budget of zero.
+    /// a completion budget of zero under either of its names.
     pub fn to_engine_request(&self, fresh_seed: u64) -> Result<EngineRequest, Refused> {
         self.refuse_unserved()?;
         Ok(EngineRequest {
@@ -946,10 +911,15 @@ impl RequestBody {
         })
     }
 
+    /// The completion budget the request carries, under whichever name: `max_completion_tokens`
+    /// wins when both are sent. `None` leaves the bound to the room under the max model length.
     fn max_new_tokens(&self) -> Result<Option<TokenCount>, Refused> {
-        self.max_completion_tokens
-            .map(|budget| TokenCount::new(budget as usize).ok_or(Refused::NoCompletionTokens))
-            .transpose()
+        let (budget, refusal) = match (self.max_completion_tokens, self.max_tokens) {
+            (Some(budget), _) => (budget, Refused::ZeroCompletionTokens),
+            (None, Some(budget)) => (budget, Refused::ZeroMaxTokens),
+            (None, None) => return Ok(None),
+        };
+        TokenCount::new(budget as usize).map(Some).ok_or(refusal)
     }
 
     fn stop_strings(&self) -> Vec<String> {
@@ -1277,6 +1247,24 @@ pub mod tests {
         );
     }
 
+    /// `max_tokens` is the deprecated name for the budget and still what most clients send; a
+    /// request carrying it alone is bounded by it rather than served as though no budget were set.
+    #[test]
+    fn a_budget_sent_as_max_tokens_is_applied() {
+        let request = body(json!({ "max_tokens": 8 }))
+            .to_engine_request(1)
+            .unwrap();
+        assert_eq!(request.max_new_tokens, Some(TokenCount::new(8).unwrap()));
+    }
+
+    #[test]
+    fn max_completion_tokens_wins_when_both_budgets_are_sent() {
+        let request = body(json!({ "max_completion_tokens": 3, "max_tokens": 8 }))
+            .to_engine_request(1)
+            .unwrap();
+        assert_eq!(request.max_new_tokens, Some(TokenCount::new(3).unwrap()));
+    }
+
     #[test]
     fn stop_strings_arrive_as_one_or_several() {
         assert_eq!(
@@ -1331,8 +1319,9 @@ pub mod tests {
         );
         assert_eq!(
             refused(json!({ "max_completion_tokens": 0 })),
-            Refused::NoCompletionTokens
+            Refused::ZeroCompletionTokens
         );
+        assert_eq!(refused(json!({ "max_tokens": 0 })), Refused::ZeroMaxTokens);
         assert!(
             refused(json!({ "n": 3 })).to_string().contains("3 choices"),
             "the refusal names what was asked"
@@ -1522,7 +1511,10 @@ pub mod tests {
     fn test_empty_prompt() {
         let messages: Vec<Message> = vec![];
         let result = messages::messages_to_llama3_prompt(&messages);
-        assert_eq!(result, "<|begin_of_text|>");
+        assert_eq!(
+            result,
+            "<|begin_of_text|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
     }
 
     #[test]
@@ -1534,7 +1526,12 @@ pub mod tests {
             name: None,
         }];
         let result = messages::messages_to_llama3_prompt(&messages);
-        let expected = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|>";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|start_header_id|>system<|end_header_id|>\n\n",
+            "You are a helpful assistant.<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        );
         assert_eq!(result, expected);
     }
 
@@ -1545,7 +1542,12 @@ pub mod tests {
             name: None,
         }];
         let result = messages::messages_to_llama3_prompt(&messages);
-        let expected = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello, who are you?<|eot_id|>";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|start_header_id|>user<|end_header_id|>\n\n",
+            "Hello, who are you?<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        );
         assert_eq!(result, expected);
     }
 
@@ -1558,7 +1560,12 @@ pub mod tests {
             tool_calls: vec![],
         }];
         let result = messages::messages_to_llama3_prompt(&messages);
-        let expected = "<|begin_of_text|><|start_header_id|>assistant<|end_header_id|>\n\nI am an AI assistant.<|eot_id|>";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+            "I am an AI assistant.<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        );
         assert_eq!(result, expected);
     }
 
@@ -1569,8 +1576,12 @@ pub mod tests {
             tool_call_id: "get_weather".to_string(),
         }];
         let result = messages::messages_to_llama3_prompt(&messages);
-        let expected =
-            "<|begin_of_text|><|start_header_id|>ipython<|end_header_id|>\n\n25 C<|eot_id|>";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|start_header_id|>ipython<|end_header_id|>\n\n",
+            "25 C<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        );
         assert_eq!(result, expected);
     }
 
@@ -1595,6 +1606,7 @@ pub mod tests {
             "You are a helpful assistant.<|eot_id|>",
             "<|start_header_id|>user<|end_header_id|>\n\n",
             "Hello, who are you?<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
         );
         assert_eq!(result, expected);
     }
@@ -1622,6 +1634,7 @@ pub mod tests {
             "You are a helpful assistant.<|eot_id|>",
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
             "I am an AI assistant.<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
         );
         assert_eq!(result, expected);
     }
@@ -1647,6 +1660,7 @@ pub mod tests {
             "Hello, who are you?<|eot_id|>",
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
             "I am an AI assistant.<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
         );
         assert_eq!(result, expected);
     }
@@ -1713,6 +1727,8 @@ pub mod tests {
             // Assistant's final response
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
             "The weather in San Francisco is 25 C.<|eot_id|>",
+            // The generation header
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
         );
         assert_eq!(result, expected);
     }
@@ -1751,8 +1767,48 @@ pub mod tests {
             "<|begin_of_text|>",
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
             "<|python_tag|>[func1(param1='value1'), func2(param2='value2')]<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
         );
         assert_eq!(result, expected);
+    }
+
+    /// One conversation per trailing role, and the empty one.
+    fn every_trailing_role() -> [Vec<Message>; 5] {
+        let text = |text: &str| Some(MessageContent::Text(text.to_string()));
+        [
+            vec![],
+            vec![Message::System {
+                content: text("Be brief."),
+                name: None,
+            }],
+            vec![Message::User {
+                content: text("Hi"),
+                name: None,
+            }],
+            vec![Message::Assistant {
+                content: text("Hello"),
+                name: None,
+                refusal: None,
+                tool_calls: vec![],
+            }],
+            vec![Message::Tool {
+                content: text("25 C"),
+                tool_call_id: "1".to_string(),
+            }],
+        ]
+    }
+
+    /// Generation starts inside the assistant turn whatever the last message was: without the
+    /// header the model writes one itself, and the role name is decoded and served as content.
+    #[test]
+    fn a_llama3_prompt_ends_in_the_assistant_header_whatever_the_trailing_role() {
+        for messages in every_trailing_role() {
+            let prompt = messages::messages_to_llama3_prompt(&messages);
+            assert!(
+                prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"),
+                "{messages:?} rendered as {prompt:?}"
+            );
+        }
     }
 
     #[test]
@@ -1765,7 +1821,11 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.\n<|im_end|>\n";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1777,7 +1837,10 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>user\nHello, who are you?\n<|im_end|>\n";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>user\nHello, who are you?\n<|im_end|>\n<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1793,7 +1856,11 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>assistant\nI am Hermes 3, a superintelligent AI.\n<|im_end|>\n";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>assistant\nI am Hermes 3, a superintelligent AI.\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1805,7 +1872,10 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>tool\nTool response here.\n<|im_end|>\n";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>tool\nTool response here.\n<|im_end|>\n<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1828,7 +1898,14 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>assistant\n<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, \"name\": \"get_stock_fundamentals\"}</tool_call>\n<|im_end|>\n";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>assistant\n",
+            "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
+            "\"name\": \"get_stock_fundamentals\"}</tool_call>",
+            "\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1857,9 +1934,11 @@ pub mod tests {
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
         let expected = concat!(
+            "<|begin_of_text|>",
             "<|im_start|>system\nYou are Hermes 3, a superintelligent AI.\n<|im_end|>\n",
             "<|im_start|>user\nFetch stock data for TSLA.\n<|im_end|>\n",
-            "<|im_start|>assistant\nFetching stock data...\n<|im_end|>\n"
+            "<|im_start|>assistant\nFetching stock data...\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
     }
@@ -1869,8 +1948,7 @@ pub mod tests {
         let messages: Vec<Message> = vec![];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = ""; // Empty messages should result in an empty prompt
-        assert_eq!(prompt, expected);
+        assert_eq!(prompt, "<|begin_of_text|><|im_start|>assistant\n");
     }
 
     #[test]
@@ -1881,7 +1959,11 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>user\n\n<|im_end|>\n"; // Handle missing content as an empty string
+        // Missing content is an empty string.
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>user\n\n<|im_end|>\n<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1913,7 +1995,15 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>assistant\n<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, \"name\": \"get_stock_fundamentals\"}, {\"arguments\": {\"symbol\": \"BTC\"}, \"name\": \"get_crypto_data\"}</tool_call>\n<|im_end|>\n";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>assistant\n",
+            "<tool_call>{\"arguments\": {\"symbol\": \"TSLA\"}, ",
+            "\"name\": \"get_stock_fundamentals\"}, ",
+            "{\"arguments\": {\"symbol\": \"BTC\"}, \"name\": \"get_crypto_data\"}</tool_call>",
+            "\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1925,7 +2015,10 @@ pub mod tests {
         }];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>tool\nStock data for TSLA\n<|im_end|>\n";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>tool\nStock data for TSLA\n<|im_end|>\n<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
     }
 
@@ -1943,8 +2036,26 @@ pub mod tests {
         ];
 
         let prompt = messages::messages_to_hermes3_prompt(&messages);
-        let expected = "<|im_start|>system\n\n<|im_end|>\n<|im_start|>user\n\n<|im_end|>\n";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|im_start|>system\n\n<|im_end|>\n",
+            "<|im_start|>user\n\n<|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
         assert_eq!(prompt, expected);
+    }
+
+    /// The Hermes 3 template ends in `<|im_start|>assistant` and a newline under its generation
+    /// prompt, so generation starts inside the assistant turn whatever the last message was.
+    #[test]
+    fn a_hermes3_prompt_ends_in_the_assistant_header_whatever_the_trailing_role() {
+        for messages in every_trailing_role() {
+            let prompt = messages::messages_to_hermes3_prompt(&messages);
+            assert!(
+                prompt.ends_with("<|im_start|>assistant\n"),
+                "{messages:?} rendered as {prompt:?}"
+            );
+        }
     }
 
     #[test]

@@ -126,8 +126,12 @@ pub(crate) mod test_support {
     use tokenizers::pre_tokenizers::byte_level::ByteLevel;
     use tokenizers::Tokenizer;
 
+    /// The beginning-of-sequence token, as Llama 3 spells it.
+    pub(crate) const BOS: &str = "<|begin_of_text|>";
+
     /// A byte-level BPE tokenizer over every byte, with a few merges, built from the JSON a
-    /// `tokenizer.json` holds: no file, no Hub.
+    /// `tokenizer.json` holds: no file, no Hub. As the Llama 3 tokenizer does, it carries the BOS
+    /// token and a post-processor that prepends it whenever special tokens are asked for.
     pub(crate) fn tokenizer() -> Arc<Tokenizer> {
         let mut alphabet: Vec<char> = ByteLevel::alphabet().into_iter().collect();
         alphabet.sort_unstable();
@@ -142,10 +146,23 @@ pub(crate) mod test_support {
             let id = u32::try_from(vocab.len()).unwrap();
             vocab.push((merged, id));
         }
+        let bos_id = u32::try_from(vocab.len()).unwrap();
         let vocab: serde_json::Map<String, serde_json::Value> = vocab
             .into_iter()
             .map(|(token, id)| (token, json!(id)))
             .collect();
+        let bos = json!({ "SpecialToken": { "id": BOS, "type_id": 0 } });
+        let post_processor = json!({
+            "type": "TemplateProcessing",
+            "single": [bos, { "Sequence": { "id": "A", "type_id": 0 } }],
+            "pair": [
+                bos,
+                { "Sequence": { "id": "A", "type_id": 0 } },
+                bos,
+                { "Sequence": { "id": "B", "type_id": 1 } }
+            ],
+            "special_tokens": { BOS: { "id": BOS, "ids": [bos_id], "tokens": [BOS] } }
+        });
         let byte_level = json!({
             "type": "ByteLevel",
             "add_prefix_space": false,
@@ -156,10 +173,18 @@ pub(crate) mod test_support {
             "version": "1.0",
             "truncation": null,
             "padding": null,
-            "added_tokens": [],
+            "added_tokens": [{
+                "id": bos_id,
+                "content": BOS,
+                "single_word": false,
+                "lstrip": false,
+                "rstrip": false,
+                "normalized": false,
+                "special": true
+            }],
             "normalizer": null,
             "pre_tokenizer": byte_level,
-            "post_processor": null,
+            "post_processor": post_processor,
             "decoder": byte_level,
             "model": {
                 "type": "BPE",

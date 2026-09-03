@@ -26,7 +26,7 @@ use axum::Router;
 use metrics::gauge;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::json;
-use tokenizers::Tokenizer;
+use tokenizers::{Error as TokenizerError, Tokenizer};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::{signal, task, time};
@@ -423,19 +423,15 @@ async fn submit(
         stream: _,
     } = request;
     let tokenizer = Arc::clone(&state.tokenizer);
-    let prompt_ids = task::spawn_blocking(move || {
-        tokenizer
-            .encode(prompt, true)
-            .map(|encoding| encoding.get_ids().to_vec())
-    })
-    .await
-    .map_err(|join| ApiError::internal(format!("tokenization panicked: {join}"), request_id))?
-    .map_err(|error| {
-        ApiError::internal(
-            format!("the prompt cannot be tokenized: {error}"),
-            request_id,
-        )
-    })?;
+    let prompt_ids = task::spawn_blocking(move || tokenize_prompt(&tokenizer, prompt))
+        .await
+        .map_err(|join| ApiError::internal(format!("tokenization panicked: {join}"), request_id))?
+        .map_err(|error| {
+            ApiError::internal(
+                format!("the prompt cannot be tokenized: {error}"),
+                request_id,
+            )
+        })?;
     let prompt_tokens = prompt_ids.len();
     let max_new_tokens = match max_new_tokens {
         Some(budget) => budget,
@@ -490,6 +486,14 @@ async fn submit(
         receiver,
         Completion::new(identity, detokenizer, prompt_tokens),
     ))
+}
+
+/// The token ids of a templated prompt, with special tokens off: the template writes the BOS
+/// token itself, and the tokenizer's post-processor would prepend a second one.
+fn tokenize_prompt(tokenizer: &Tokenizer, prompt: String) -> Result<Vec<u32>, TokenizerError> {
+    tokenizer
+        .encode(prompt, false)
+        .map(|encoding| encoding.get_ids().to_vec())
 }
 
 /// Reads a request's events until it finishes and answers with the whole completion. Dropping
@@ -548,7 +552,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::test_support::tokenizer;
+    use crate::test_support::{tokenizer, BOS};
 
     const MAX_MODEL_LEN: TokenCount = TokenCount::new(512).expect("nonzero");
     const BLOCK_SIZE: usize = 16;
@@ -731,6 +735,28 @@ mod tests {
         body
     }
 
+    /// The prompt a body renders to, through the same path the handler takes.
+    fn rendered_prompt(body: Value) -> String {
+        serde_json::from_value::<RequestBody>(body)
+            .unwrap()
+            .to_engine_request(0)
+            .unwrap()
+            .prompt
+    }
+
+    /// The template writes the BOS token itself, so the tokenizer must not prepend a second one.
+    #[test]
+    fn a_templated_prompt_tokenizes_to_exactly_one_bos() {
+        let tokenizer = tokenizer();
+        let bos = tokenizer.token_to_id(BOS).unwrap();
+        let hermes = json!({ "model": "NousResearch/Hermes-3-Llama-3.1-8B" });
+        for body in [completion_body(json!({})), completion_body(hermes)] {
+            let ids = tokenize_prompt(&tokenizer, rendered_prompt(body)).unwrap();
+            assert_eq!(ids.first(), Some(&bos), "{ids:?}");
+            assert_eq!(ids.iter().filter(|&&id| id == bos).count(), 1, "{ids:?}");
+        }
+    }
+
     #[tokio::test]
     async fn a_completion_is_served_whole_through_the_engine_and_the_executor() {
         let served = serve("a", Duration::from_secs(30));
@@ -743,14 +769,11 @@ mod tests {
         assert_eq!(body["choices"][0]["message"]["content"], "aaaa");
         assert_eq!(body["choices"][0]["finish_reason"], "length");
         assert_eq!(body["usage"]["completion_tokens"], 4);
-        let prompt_tokens = served
-            .tokenizer
-            .encode("<|begin_of_text|>", true)
-            .unwrap()
-            .get_ids()
-            .len();
-        assert!(
-            body["usage"]["prompt_tokens"].as_u64().unwrap() as usize > prompt_tokens,
+        let prompt = rendered_prompt(completion_body(json!({})));
+        let prompt_tokens = tokenize_prompt(&served.tokenizer, prompt).unwrap().len();
+        assert_eq!(
+            body["usage"]["prompt_tokens"].as_u64().unwrap(),
+            u64::try_from(prompt_tokens).unwrap(),
             "the prompt is the templated conversation: {body}"
         );
         served.shutdown();
@@ -784,6 +807,23 @@ mod tests {
                 .all(|chunk| chunk["choices"][0].get("finish_reason").is_none()),
             "only the last chunk carries the finish: {events:?}"
         );
+        served.shutdown();
+    }
+
+    /// The shape most clients send: the deprecated `max_tokens` and no `max_completion_tokens`.
+    #[tokio::test]
+    async fn a_budget_sent_as_max_tokens_bounds_the_completion() {
+        let served = serve("a", Duration::from_secs(30));
+        let mut body = completion_body(json!({ "max_tokens": 4 }));
+        body.as_object_mut()
+            .unwrap()
+            .remove("max_completion_tokens");
+        let (status, body) = post(served.router(), body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "aaaa");
+        assert_eq!(body["choices"][0]["finish_reason"], "length");
+        assert_eq!(body["usage"]["completion_tokens"], 4);
         served.shutdown();
     }
 
