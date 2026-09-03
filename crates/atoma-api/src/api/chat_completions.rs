@@ -422,10 +422,14 @@ pub(crate) mod messages {
         prompt.push('\n');
     }
 
+    /// The token that ends one Hermes 3 turn.
+    const HERMES3_END_OF_TURN: &str = "<|im_end|>";
+
     /// Closes one Hermes 3 turn. The template writes the end-of-turn token straight after the
     /// turn's content, so nothing separates them.
     fn push_hermes3_end_of_turn(prompt: &mut String) {
-        prompt.push_str("<|im_end|>\n");
+        prompt.push_str(HERMES3_END_OF_TURN);
+        prompt.push('\n');
     }
 
     /// Writes one Hermes 3 turn whose content is text alone: the role line, the content if any,
@@ -460,6 +464,39 @@ pub(crate) mod messages {
         push_hermes3_end_of_turn(prompt);
     }
 
+    /// Whether a message is a tool message, which is what a tool turn's run is made of.
+    fn is_hermes3_tool_message(message: &Message) -> bool {
+        matches!(message, Message::Tool { .. })
+    }
+
+    /// Writes one Hermes 3 tool message as the `tool_use` template does: a `<tool_response>`
+    /// block, with a run of consecutive tool messages sharing one turn.
+    ///
+    /// Two shapes are the template's own. The role line is written only when there is a previous
+    /// message and it is not a tool message, so a conversation opening with a tool message gets
+    /// none. And the end-of-turn token carries no newline, unlike every other role's.
+    fn push_hermes3_tool_response(
+        prompt: &mut String,
+        content: Option<&MessageContent>,
+        previous: Option<&Message>,
+        next: Option<&Message>,
+    ) {
+        if previous.is_some_and(|previous| !is_hermes3_tool_message(previous)) {
+            push_hermes3_header(prompt, "tool");
+        }
+        prompt.push_str("<tool_response>\n");
+        if let Some(content) = content {
+            prompt.push_str(&content.to_string());
+        }
+        prompt.push_str("\n</tool_response>");
+        if next.is_some() {
+            prompt.push('\n');
+        }
+        if !next.is_some_and(is_hermes3_tool_message) {
+            prompt.push_str(HERMES3_END_OF_TURN);
+        }
+    }
+
     /// The system turn the Hermes 3 template writes ahead of a conversation that does not open
     /// with one of its own.
     const HERMES3_DEFAULT_SYSTEM_TURN: &str =
@@ -480,7 +517,7 @@ pub(crate) mod messages {
             prompt.push_str(HERMES3_DEFAULT_SYSTEM_TURN);
         }
 
-        for message in messages {
+        for (index, message) in messages.iter().enumerate() {
             match message {
                 Message::System { content, .. } => {
                     push_hermes3_turn(&mut prompt, "system", content.as_ref());
@@ -500,7 +537,12 @@ pub(crate) mod messages {
                     }
                 }
                 Message::Tool { content, .. } => {
-                    push_hermes3_turn(&mut prompt, "tool", content.as_ref());
+                    push_hermes3_tool_response(
+                        &mut prompt,
+                        content.as_ref(),
+                        messages[..index].last(),
+                        messages.get(index + 1),
+                    );
                 }
             }
         }
@@ -2006,7 +2048,8 @@ pub mod tests {
         let expected = concat!(
             "<|begin_of_text|>",
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
-            "<|im_start|>tool\nTool response here.<|im_end|>\n<|im_start|>assistant\n",
+            "<tool_response>\nTool response here.\n</tool_response><|im_end|>",
+            "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
     }
@@ -2248,9 +2291,91 @@ pub mod tests {
         let expected = concat!(
             "<|begin_of_text|>",
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
-            "<|im_start|>tool\nStock data for TSLA<|im_end|>\n<|im_start|>assistant\n",
+            "<tool_response>\nStock data for TSLA\n</tool_response><|im_end|>",
+            "<|im_start|>assistant\n",
         );
         assert_eq!(prompt, expected);
+    }
+
+    /// The `tool_use` template frames a tool message in `<tool_response>` tags rather than writing
+    /// its content as a turn. The role line comes from the previous message, so a conversation
+    /// opening with a tool message gets none.
+    #[test]
+    fn a_hermes3_tool_message_is_framed_as_a_tool_response_block() {
+        let user = || Message::User {
+            content: Some(MessageContent::Text("Weather?".to_string())),
+            name: None,
+        };
+        let tool = || Message::Tool {
+            content: Some(MessageContent::Text("25 C".to_string())),
+            tool_call_id: "1".to_string(),
+        };
+
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[user(), tool()]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<|im_start|>user\nWeather?<|im_end|>\n",
+                "<|im_start|>tool\n<tool_response>\n25 C\n</tool_response><|im_end|>",
+                "<|im_start|>assistant\n",
+            ),
+            "a tool message after a message of another role opens a turn of its own"
+        );
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[tool(), user()]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<tool_response>\n25 C\n</tool_response>\n<|im_end|>",
+                "<|im_start|>user\nWeather?<|im_end|>\n",
+                "<|im_start|>assistant\n",
+            ),
+            "a tool message with nothing before it is written no role line, and the turn it never \
+             opened is closed all the same"
+        );
+    }
+
+    /// A run of consecutive tool messages is one turn: one role line, one block per message, one
+    /// end-of-turn token.
+    #[test]
+    fn consecutive_hermes3_tool_messages_are_one_turn() {
+        let user = || Message::User {
+            content: Some(MessageContent::Text("Weather?".to_string())),
+            name: None,
+        };
+        let tool = |content: &str| Message::Tool {
+            content: Some(MessageContent::Text(content.to_string())),
+            tool_call_id: "1".to_string(),
+        };
+
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[user(), tool("25 C"), tool("Cloudy")]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<|im_start|>user\nWeather?<|im_end|>\n",
+                "<|im_start|>tool\n",
+                "<tool_response>\n25 C\n</tool_response>\n",
+                "<tool_response>\nCloudy\n</tool_response>",
+                "<|im_end|>",
+                "<|im_start|>assistant\n",
+            ),
+            "two responses, one turn"
+        );
+        assert_eq!(
+            messages::messages_to_hermes3_prompt(&[tool("25 C"), tool("Cloudy"), user()]),
+            concat!(
+                "<|begin_of_text|>",
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                "<tool_response>\n25 C\n</tool_response>\n",
+                "<tool_response>\nCloudy\n</tool_response>\n",
+                "<|im_end|>",
+                "<|im_start|>user\nWeather?<|im_end|>\n",
+                "<|im_start|>assistant\n",
+            ),
+            "the run ends where the tool messages do, whatever follows"
+        );
     }
 
     #[test]
@@ -2319,6 +2444,9 @@ pub mod tests {
 
     /// The template writes `<|im_end|>` straight after a turn's content. The builder wrote a
     /// newline between the two, so every turn carried a token the model's own template does not.
+    ///
+    /// A tool run that something follows is the template's one exception, and no conversation
+    /// here ends in one.
     #[test]
     fn a_hermes3_turn_ends_in_the_end_of_turn_token_with_nothing_before_it() {
         for messages in every_trailing_role() {
