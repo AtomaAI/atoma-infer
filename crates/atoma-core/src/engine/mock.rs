@@ -1,9 +1,6 @@
 //! A mock executor for tests: the far side of the rings, answering every step command with one
 //! chosen token per sampling entry. No device, no thread of its own unless a test gives it one.
 
-use std::thread;
-use std::time::Duration;
-
 use crate::engine::ExecutorRings;
 use crate::step::{CommandEntry, StepCommand, StepResult};
 
@@ -63,12 +60,12 @@ impl MockExecutor {
         self.rings.engine_gone()
     }
 
-    /// Serves commands as they come until the engine is gone, polling between them. For tests
+    /// Serves commands as they come until the engine is gone, parking between them. For tests
     /// that give the mock a thread of its own.
     pub(crate) fn run_until_engine_gone(mut self) {
         while !self.engine_gone() {
             if !self.serve_one() {
-                thread::sleep(Duration::from_micros(200));
+                self.rings.park();
             }
         }
     }
