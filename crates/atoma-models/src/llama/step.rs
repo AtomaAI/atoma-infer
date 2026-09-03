@@ -28,9 +28,10 @@ use crate::attention::{
 };
 use crate::dims::LlamaDims;
 use crate::gemm::{GemmError, GemmShape, StepBlas};
-use crate::kernels::{DecodeKernelError, DecodeKernels, RotaryTensors};
+use crate::kernels::{DecodeKernels, RotaryTensors};
 use crate::layer::{LayerOp, Role, RoleRef, LLAMA_LAYER};
 use crate::llama::slots::{BucketSlots, LlamaCache, LlamaWeights, SlotError};
+use crate::operand::OperandError;
 
 /// Why the step could not be built or enqueued.
 #[derive(Debug, Error)]
@@ -38,7 +39,7 @@ pub enum StepError {
     #[error(transparent)]
     Slot(#[from] SlotError),
     #[error(transparent)]
-    Kernel(#[from] DecodeKernelError),
+    Operand(#[from] OperandError),
     #[error(transparent)]
     Attention(#[from] AttentionError),
     #[error(transparent)]

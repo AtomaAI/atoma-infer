@@ -14,6 +14,7 @@
 //! | [`attention`] | Paged decode attention: the per-bucket plan and the calls it assembles |
 //! | [`gemm`] | The step's multiplications, through a cuBLAS handle bound to the capture stream |
 //! | [`kernels`] | The step's own kernels, each call assembled from checked tensor views |
+//! | [`operand`] | Holding an operand to the dtype, rank, contiguity and shape it must have |
 //! | [`rope`] | The rotary embedding's cosine and sine tables, computed on the host once |
 
 pub mod attention;
@@ -22,4 +23,5 @@ pub mod gemm;
 pub mod kernels;
 pub mod layer;
 pub mod llama;
+pub mod operand;
 pub mod rope;

@@ -13,89 +13,18 @@
 //! residual add writes the row after it, which the final norm then reads, and whose `Normed`
 //! slot the head projection reads.
 
-use std::fmt;
-
 use atoma_runtime::arena::{BucketIdx, CaptureArena, LayerIdx};
-use atoma_runtime::tensor::{Dtype, Tensor, TensorError, MAX_RANK};
+use atoma_runtime::tensor::{Dtype, Tensor, TensorError};
 use thiserror::Error;
 
 use crate::attention::{cache_halves, AttentionError, AttentionPlan, CacheHalves};
 use crate::dims::LlamaDims;
 use crate::kernels::RotaryTensors;
 use crate::layer::{LayerOffset, LayerWeight, QkvColumns, Role, RoleRef};
+use crate::operand::{self, Operand, OperandError};
 
 /// The activations' element type: every arena slot is read and written as bf16.
 const ACTIVATION: Dtype = Dtype::Bf16;
-
-/// A shape, for refusals that show both the one held and the one needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Shape {
-    dims: [usize; MAX_RANK],
-    rank: usize,
-}
-
-impl Shape {
-    /// The shape `dims`; dimensions past the rank a layout holds are dropped.
-    #[must_use]
-    pub fn new(dims: &[usize]) -> Self {
-        let mut shape = Self {
-            dims: [0; MAX_RANK],
-            rank: dims.len().min(MAX_RANK),
-        };
-        shape.dims[..shape.rank].copy_from_slice(&dims[..shape.rank]);
-        shape
-    }
-
-    /// The shape of `tensor`.
-    #[must_use]
-    pub fn of(tensor: &Tensor) -> Self {
-        Self::new(tensor.dims())
-    }
-
-    #[must_use]
-    pub fn dims(&self) -> &[usize] {
-        &self.dims[..self.rank]
-    }
-}
-
-impl fmt::Display for Shape {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.dims())
-    }
-}
-
-/// Which tensor a refusal is about: a model-level one, or one of a layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Operand {
-    pub what: &'static str,
-    pub layer: Option<usize>,
-}
-
-impl Operand {
-    /// A tensor the model has one of.
-    #[must_use]
-    pub const fn model(what: &'static str) -> Self {
-        Self { what, layer: None }
-    }
-
-    /// A tensor each layer has one of.
-    #[must_use]
-    pub const fn layer(layer: usize, what: &'static str) -> Self {
-        Self {
-            what,
-            layer: Some(layer),
-        }
-    }
-}
-
-impl fmt::Display for Operand {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.layer {
-            Some(layer) => write!(f, "layer {layer}'s {}", self.what),
-            None => f.write_str(self.what),
-        }
-    }
-}
 
 /// Why a table could not be resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -115,34 +44,13 @@ pub enum SlotError {
         slot_bytes: usize,
         view_bytes: usize,
     },
-    #[error("{operand} is {dtype:?}, not {expected:?}")]
-    Dtype {
-        operand: Operand,
-        dtype: Dtype,
-        expected: Dtype,
-    },
-    #[error("{operand} is {shape}, not {expected}")]
-    Shape {
-        operand: Operand,
-        shape: Shape,
-        expected: Shape,
-    },
-    #[error("{operand} has strides {strides:?}; it must be one contiguous buffer")]
-    NotContiguous {
-        operand: Operand,
-        strides: [usize; MAX_RANK],
-    },
+    #[error(transparent)]
+    Operand(#[from] OperandError),
     #[error("{what} covers {count} layers; the model has {expected}")]
     LayerCount {
         what: &'static str,
         count: usize,
         expected: usize,
-    },
-    #[error("{operand} holds {len} rows; the bucket reads {needed}")]
-    StaticTooShort {
-        operand: Operand,
-        len: usize,
-        needed: usize,
     },
     #[error("the attention plan is for {plan} sequences; the bucket serves {tokens} tokens")]
     PlanBucket { plan: usize, tokens: usize },
@@ -263,7 +171,7 @@ impl ActivationSlots {
                 dtype: memory.dtype(),
             });
         }
-        contiguous(Operand::model("the arena memory"), memory)?;
+        operand::contiguous(Operand::model("the arena memory"), memory.layout())?;
         let held = memory.extent_bytes();
         if held < arena.total_size() {
             return Err(SlotError::ArenaTooSmall {
@@ -631,46 +539,23 @@ impl BucketSlots {
     }
 }
 
-/// Holds `tensor` to being one unbroken row-major buffer.
-fn contiguous(operand: Operand, tensor: &Tensor) -> Result<(), SlotError> {
-    if tensor.is_contiguous() {
-        return Ok(());
-    }
-    let mut strides = [0; MAX_RANK];
-    for (slot, &stride) in strides.iter_mut().zip(tensor.strides()) {
-        *slot = stride;
-    }
-    Err(SlotError::NotContiguous { operand, strides })
+/// A bf16 weight of exactly `shape`.
+fn weight(operand: Operand, tensor: &Tensor, shape: &[usize]) -> Result<(), SlotError> {
+    exact(operand, tensor, Dtype::Bf16, shape)
 }
 
-/// Holds `tensor` to `dtype`, contiguity and exactly `shape`.
+/// A contiguous tensor of `dtype` and exactly `shape`.
 fn exact(
     operand: Operand,
     tensor: &Tensor,
     dtype: Dtype,
     shape: &[usize],
 ) -> Result<(), SlotError> {
-    if tensor.dtype() != dtype {
-        return Err(SlotError::Dtype {
-            operand,
-            dtype: tensor.dtype(),
-            expected: dtype,
-        });
-    }
-    contiguous(operand, tensor)?;
-    if tensor.dims() != shape {
-        return Err(SlotError::Shape {
-            operand,
-            shape: Shape::of(tensor),
-            expected: Shape::new(shape),
-        });
-    }
+    let layout = tensor.layout();
+    operand::dtype(operand, layout, dtype)?;
+    operand::contiguous(operand, layout)?;
+    operand::shape(operand, layout, shape)?;
     Ok(())
-}
-
-/// A bf16 weight of exactly `shape`.
-fn weight(operand: Operand, tensor: &Tensor, shape: &[usize]) -> Result<(), SlotError> {
-    exact(operand, tensor, Dtype::Bf16, shape)
 }
 
 /// A model-level static of exactly `shape`.
@@ -703,30 +588,21 @@ fn leading_rows(
     columns: usize,
 ) -> Result<Tensor, SlotError> {
     let operand = Operand::model(what);
-    if tensor.dtype() != dtype {
-        return Err(SlotError::Dtype {
-            operand,
-            dtype: tensor.dtype(),
-            expected: dtype,
-        });
-    }
-    contiguous(operand, tensor)?;
-    let held = tensor.dims().first().copied().unwrap_or(0);
-    let expected_rank = if columns == 0 { 1 } else { 2 };
-    if tensor.rank() != expected_rank || (columns != 0 && tensor.dim(1) != columns) {
-        let expected = [held, columns];
-        return Err(SlotError::Shape {
-            operand,
-            shape: Shape::of(tensor),
-            expected: Shape::new(&expected[..expected_rank]),
-        });
+    let layout = tensor.layout();
+    operand::dtype(operand, layout, dtype)?;
+    operand::contiguous(operand, layout)?;
+    operand::rank(operand, layout, if columns == 0 { 1 } else { 2 })?;
+    let held = layout.dim(0);
+    if columns != 0 {
+        operand::shape(operand, layout, &[held, columns])?;
     }
     if held < rows {
-        return Err(SlotError::StaticTooShort {
+        return Err(OperandError::TooShort {
             operand,
             len: held,
             needed: rows,
-        });
+        }
+        .into());
     }
     Ok(tensor.narrow(0, 0, rows)?)
 }
@@ -739,6 +615,7 @@ mod tests {
     use super::*;
     use crate::dims::test_support::llama_8b;
     use crate::layer::LLAMA_LAYER;
+    use crate::operand::Shape;
 
     const LAYERS: usize = 2;
     const LADDER: [usize; 2] = [1, 8];
@@ -951,11 +828,11 @@ mod tests {
 
         assert_eq!(
             refused,
-            SlotError::Shape {
+            SlotError::Operand(OperandError::Shape {
                 operand: Operand::layer(1, "key projection"),
                 shape: Shape::new(&[4096, 4096]),
                 expected: Shape::new(&[1024, 4096])
-            }
+            })
         );
         assert_eq!(
             refused.to_string(),
@@ -970,11 +847,11 @@ mod tests {
         table.final_norm = view(0x4000_0000, &[dims.hidden], Dtype::F16);
         assert_eq!(
             table.check(&dims).unwrap_err(),
-            SlotError::Dtype {
+            SlotError::Operand(OperandError::Dtype {
                 operand: Operand::model("the final norm gain"),
                 dtype: Dtype::F16,
                 expected: Dtype::Bf16
-            }
+            })
         );
 
         let mut table = weights(&dims);
@@ -1097,27 +974,27 @@ mod tests {
 
         assert_eq!(
             BucketStatics::resolve(&statics, &plan(8), &dims).unwrap_err(),
-            SlotError::StaticTooShort {
+            SlotError::Operand(OperandError::TooShort {
                 operand: Operand::model("the positions"),
                 len: 4,
                 needed: 8
-            }
+            })
         );
     }
 
     #[test]
-    fn a_scalar_static_is_refused_by_shape_rather_than_indexed() {
+    fn a_scalar_static_is_refused_by_rank_rather_than_indexed() {
         let dims = dims();
         let mut statics = statics(&dims);
         statics.seqlens_k = view(0x7002_0000, &[], Dtype::I32);
 
         assert_eq!(
             BucketStatics::resolve(&statics, &plan(8), &dims).unwrap_err(),
-            SlotError::Shape {
+            SlotError::Operand(OperandError::Rank {
                 operand: Operand::model("the key lengths"),
-                shape: Shape::new(&[]),
-                expected: Shape::new(&[0])
-            }
+                rank: 0,
+                expected: 1
+            })
         );
     }
 
@@ -1129,11 +1006,11 @@ mod tests {
 
         assert_eq!(
             BucketStatics::resolve(&statics, &plan(8), &dims).unwrap_err(),
-            SlotError::Shape {
+            SlotError::Operand(OperandError::Shape {
                 operand: Operand::model("the block table"),
                 shape: Shape::new(&[8, 16]),
                 expected: Shape::new(&[8, BLOCK_COLUMNS])
-            }
+            })
         );
     }
 

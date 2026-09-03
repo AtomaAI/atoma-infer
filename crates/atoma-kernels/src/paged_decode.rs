@@ -171,29 +171,14 @@ impl KvWriteCall {
 }
 
 #[cfg(feature = "cuda")]
-mod real {
+mod compiled {
     use core::ffi::{c_int, c_void};
     use std::f32::consts::LOG2_E;
     use std::ptr;
 
     use super::{DecodeAttentionCall, KvWriteCall, SEQLEN_Q_ROUNDED};
-    use crate::error::KernelError;
+    use crate::error::{arg32, arg_i64, arg_int, KernelError};
     use crate::ffi;
-
-    /// A kernel argument that must fit the FFI's 32-bit parameter.
-    fn arg32(argument: &'static str, value: usize) -> Result<u32, KernelError> {
-        u32::try_from(value).map_err(|_| KernelError::ArgumentOverflow { argument, value })
-    }
-
-    /// A kernel argument that must fit the FFI's signed 32-bit parameter.
-    fn arg_int(argument: &'static str, value: usize) -> Result<c_int, KernelError> {
-        c_int::try_from(value).map_err(|_| KernelError::ArgumentOverflow { argument, value })
-    }
-
-    /// A kernel argument that must fit the FFI's signed 64-bit parameter.
-    fn arg_i64(argument: &'static str, value: usize) -> Result<i64, KernelError> {
-        i64::try_from(value).map_err(|_| KernelError::ArgumentOverflow { argument, value })
-    }
 
     /// Enqueues the paged decode attention kernel on `call.stream`.
     ///
@@ -309,7 +294,7 @@ mod real {
 }
 
 #[cfg(feature = "cuda")]
-pub use real::{decode_attention, write_kv};
+pub use compiled::{decode_attention, write_kv};
 
 /// Named refusal: this build carries no kernels.
 ///

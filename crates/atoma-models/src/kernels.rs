@@ -12,45 +12,9 @@ use core::ffi::c_void;
 
 use atoma_kernels::decode_ops::{AddCall, EmbeddingGatherCall, RmsNormCall, RopeCall, SiluMulCall};
 use atoma_runtime::tensor::{Dtype, Tensor};
-use thiserror::Error;
 
 use crate::dims::LlamaDims;
-
-/// Why a kernel call could not be assembled from its operands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum DecodeKernelError {
-    #[error("{operand} is {dtype:?}; the kernel reads {expected:?}")]
-    OperandDtype {
-        operand: &'static str,
-        dtype: Dtype,
-        expected: Dtype,
-    },
-    #[error("{operand} is rank {rank}; the kernel indexes rank {expected}")]
-    OperandRank {
-        operand: &'static str,
-        rank: usize,
-        expected: usize,
-    },
-    #[error("{operand} has strides {strides:?}; the kernel reads one unbroken row-major buffer")]
-    OperandNotContiguous {
-        operand: &'static str,
-        strides: [usize; 4],
-    },
-    #[error("{operand} holds {len} elements, not {expected}")]
-    OperandLength {
-        operand: &'static str,
-        len: usize,
-        expected: usize,
-    },
-    #[error("{operand} is {rows} by {columns}, not {expected_rows} by {expected_columns}")]
-    OperandShape {
-        operand: &'static str,
-        rows: usize,
-        columns: usize,
-        expected_rows: usize,
-        expected_columns: usize,
-    },
-}
+use crate::operand::{matrix, rows, vector, vector_len, Operand, OperandError};
 
 /// The rotary embedding's tables on the device, f32 `[max_position, head_dim / 2]` each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,25 +39,35 @@ impl DecodeKernels {
     ///
     /// # Errors
     ///
-    /// Returns [`DecodeKernelError`] when the table is not the vocabulary by the hidden size,
-    /// the token ids are not a u32 vector, or the output is not one hidden row per token.
+    /// Returns [`OperandError`] when the table is not the vocabulary by the hidden size, the
+    /// token ids are not a u32 vector, or the output is not one hidden row per token.
     pub fn embedding_gather(
         &self,
         table: &Tensor,
         token_ids: &Tensor,
         out: &Tensor,
         stream: *mut c_void,
-    ) -> Result<EmbeddingGatherCall, DecodeKernelError> {
+    ) -> Result<EmbeddingGatherCall, OperandError> {
         let hidden = self.dims.hidden;
         matrix(
-            "the embedding table",
-            table,
+            Operand::model("the embedding table"),
+            table.layout(),
             Dtype::Bf16,
             self.dims.vocab,
             hidden,
         )?;
-        let tokens = vector_len("the token ids", token_ids, Dtype::U32)?;
-        matrix("the gathered rows", out, Dtype::Bf16, tokens, hidden)?;
+        let tokens = vector_len(
+            Operand::model("the token ids"),
+            token_ids.layout(),
+            Dtype::U32,
+        )?;
+        matrix(
+            Operand::model("the gathered rows"),
+            out.layout(),
+            Dtype::Bf16,
+            tokens,
+            hidden,
+        )?;
         Ok(EmbeddingGatherCall {
             table: table.address(),
             token_ids: token_ids.address(),
@@ -109,7 +83,7 @@ impl DecodeKernels {
     ///
     /// # Errors
     ///
-    /// Returns [`DecodeKernelError`] when the rows are not the hidden width, the gain is not one
+    /// Returns [`OperandError`] when the rows are not the hidden width, the gain is not one
     /// hidden vector, or the output is not the rows' shape.
     pub fn rmsnorm(
         &self,
@@ -117,11 +91,27 @@ impl DecodeKernels {
         gain: &Tensor,
         out: &Tensor,
         stream: *mut c_void,
-    ) -> Result<RmsNormCall, DecodeKernelError> {
+    ) -> Result<RmsNormCall, OperandError> {
         let hidden = self.dims.hidden;
-        let tokens = rows("the input rows", x, Dtype::Bf16, hidden)?;
-        vector("the gain", gain, Dtype::Bf16, hidden)?;
-        matrix("the normalized rows", out, Dtype::Bf16, tokens, hidden)?;
+        let tokens = rows(
+            Operand::model("the input rows"),
+            x.layout(),
+            Dtype::Bf16,
+            hidden,
+        )?;
+        vector(
+            Operand::model("the gain"),
+            gain.layout(),
+            Dtype::Bf16,
+            hidden,
+        )?;
+        matrix(
+            Operand::model("the normalized rows"),
+            out.layout(),
+            Dtype::Bf16,
+            tokens,
+            hidden,
+        )?;
         Ok(RmsNormCall {
             x: x.address(),
             gain: gain.address(),
@@ -138,30 +128,39 @@ impl DecodeKernels {
     ///
     /// # Errors
     ///
-    /// Returns [`DecodeKernelError`] when the rows are not the fused width, the positions are
-    /// not one i32 per row, or a table does not cover every position with one f32 per rotary
-    /// pair.
+    /// Returns [`OperandError`] when the rows are not the fused width, the positions are not one
+    /// i32 per row, or a table does not cover every position with one f32 per rotary pair.
     pub fn rope(
         &self,
         qkv: &Tensor,
         positions: &Tensor,
         tables: &RotaryTensors,
         stream: *mut c_void,
-    ) -> Result<RopeCall, DecodeKernelError> {
+    ) -> Result<RopeCall, OperandError> {
         let dims = &self.dims;
-        let tokens = rows("the fused rows", qkv, Dtype::Bf16, dims.qkv_width())?;
-        vector("the positions", positions, Dtype::I32, tokens)?;
+        let tokens = rows(
+            Operand::model("the fused rows"),
+            qkv.layout(),
+            Dtype::Bf16,
+            dims.qkv_width(),
+        )?;
+        vector(
+            Operand::model("the positions"),
+            positions.layout(),
+            Dtype::I32,
+            tokens,
+        )?;
         let (max_position, pairs) = (dims.rope.max_position, dims.head_dim / 2);
         matrix(
-            "the cosine table",
-            &tables.cos,
+            Operand::model("the cosine table"),
+            tables.cos.layout(),
             Dtype::F32,
             max_position,
             pairs,
         )?;
         matrix(
-            "the sine table",
-            &tables.sin,
+            Operand::model("the sine table"),
+            tables.sin.layout(),
             Dtype::F32,
             max_position,
             pairs,
@@ -183,19 +182,31 @@ impl DecodeKernels {
     ///
     /// # Errors
     ///
-    /// Returns [`DecodeKernelError`] when an operand is not one feed-forward row per token, or
-    /// the three do not hold the same number of rows.
+    /// Returns [`OperandError`] when an operand is not one feed-forward row per token, or the
+    /// three do not hold the same number of rows.
     pub fn silu_mul(
         &self,
         gate: &Tensor,
         up: &Tensor,
         out: &Tensor,
         stream: *mut c_void,
-    ) -> Result<SiluMulCall, DecodeKernelError> {
+    ) -> Result<SiluMulCall, OperandError> {
         let ffn = self.dims.ffn;
-        let tokens = rows("the gate", gate, Dtype::Bf16, ffn)?;
-        matrix("the up projection", up, Dtype::Bf16, tokens, ffn)?;
-        matrix("the activation", out, Dtype::Bf16, tokens, ffn)?;
+        let tokens = rows(Operand::model("the gate"), gate.layout(), Dtype::Bf16, ffn)?;
+        matrix(
+            Operand::model("the up projection"),
+            up.layout(),
+            Dtype::Bf16,
+            tokens,
+            ffn,
+        )?;
+        matrix(
+            Operand::model("the activation"),
+            out.layout(),
+            Dtype::Bf16,
+            tokens,
+            ffn,
+        )?;
         Ok(SiluMulCall {
             gate: gate.address(),
             up: up.address(),
@@ -209,19 +220,36 @@ impl DecodeKernels {
     ///
     /// # Errors
     ///
-    /// Returns [`DecodeKernelError`] when an operand is not one hidden row per token, or the
-    /// three do not hold the same number of rows.
+    /// Returns [`OperandError`] when an operand is not one hidden row per token, or the three do
+    /// not hold the same number of rows.
     pub fn add(
         &self,
         residual: &Tensor,
         delta: &Tensor,
         out: &Tensor,
         stream: *mut c_void,
-    ) -> Result<AddCall, DecodeKernelError> {
+    ) -> Result<AddCall, OperandError> {
         let hidden = self.dims.hidden;
-        let tokens = rows("the residual", residual, Dtype::Bf16, hidden)?;
-        matrix("the delta", delta, Dtype::Bf16, tokens, hidden)?;
-        matrix("the sum", out, Dtype::Bf16, tokens, hidden)?;
+        let tokens = rows(
+            Operand::model("the residual"),
+            residual.layout(),
+            Dtype::Bf16,
+            hidden,
+        )?;
+        matrix(
+            Operand::model("the delta"),
+            delta.layout(),
+            Dtype::Bf16,
+            tokens,
+            hidden,
+        )?;
+        matrix(
+            Operand::model("the sum"),
+            out.layout(),
+            Dtype::Bf16,
+            tokens,
+            hidden,
+        )?;
         Ok(AddCall {
             lhs: residual.address(),
             rhs: delta.address(),
@@ -232,108 +260,6 @@ impl DecodeKernels {
     }
 }
 
-/// Holds `tensor` to `dtype`, `rank` and contiguity, the three things every kernel assumes.
-fn layout(
-    operand: &'static str,
-    tensor: &Tensor,
-    dtype: Dtype,
-    rank: usize,
-) -> Result<(), DecodeKernelError> {
-    if tensor.dtype() != dtype {
-        return Err(DecodeKernelError::OperandDtype {
-            operand,
-            dtype: tensor.dtype(),
-            expected: dtype,
-        });
-    }
-    if tensor.rank() != rank {
-        return Err(DecodeKernelError::OperandRank {
-            operand,
-            rank: tensor.rank(),
-            expected: rank,
-        });
-    }
-    if !tensor.is_contiguous() {
-        let mut strides = [0; 4];
-        for (slot, &stride) in strides.iter_mut().zip(tensor.strides()) {
-            *slot = stride;
-        }
-        return Err(DecodeKernelError::OperandNotContiguous { operand, strides });
-    }
-    Ok(())
-}
-
-/// A contiguous `[rows, columns]` operand of `dtype` whose row count is the batch's to say;
-/// returns it.
-fn rows(
-    operand: &'static str,
-    tensor: &Tensor,
-    dtype: Dtype,
-    columns: usize,
-) -> Result<usize, DecodeKernelError> {
-    layout(operand, tensor, dtype, 2)?;
-    let tokens = tensor.dim(0);
-    if tensor.dim(1) != columns {
-        return Err(DecodeKernelError::OperandShape {
-            operand,
-            rows: tokens,
-            columns: tensor.dim(1),
-            expected_rows: tokens,
-            expected_columns: columns,
-        });
-    }
-    Ok(tokens)
-}
-
-/// A contiguous `[rows, columns]` operand of `dtype`, both dimensions fixed.
-fn matrix(
-    operand: &'static str,
-    tensor: &Tensor,
-    dtype: Dtype,
-    rows: usize,
-    columns: usize,
-) -> Result<(), DecodeKernelError> {
-    layout(operand, tensor, dtype, 2)?;
-    if tensor.dim(0) != rows || tensor.dim(1) != columns {
-        return Err(DecodeKernelError::OperandShape {
-            operand,
-            rows: tensor.dim(0),
-            columns: tensor.dim(1),
-            expected_rows: rows,
-            expected_columns: columns,
-        });
-    }
-    Ok(())
-}
-
-/// A contiguous vector of `dtype`; returns its length.
-fn vector_len(
-    operand: &'static str,
-    tensor: &Tensor,
-    dtype: Dtype,
-) -> Result<usize, DecodeKernelError> {
-    layout(operand, tensor, dtype, 1)?;
-    Ok(tensor.dim(0))
-}
-
-/// A contiguous vector of `dtype` holding `len` elements.
-fn vector(
-    operand: &'static str,
-    tensor: &Tensor,
-    dtype: Dtype,
-    len: usize,
-) -> Result<(), DecodeKernelError> {
-    let held = vector_len(operand, tensor, dtype)?;
-    if held != len {
-        return Err(DecodeKernelError::OperandLength {
-            operand,
-            len: held,
-            expected: len,
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use core::ptr;
@@ -342,6 +268,7 @@ mod tests {
 
     use super::*;
     use crate::dims::test_support::llama_8b;
+    use crate::operand::Shape;
 
     const TOKENS: usize = 8;
 
@@ -393,8 +320,8 @@ mod tests {
 
         assert_eq!(
             refused,
-            DecodeKernelError::OperandDtype {
-                operand: "the token ids",
+            OperandError::Dtype {
+                operand: Operand::model("the token ids"),
                 dtype: Dtype::I64,
                 expected: Dtype::U32
             }
@@ -414,12 +341,10 @@ mod tests {
             kernels()
                 .embedding_gather(&table, &ids, &out, ptr::null_mut())
                 .unwrap_err(),
-            DecodeKernelError::OperandShape {
-                operand: "the embedding table",
-                rows: 32_000,
-                columns: dims.hidden,
-                expected_rows: dims.vocab,
-                expected_columns: dims.hidden
+            OperandError::Shape {
+                operand: Operand::model("the embedding table"),
+                shape: Shape::new(&[32_000, dims.hidden]),
+                expected: Shape::new(&[dims.vocab, dims.hidden])
             }
         );
     }
@@ -452,8 +377,8 @@ mod tests {
             kernels()
                 .rmsnorm(&x, &gain, &out, ptr::null_mut())
                 .unwrap_err(),
-            DecodeKernelError::OperandRank {
-                operand: "the gain",
+            OperandError::Rank {
+                operand: Operand::model("the gain"),
                 rank: 2,
                 expected: 1
             }
@@ -471,12 +396,10 @@ mod tests {
             kernels()
                 .rmsnorm(&x, &gain, &out, ptr::null_mut())
                 .unwrap_err(),
-            DecodeKernelError::OperandShape {
-                operand: "the normalized rows",
-                rows: TOKENS - 1,
-                columns: dims.hidden,
-                expected_rows: TOKENS,
-                expected_columns: dims.hidden
+            OperandError::Shape {
+                operand: Operand::model("the normalized rows"),
+                shape: Shape::new(&[TOKENS - 1, dims.hidden]),
+                expected: Shape::new(&[TOKENS, dims.hidden])
             }
         );
     }
@@ -515,8 +438,8 @@ mod tests {
 
         assert_eq!(
             refused,
-            DecodeKernelError::OperandNotContiguous {
-                operand: "the fused rows",
+            OperandError::NotContiguous {
+                operand: Operand::model("the fused rows"),
                 strides: [dims.qkv_width(), 1, 0, 0]
             }
         );
@@ -533,8 +456,8 @@ mod tests {
             kernels()
                 .rope(&qkv, &positions, &tables(&dims), ptr::null_mut())
                 .unwrap_err(),
-            DecodeKernelError::OperandLength {
-                operand: "the positions",
+            OperandError::Length {
+                operand: Operand::model("the positions"),
                 len: TOKENS - 2,
                 expected: TOKENS
             }
@@ -553,12 +476,10 @@ mod tests {
             kernels()
                 .rope(&qkv, &positions, &tables, ptr::null_mut())
                 .unwrap_err(),
-            DecodeKernelError::OperandShape {
-                operand: "the sine table",
-                rows: 4096,
-                columns: 64,
-                expected_rows: dims.rope.max_position,
-                expected_columns: 64
+            OperandError::Shape {
+                operand: Operand::model("the sine table"),
+                shape: Shape::new(&[4096, 64]),
+                expected: Shape::new(&[dims.rope.max_position, 64])
             }
         );
     }
@@ -591,12 +512,10 @@ mod tests {
             kernels()
                 .silu_mul(&gate, &up, &out, ptr::null_mut())
                 .unwrap_err(),
-            DecodeKernelError::OperandShape {
-                operand: "the up projection",
-                rows: TOKENS,
-                columns: dims.hidden,
-                expected_rows: TOKENS,
-                expected_columns: dims.ffn
+            OperandError::Shape {
+                operand: Operand::model("the up projection"),
+                shape: Shape::new(&[TOKENS, dims.hidden]),
+                expected: Shape::new(&[TOKENS, dims.ffn])
             }
         );
     }
@@ -629,8 +548,8 @@ mod tests {
             kernels()
                 .add(&residual, &delta, &out, ptr::null_mut())
                 .unwrap_err(),
-            DecodeKernelError::OperandDtype {
-                operand: "the delta",
+            OperandError::Dtype {
+                operand: Operand::model("the delta"),
                 dtype: Dtype::F32,
                 expected: Dtype::Bf16
             }

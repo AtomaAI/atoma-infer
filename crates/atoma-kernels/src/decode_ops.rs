@@ -85,17 +85,12 @@ pub struct AddCall {
 }
 
 #[cfg(feature = "cuda")]
-mod real {
+mod compiled {
     use core::ffi::c_void;
 
     use super::{AddCall, EmbeddingGatherCall, RmsNormCall, RopeCall, SiluMulCall};
-    use crate::error::KernelError;
+    use crate::error::{arg_i64, KernelError};
     use crate::ffi;
-
-    /// A count that must fit the FFI's 64-bit parameter.
-    fn count(argument: &'static str, value: usize) -> Result<i64, KernelError> {
-        i64::try_from(value).map_err(|_| KernelError::ArgumentOverflow { argument, value })
-    }
 
     /// # Safety
     /// Every address in `call` must be live on the stream's device and match its documented
@@ -107,8 +102,8 @@ mod real {
                 call.table as *const c_void,
                 call.token_ids as *const c_void,
                 call.out as *mut c_void,
-                count("hidden", call.hidden)?,
-                count("n_tokens", call.n_tokens)?,
+                arg_i64("hidden", call.hidden)?,
+                arg_i64("n_tokens", call.n_tokens)?,
                 call.stream,
             )
         };
@@ -125,8 +120,8 @@ mod real {
                 call.x as *const c_void,
                 call.gain as *const c_void,
                 call.out as *mut c_void,
-                count("hidden", call.hidden)?,
-                count("n_tokens", call.n_tokens)?,
+                arg_i64("hidden", call.hidden)?,
+                arg_i64("n_tokens", call.n_tokens)?,
                 call.eps,
                 call.stream,
             )
@@ -145,10 +140,10 @@ mod real {
                 call.positions as *const c_void,
                 call.cos_table as *const c_void,
                 call.sin_table as *const c_void,
-                count("n_tokens", call.n_tokens)?,
-                count("rot_heads", call.rot_heads)?,
-                count("head_dim", call.head_dim)?,
-                count("row_width", call.row_width)?,
+                arg_i64("n_tokens", call.n_tokens)?,
+                arg_i64("rot_heads", call.rot_heads)?,
+                arg_i64("head_dim", call.head_dim)?,
+                arg_i64("row_width", call.row_width)?,
                 call.stream,
             )
         };
@@ -164,7 +159,7 @@ mod real {
                 call.gate as *const c_void,
                 call.up as *const c_void,
                 call.out as *mut c_void,
-                count("len", call.len)?,
+                arg_i64("len", call.len)?,
                 call.stream,
             )
         };
@@ -180,7 +175,7 @@ mod real {
                 call.lhs as *const c_void,
                 call.rhs as *const c_void,
                 call.out as *mut c_void,
-                count("len", call.len)?,
+                arg_i64("len", call.len)?,
                 call.stream,
             )
         };
@@ -189,7 +184,7 @@ mod real {
 }
 
 #[cfg(feature = "cuda")]
-pub use real::{add, embedding_gather, rmsnorm, rope, silu_mul};
+pub use compiled::{add, embedding_gather, rmsnorm, rope, silu_mul};
 
 /// Named refusal: this build carries no kernels.
 ///

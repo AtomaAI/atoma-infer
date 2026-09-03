@@ -18,6 +18,8 @@ use cudarc::cublas::{result as cublas, sys};
 use cudarc::driver::{CudaSlice, DevicePtr};
 use thiserror::Error;
 
+use crate::operand::{self, Operand, OperandError};
+
 /// Bytes of workspace the handle is given. cuBLAS documents 32 MiB as the size that lets Hopper
 /// choose among all its kernels; it is allocated once, before any capture.
 pub const WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
@@ -25,13 +27,8 @@ pub const WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 /// Why a multiplication could not be shaped or enqueued.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GemmError {
-    #[error("{operand} is rank {rank}, not a matrix")]
-    NotAMatrix { operand: &'static str, rank: usize },
-    #[error("{operand} has inner stride {stride}; its last dimension must be contiguous")]
-    InnerStride {
-        operand: &'static str,
-        stride: usize,
-    },
+    #[error(transparent)]
+    Operand(#[from] OperandError),
     #[error("the weight's {weight_in} input features are not the activations' {input_in}")]
     InputMismatch { weight_in: usize, input_in: usize },
     #[error("the output is {rows} by {columns}, not {tokens} by {out_features}")]
@@ -41,8 +38,6 @@ pub enum GemmError {
         tokens: usize,
         out_features: usize,
     },
-    #[error("{operand} is {dtype:?}; the multiplication takes bf16 operands")]
-    OperandDtype { operand: &'static str, dtype: Dtype },
     #[error("the output is {dtype:?}; it must be bf16 or f32")]
     OutputDtype { dtype: Dtype },
     #[error("{what} of {value} does not fit the dimension cuBLAS takes")]
@@ -94,24 +89,12 @@ impl GemmShape {
     /// hold the result, or a dtype is not one the multiplication takes.
     pub fn x_wt(x: &Layout, w: &Layout, y: &Layout) -> Result<Self, GemmError> {
         for (operand, layout) in [("the activations", x), ("the weight", w), ("the output", y)] {
-            if layout.rank() != 2 {
-                return Err(GemmError::NotAMatrix {
-                    operand,
-                    rank: layout.rank(),
-                });
-            }
-            let stride = layout.stride(1);
-            if stride != 1 {
-                return Err(GemmError::InnerStride { operand, stride });
-            }
+            let operand = Operand::model(operand);
+            operand::rank(operand, layout, 2)?;
+            operand::inner_contiguous(operand, layout)?;
         }
         for (operand, layout) in [("the activations", x), ("the weight", w)] {
-            if layout.dtype() != Dtype::Bf16 {
-                return Err(GemmError::OperandDtype {
-                    operand,
-                    dtype: layout.dtype(),
-                });
-            }
+            operand::dtype(Operand::model(operand), layout, Dtype::Bf16)?;
         }
         let output_dtype = y.dtype();
         if !matches!(output_dtype, Dtype::Bf16 | Dtype::F32) {
@@ -356,10 +339,11 @@ mod tests {
 
         assert_eq!(
             GemmShape::x_wt(&x, &w, &y).unwrap_err(),
-            GemmError::OperandDtype {
-                operand: "the activations",
-                dtype: Dtype::F32
-            }
+            GemmError::Operand(OperandError::Dtype {
+                operand: Operand::model("the activations"),
+                dtype: Dtype::F32,
+                expected: Dtype::Bf16
+            })
         );
     }
 
@@ -402,19 +386,20 @@ mod tests {
         let vector = rows(&[4096], Dtype::Bf16);
         assert_eq!(
             GemmShape::x_wt(&vector, &w, &x).unwrap_err(),
-            GemmError::NotAMatrix {
-                operand: "the activations",
-                rank: 1
-            }
+            GemmError::Operand(OperandError::Rank {
+                operand: Operand::model("the activations"),
+                rank: 1,
+                expected: 2
+            })
         );
 
         let gapped = Layout::strided(&[8, 4096], &[8192, 2], Dtype::Bf16).unwrap();
         assert_eq!(
             GemmShape::x_wt(&gapped, &w, &x).unwrap_err(),
-            GemmError::InnerStride {
-                operand: "the activations",
+            GemmError::Operand(OperandError::InnerStride {
+                operand: Operand::model("the activations"),
                 stride: 2
-            }
+            })
         );
     }
 

@@ -84,6 +84,27 @@ impl KernelError {
     }
 }
 
+/// A kernel argument that must fit the FFI's 32-bit parameter.
+#[cfg(feature = "cuda")]
+pub(crate) fn arg32(argument: &'static str, value: usize) -> Result<u32, KernelError> {
+    u32::try_from(value).map_err(|_| KernelError::ArgumentOverflow { argument, value })
+}
+
+/// A kernel argument that must fit the FFI's signed 32-bit parameter.
+#[cfg(feature = "cuda")]
+pub(crate) fn arg_int(
+    argument: &'static str,
+    value: usize,
+) -> Result<core::ffi::c_int, KernelError> {
+    core::ffi::c_int::try_from(value).map_err(|_| KernelError::ArgumentOverflow { argument, value })
+}
+
+/// A kernel argument that must fit the FFI's signed 64-bit parameter.
+#[cfg(feature = "cuda")]
+pub(crate) fn arg_i64(argument: &'static str, value: usize) -> Result<i64, KernelError> {
+    i64::try_from(value).map_err(|_| KernelError::ArgumentOverflow { argument, value })
+}
+
 impl From<KernelError> for Error {
     fn from(error: KernelError) -> Self {
         Self::wrap(error)

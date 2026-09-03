@@ -22,6 +22,7 @@ use atoma_runtime::tensor::{Dtype, Tensor};
 use thiserror::Error;
 
 use crate::dims::LlamaDims;
+use crate::operand::{self, Operand, OperandError};
 
 /// f32 is what the split kernel accumulates in.
 const ACCUMULATOR: Dtype = Dtype::F32;
@@ -39,16 +40,8 @@ pub enum AttentionError {
     CacheShape { rank: usize, dims: [usize; 4] },
     #[error("the cache holds {kv_width} key-value elements per slot, not the model's {expected}")]
     CacheWidth { kv_width: usize, expected: usize },
-    #[error("{operand} is {dtype:?}; the decode step runs bf16")]
-    OperandDtype { operand: &'static str, dtype: Dtype },
-    #[error("{operand} is {rows} by {columns}, not {expected_rows} by {expected_columns}")]
-    OperandShape {
-        operand: &'static str,
-        rows: usize,
-        columns: usize,
-        expected_rows: usize,
-        expected_columns: usize,
-    },
+    #[error(transparent)]
+    Operand(#[from] OperandError),
     #[error("a batch of {batch} sequences does not fill the plan's bucket of {bucket}")]
     BatchNotBucket { batch: usize, bucket: usize },
 }
@@ -175,12 +168,7 @@ pub fn cache_halves(cache: &Tensor, dims: &LlamaDims) -> Result<CacheHalves, Att
             dims,
         });
     }
-    if cache.dtype() != Dtype::Bf16 {
-        return Err(AttentionError::OperandDtype {
-            operand: "the cache",
-            dtype: cache.dtype(),
-        });
-    }
+    operand::dtype(Operand::model("the cache"), cache.layout(), Dtype::Bf16)?;
     let kv_width = cache.dim(3);
     if kv_width != dims.kv_width() {
         return Err(AttentionError::CacheWidth {
@@ -292,22 +280,12 @@ pub fn kv_write_call(
     dims: &LlamaDims,
     stream: *mut c_void,
 ) -> Result<KvWriteCall, AttentionError> {
-    if qkv.dtype() != Dtype::Bf16 {
-        return Err(AttentionError::OperandDtype {
-            operand: "the activations",
-            dtype: qkv.dtype(),
-        });
-    }
-    let tokens = qkv.dim(0);
-    if qkv.dim(1) != dims.qkv_width() {
-        return Err(AttentionError::OperandShape {
-            operand: "the activations",
-            rows: tokens,
-            columns: qkv.dim(1),
-            expected_rows: tokens,
-            expected_columns: dims.qkv_width(),
-        });
-    }
+    let tokens = operand::rows(
+        Operand::model("the activations"),
+        qkv.layout(),
+        Dtype::Bf16,
+        dims.qkv_width(),
+    )?;
     let k_source = qkv
         .narrow(1, dims.q_width(), dims.kv_width())
         .expect("the key heads follow the query heads in the fused row");
@@ -356,12 +334,7 @@ fn check(
         ),
         ("the split output accumulator", tensors.o_accum, Dtype::F32),
     ] {
-        if tensor.dtype() != dtype {
-            return Err(AttentionError::OperandDtype {
-                operand,
-                dtype: tensor.dtype(),
-            });
-        }
+        operand::dtype(Operand::model(operand), tensor.layout(), dtype)?;
     }
     for (operand, tensor, expected_columns) in [
         ("the activations", tensors.qkv, dims.qkv_width()),
@@ -372,15 +345,11 @@ fn check(
             plan.max_blocks_per_seq,
         ),
     ] {
-        if tensor.dim(0) != batch || tensor.dim(1) != expected_columns {
-            return Err(AttentionError::OperandShape {
-                operand,
-                rows: tensor.dim(0),
-                columns: tensor.dim(1),
-                expected_rows: batch,
-                expected_columns,
-            });
-        }
+        operand::shape(
+            Operand::model(operand),
+            tensor.layout(),
+            &[batch, expected_columns],
+        )?;
     }
     Ok(())
 }
@@ -393,6 +362,7 @@ mod tests {
 
     use super::*;
     use crate::dims::test_support::llama_8b;
+    use crate::operand::Shape;
 
     const PAGE_BLOCK: usize = 16;
     const BLOCKS: usize = 4096;
@@ -598,13 +568,11 @@ mod tests {
 
         assert_eq!(
             refused,
-            AttentionError::OperandShape {
-                operand: "the block table",
-                rows: BUCKET,
-                columns: 8,
-                expected_rows: BUCKET,
-                expected_columns: BLOCK_COLUMNS
-            }
+            AttentionError::Operand(OperandError::Shape {
+                operand: Operand::model("the block table"),
+                shape: Shape::new(&[BUCKET, 8]),
+                expected: Shape::new(&[BUCKET, BLOCK_COLUMNS])
+            })
         );
     }
 
@@ -638,13 +606,11 @@ mod tests {
 
         assert_eq!(
             kv_write_call(&narrow, &halves, &slot_mapping, &dims, ptr::null_mut()).unwrap_err(),
-            AttentionError::OperandShape {
-                operand: "the activations",
-                rows: BUCKET,
-                columns: dims.q_width(),
-                expected_rows: BUCKET,
-                expected_columns: dims.qkv_width()
-            }
+            AttentionError::Operand(OperandError::Shape {
+                operand: Operand::model("the activations"),
+                shape: Shape::new(&[BUCKET, dims.q_width()]),
+                expected: Shape::new(&[BUCKET, dims.qkv_width()])
+            })
         );
     }
 }
