@@ -343,7 +343,8 @@ pub(crate) mod messages {
         prompt.push_str("<|end_header_id|>\n\n");
     }
 
-    /// Function to convert a list of messages to a prompt string in Llama3 format.
+    /// Renders a conversation in the Llama 3 chat format, ending in the assistant header so that
+    /// generation starts inside the assistant turn.
     pub(crate) fn messages_to_llama3_prompt(messages: &[Message]) -> String {
         let mut prompt = String::new();
         prompt.push_str("<|begin_of_text|>");
@@ -401,6 +402,7 @@ pub(crate) mod messages {
             }
         }
 
+        push_llama3_header(&mut prompt, "assistant");
         prompt
     }
 
@@ -1522,7 +1524,10 @@ pub mod tests {
     fn test_empty_prompt() {
         let messages: Vec<Message> = vec![];
         let result = messages::messages_to_llama3_prompt(&messages);
-        assert_eq!(result, "<|begin_of_text|>");
+        assert_eq!(
+            result,
+            "<|begin_of_text|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
     }
 
     #[test]
@@ -1534,7 +1539,12 @@ pub mod tests {
             name: None,
         }];
         let result = messages::messages_to_llama3_prompt(&messages);
-        let expected = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|>";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|start_header_id|>system<|end_header_id|>\n\n",
+            "You are a helpful assistant.<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        );
         assert_eq!(result, expected);
     }
 
@@ -1545,7 +1555,12 @@ pub mod tests {
             name: None,
         }];
         let result = messages::messages_to_llama3_prompt(&messages);
-        let expected = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello, who are you?<|eot_id|>";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|start_header_id|>user<|end_header_id|>\n\n",
+            "Hello, who are you?<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        );
         assert_eq!(result, expected);
     }
 
@@ -1558,7 +1573,12 @@ pub mod tests {
             tool_calls: vec![],
         }];
         let result = messages::messages_to_llama3_prompt(&messages);
-        let expected = "<|begin_of_text|><|start_header_id|>assistant<|end_header_id|>\n\nI am an AI assistant.<|eot_id|>";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+            "I am an AI assistant.<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        );
         assert_eq!(result, expected);
     }
 
@@ -1569,8 +1589,12 @@ pub mod tests {
             tool_call_id: "get_weather".to_string(),
         }];
         let result = messages::messages_to_llama3_prompt(&messages);
-        let expected =
-            "<|begin_of_text|><|start_header_id|>ipython<|end_header_id|>\n\n25 C<|eot_id|>";
+        let expected = concat!(
+            "<|begin_of_text|>",
+            "<|start_header_id|>ipython<|end_header_id|>\n\n",
+            "25 C<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        );
         assert_eq!(result, expected);
     }
 
@@ -1595,6 +1619,7 @@ pub mod tests {
             "You are a helpful assistant.<|eot_id|>",
             "<|start_header_id|>user<|end_header_id|>\n\n",
             "Hello, who are you?<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
         );
         assert_eq!(result, expected);
     }
@@ -1622,6 +1647,7 @@ pub mod tests {
             "You are a helpful assistant.<|eot_id|>",
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
             "I am an AI assistant.<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
         );
         assert_eq!(result, expected);
     }
@@ -1647,6 +1673,7 @@ pub mod tests {
             "Hello, who are you?<|eot_id|>",
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
             "I am an AI assistant.<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
         );
         assert_eq!(result, expected);
     }
@@ -1713,6 +1740,8 @@ pub mod tests {
             // Assistant's final response
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
             "The weather in San Francisco is 25 C.<|eot_id|>",
+            // The generation header
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
         );
         assert_eq!(result, expected);
     }
@@ -1751,8 +1780,44 @@ pub mod tests {
             "<|begin_of_text|>",
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
             "<|python_tag|>[func1(param1='value1'), func2(param2='value2')]<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
         );
         assert_eq!(result, expected);
+    }
+
+    /// Generation starts inside the assistant turn whatever the last message was: without the
+    /// header the model writes one itself, and the role name is decoded and served as content.
+    #[test]
+    fn a_llama3_prompt_ends_in_the_assistant_header_whatever_the_trailing_role() {
+        let text = |text: &str| Some(MessageContent::Text(text.to_string()));
+        let conversations = [
+            vec![],
+            vec![Message::System {
+                content: text("Be brief."),
+                name: None,
+            }],
+            vec![Message::User {
+                content: text("Hi"),
+                name: None,
+            }],
+            vec![Message::Assistant {
+                content: text("Hello"),
+                name: None,
+                refusal: None,
+                tool_calls: vec![],
+            }],
+            vec![Message::Tool {
+                content: text("25 C"),
+                tool_call_id: "1".to_string(),
+            }],
+        ];
+        for messages in conversations {
+            let prompt = messages::messages_to_llama3_prompt(&messages);
+            assert!(
+                prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"),
+                "{messages:?} rendered as {prompt:?}"
+            );
+        }
     }
 
     #[test]
