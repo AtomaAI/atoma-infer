@@ -4,7 +4,11 @@
 //! KV cache, records the step under capture to show the driver accepts it, then runs decode steps
 //! of varying ids, lengths and block tables through both forwards and compares their logits: the
 //! argmax of every live row must agree, and the largest absolute difference is reported against a
-//! bound. Around every keyed step the device's free memory is read, and it must not change: the
+//! bound. Every row also goes through candle alone, so the run measures what candle's own logits
+//! do when nothing changes but the live batch it is computed in; that spread is the floor the
+//! step is read against, and it is printed beside the step's.
+//!
+//! Around every keyed step the device's free memory is read, and it must not change: the
 //! session captures in relaxed mode, where an allocation from the capturing thread is legal, so
 //! the recording alone does not prove the step allocates nothing, and a lazy allocation that
 //! stays is what the free-memory check catches.
@@ -304,6 +308,24 @@ struct Parity {
     rows: usize,
     argmax_disagreements: usize,
     max_abs_diff: f32,
+    sum_abs_diff: f64,
+    /// The same rows through candle alone against candle in the live batch.
+    candle_max_abs_diff: f32,
+    candle_sum_abs_diff: f64,
+}
+
+impl Parity {
+    fn mean_abs_diff(&self) -> f64 {
+        self.sum_abs_diff / self.row_count()
+    }
+
+    fn candle_mean_abs_diff(&self) -> f64 {
+        self.candle_sum_abs_diff / self.row_count()
+    }
+
+    fn row_count(&self) -> f64 {
+        f64::from(u32::try_from(self.rows).expect("a row count fits"))
+    }
 }
 
 /// Both forwards over the sequences under test, and what comparing them has found so far.
@@ -315,7 +337,10 @@ struct Harness {
 }
 
 /// Runs one decode step over `chosen` through both forwards and compares them row by row, then
-/// advances each chosen sequence by the token candle sampled.
+/// advances each chosen sequence by the token candle sampled. Every chosen sequence also decodes
+/// alone on candle, which measures candle against itself over the same row; the live batch runs
+/// last, so what the cache holds at the end of the step is what it held before this measurement
+/// was taken.
 fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
     let Harness {
         forward,
@@ -345,6 +370,21 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
         "step {step}: the decode step left {} bytes allocated",
         free_before.abs_diff(free_after)
     );
+    let alone: Vec<Vec<f32>> = live
+        .iter()
+        .map(|&(index, sequence)| {
+            let command = StepCommand {
+                step: StepId::new(500 + step as u64),
+                entries: vec![sequence.entry(index, vec![sequence.next_token()])],
+                padding_count: 0,
+                dispatch: eager(),
+            };
+            let logits = forward
+                .forward(&lay_out(&command))
+                .expect("the one-entry step runs on candle");
+            logits.row(0).expect("row").to_vec()
+        })
+        .collect();
     let candle_logits = forward
         .forward(&lay_out(&on_candle))
         .expect("the eager step runs on candle");
@@ -368,12 +408,12 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
                 candle_row[theirs_at]
             );
         }
-        let diff = tensor_row
-            .iter()
-            .zip(candle_row)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+        let diff = widest(tensor_row, candle_row);
         parity.max_abs_diff = parity.max_abs_diff.max(diff);
+        parity.sum_abs_diff += f64::from(diff);
+        let candle_diff = widest(&alone[row], candle_row);
+        parity.candle_max_abs_diff = parity.candle_max_abs_diff.max(candle_diff);
+        parity.candle_sum_abs_diff += f64::from(candle_diff);
         parity.rows += 1;
         sampled.push(theirs);
     }
@@ -450,7 +490,11 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     println!("rows compared:        {}", parity.rows);
     println!("argmax disagreements: {}", parity.argmax_disagreements);
     println!("max |logit diff|:     {:.6}", parity.max_abs_diff);
+    println!("mean |logit diff|:    {:.6}", parity.mean_abs_diff());
     println!("bound:                {bound}");
+    println!("candle alone against candle in the live batch:");
+    println!("  max |logit diff|:   {:.6}", parity.candle_max_abs_diff);
+    println!("  mean |logit diff|:  {:.6}", parity.candle_mean_abs_diff());
     println!("capture graph nodes:  {nodes}");
     assert_eq!(
         parity.argmax_disagreements, 0,
@@ -461,6 +505,14 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
         "the largest logit difference {} is above the bound {bound}",
         parity.max_abs_diff
     );
+}
+
+/// The largest absolute difference between two logits rows.
+fn widest(row: &[f32], other: &[f32]) -> f32 {
+    row.iter()
+        .zip(other)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max)
 }
 
 /// A token id as an index into a logits row.
