@@ -335,6 +335,14 @@ pub(crate) mod messages {
         prompt
     }
 
+    /// Writes one Llama 3 role header: the role between its delimiters, then the blank line the
+    /// template puts before a turn's content.
+    fn push_llama3_header(prompt: &mut String, role: &str) {
+        prompt.push_str("<|start_header_id|>");
+        prompt.push_str(role);
+        prompt.push_str("<|end_header_id|>\n\n");
+    }
+
     /// Function to convert a list of messages to a prompt string in Llama3 format.
     pub(crate) fn messages_to_llama3_prompt(messages: &[Message]) -> String {
         let mut prompt = String::new();
@@ -343,18 +351,14 @@ pub(crate) mod messages {
         for message in messages {
             match message {
                 Message::System { content, name } => {
-                    prompt.push_str("<|start_header_id|>");
-                    prompt.push_str(name.as_deref().unwrap_or("system"));
-                    prompt.push_str("<|end_header_id|>\n\n");
+                    push_llama3_header(&mut prompt, name.as_deref().unwrap_or("system"));
                     if let Some(content) = content {
                         prompt.push_str(&content.to_string());
                     }
                     prompt.push_str("<|eot_id|>");
                 }
                 Message::User { content, name } => {
-                    prompt.push_str("<|start_header_id|>");
-                    prompt.push_str(name.as_deref().unwrap_or("user"));
-                    prompt.push_str("<|end_header_id|>\n\n");
+                    push_llama3_header(&mut prompt, name.as_deref().unwrap_or("user"));
                     if let Some(content) = content {
                         prompt.push_str(&content.to_string());
                     }
@@ -366,9 +370,7 @@ pub(crate) mod messages {
                     tool_calls,
                     ..
                 } => {
-                    prompt.push_str("<|start_header_id|>");
-                    prompt.push_str(name.as_deref().unwrap_or("assistant"));
-                    prompt.push_str("<|end_header_id|>\n\n");
+                    push_llama3_header(&mut prompt, name.as_deref().unwrap_or("assistant"));
                     if !tool_calls.is_empty() {
                         prompt.push_str("<|python_tag|>[");
                         let tool_calls_str = tool_calls
@@ -390,9 +392,7 @@ pub(crate) mod messages {
                     content,
                     tool_call_id: _,
                 } => {
-                    prompt.push_str("<|start_header_id|>");
-                    prompt.push_str("ipython");
-                    prompt.push_str("<|end_header_id|>\n\n");
+                    push_llama3_header(&mut prompt, "ipython");
                     if let Some(content) = content {
                         prompt.push_str(&content.to_string());
                     }
