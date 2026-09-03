@@ -7,6 +7,8 @@
 //! executor being lost, and the cause is logged and returned from the thread.
 
 mod fanout;
+#[cfg(feature = "cuda")]
+mod spawn;
 mod thread;
 
 use std::sync::Arc;
@@ -18,6 +20,8 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 pub use fanout::{feed, Follower, FollowerFeed, FollowerRings};
+#[cfg(feature = "cuda")]
+pub use spawn::{spawn_ranks, StartupError};
 pub use thread::{launch, spawn, wait_all, Cause, ExecutorThread, Launched, SpawnError};
 
 use crate::batch::{BatchLayout, LayoutError};

@@ -424,16 +424,10 @@ impl FlashAttention {
                 output.slice_set(&out, 0, 0)?;
             } else {
                 // We support prefix enabled attention, in which a block table is provided.
-                let sequence_lengths = if let Some(sequence_lengths) =
-                    prefill_metadata.sequence_lengths.as_ref()
-                {
-                    sequence_lengths
-                } else {
-                    candle_core::bail!("Missing sequence lengths tensor for prefill inference, with prefix enabled attention")
-                };
-                // The worker builds every length tensor as u32; reading this one as i64 made the
-                // prefix-enabled prefill path fail the moment anything reached it.
-                let max_sequence_length_k = sequence_lengths.max(0)?.to_scalar::<u32>()? as usize;
+                // The longest key sequence is the longest prefill sequence, which the caller
+                // computed on the host; reading it off the device here would be a synchronous
+                // copy on every prefill step.
+                let max_sequence_length_k = prefill_metadata.max_prefill_sequence_length;
                 let query_start_locations = if let Some(query_start_locations) =
                     prefill_metadata.query_start_locations.as_ref()
                 {

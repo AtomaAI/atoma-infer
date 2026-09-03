@@ -7,9 +7,13 @@
 
 pub mod batch;
 pub mod config;
+#[cfg(feature = "cuda")]
+pub mod device;
 pub mod executor;
 pub mod forward;
 pub mod logits;
+pub mod model;
+pub mod readback;
 pub mod sampler;
 
 #[cfg(test)]
