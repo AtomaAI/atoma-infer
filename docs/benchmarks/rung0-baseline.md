@@ -1,10 +1,20 @@
 # Rung-0 baseline — protocol and procedure
 
-**Status: not yet measured.** The harness that produces the table landed with PR-4
-([#164](https://github.com/AtomaAI/atoma-infer/issues/164)); the numbers land when it is run on the
-rung-0 H100 stint. The table itself lives in
-[rung0-baseline-table.md](rung0-baseline-table.md), which the harness overwrites — this file is
-hand-written and is not touched by any run.
+**Status: measured on 2026-09-03**, on one H100 PCIe 80GB, both engines serving
+`NousResearch/Meta-Llama-3.1-8B-Instruct`. One table per workload, both written by the harness:
+
+| Workload | Table | Artifact |
+|---|---|---|
+| ShareGPT-derived, 500 requests at 8 req/s | [rung0-baseline-table.md](rung0-baseline-table.md) | [rung0-baseline-sharegpt.json](rung0-baseline-sharegpt.json) |
+| Long-context, 8k input tokens, 150 requests at 0.5 req/s | [rung0-baseline-table-long-context.md](rung0-baseline-table-long-context.md) | [rung0-baseline-long-context.json](rung0-baseline-long-context.json) |
+
+This file is hand-written and is not touched by any run.
+
+Both engines were given the same KV budget and the same batch limits, so the tables compare engines
+rather than memory splits: vLLM's defaults chose 463,040 KV tokens, 128 sequences per step and an
+8192-token step budget on this host, and `atoma-infer` was configured to match. `atoma-infer` served
+every run eagerly — replaying captured graphs is not yet wired into its serving path — so these are
+the numbers for an engine that runs each step from scratch.
 
 The table is the rung-0 exit evidence for [the ladder](../plan/README.md#3-the-ladder):
 *"atoma-vs-vLLM baseline table exists. No performance bar — the number is the deliverable."* There
@@ -64,5 +74,23 @@ than appearing in a log line nobody reads. An engine configured without a `metri
 no gauge to sample; its runs are measured but not guarded, and `compare` refuses to publish a table
 from them.
 
-Requirements on the host: the rung's GPU, Docker with the NVIDIA runtime, the ShareGPT dump, and a
-Hugging Face token (`HF_TOKEN`, forwarded to the container by name) for the model's weights.
+Requirements on the host: the rung's GPU, Docker with the NVIDIA runtime, the ShareGPT dump, and
+the model's weights. Gated weights need a Hugging Face token (`HF_TOKEN`, forwarded to the
+container by name); the rung-0 runs used an ungated mirror and needed none.
+
+Set `engine.version` rather than leaving it to be read from git when the host's checkout is not the
+tree that built the binary — a host synced by `rsync` or unpacked from an archive records whatever
+commit its `.git` happens to hold.
+
+## Choosing the offered rate
+
+The protocol fixes the arrival process, not the rate. Both rates above were chosen by measuring
+where the engines stop keeping up, because goodput at a fixed SLO only discriminates below that
+point:
+
+- **ShareGPT at 8 req/s.** `atoma-infer` serves 6.87 req/s of it and vLLM 7.71, so both are at
+  their knee and the metric separates them.
+- **Long-context at 0.5 req/s.** At 8k input tokens the two engines sustain 1.01 and 1.51 req/s.
+  A first pass at 2 req/s put both far past that: every run completed, but first-token latency ran
+  to 52 s for `atoma-infer` and 12 s for vLLM, and goodput fell to 0.013 against 0.005 — two
+  numbers near zero, comparing nothing. 0.5 req/s sits under both knees.

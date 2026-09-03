@@ -1,0 +1,275 @@
+{
+  "generated_at": "2026-09-03T01:19:19.312522899+00:00",
+  "hardware": "1xH100 PCIe 80GB, driver 580.105.08, CUDA 12.8",
+  "workload": "sharegpt",
+  "plan": {
+    "num_requests": 500,
+    "request_rate_per_second": 8.0,
+    "seed": 1
+  },
+  "slo": {
+    "ttft_ms": 2000.0,
+    "itl_ms": 50.0
+  },
+  "subject": {
+    "name": "atoma-infer",
+    "version": "e378d36",
+    "config": {
+      "base_url": "http://127.0.0.1:8080",
+      "config": "# The engine under test for the rung-0 baseline. Sized against the pinned vLLM v0.26.0 baseline\n# as it reported itself on this host, so the table compares engines rather than memory splits:\n# 463,040 KV tokens, 128 sequences per step, an 8192-token step budget and a 131,072-token context.\n\n[engine]\n# 28,940 blocks x 16 tokens = 463,040 KV tokens, the size vLLM's defaults chose here.\nblock_count          = 28940\ningress_capacity     = 512\nidle_deadline_millis = 5\nstep_deadline_millis = 60000\n\n[engine.scheduler]\ntoken_budget       = 8192\nmax_batch          = 128\nmax_model_len      = 131072\nblock_size         = 16\nwindow             = 128\nadmission          = \"longest_prefix_match\"\nmax_requests       = 1024\nmax_client_backlog = 1024\neos_token_ids      = [ 128001, 128008, 128009 ]\nhash_algorithm     = \"sha256_v1\"\n\n[engine.dispatch]\nbucket_ladder         = [ 1, 1024, 128, 16, 2, 2048, 256, 32, 4, 4096, 512, 64, 8, 8192 ]\ncaptured_max_requests = 128\n\n[executor]\nranks = [ { core = 2, device = 0 } ]\n\n[model]\nid       = \"NousResearch/Meta-Llama-3.1-8B-Instruct\"\nrevision = \"main\"\ndtype    = \"bf16\"\n\n[server]\nbind                   = \"127.0.0.1:8080\"\nkeep_alive_millis      = 100\nheartbeat_stale_millis = 1000\n",
+      "config_path": "config-bench.toml",
+      "model": "NousResearch/Meta-Llama-3.1-8B-Instruct"
+    },
+    "runs": [
+      {
+        "summary": {
+          "num_requests": 500,
+          "completed": 500,
+          "failed": 0,
+          "output_tokens": 134717,
+          "duration_seconds": 72.792701272,
+          "goodput_per_second": 6.855082876172124,
+          "request_throughput_per_second": 6.868820517206537,
+          "output_token_throughput_per_second": 1850.693787233026,
+          "ttft_ms": {
+            "count": 500,
+            "mean_ms": 79.50387199999993,
+            "p50_ms": 80.767,
+            "p90_ms": 102.143,
+            "p99_ms": 114.495,
+            "max_ms": 119.807
+          },
+          "itl_ms": {
+            "count": 134217,
+            "mean_ms": 31.25278827570277,
+            "p50_ms": 33.471,
+            "p90_ms": 36.735,
+            "p99_ms": 39.679,
+            "max_ms": 103.743
+          },
+          "end_to_end_ms": {
+            "count": 500,
+            "mean_ms": 8474.727616,
+            "p50_ms": 7557.119,
+            "p90_ms": 16687.103,
+            "p99_ms": 26542.079,
+            "max_ms": 27394.047
+          }
+        },
+        "kv_probe": {
+          "verdict": "pass",
+          "baseline_blocks": 28801,
+          "final_blocks": 28813,
+          "samples": 78
+        }
+      },
+      {
+        "summary": {
+          "num_requests": 500,
+          "completed": 500,
+          "failed": 0,
+          "output_tokens": 135108,
+          "duration_seconds": 72.824127952,
+          "goodput_per_second": 6.85212461903975,
+          "request_throughput_per_second": 6.8658563317031565,
+          "output_token_throughput_per_second": 1855.2642345275,
+          "ttft_ms": {
+            "count": 500,
+            "mean_ms": 78.34718400000003,
+            "p50_ms": 79.423,
+            "p90_ms": 101.119,
+            "p99_ms": 112.255,
+            "max_ms": 115.263
+          },
+          "itl_ms": {
+            "count": 134608,
+            "mean_ms": 31.083332639961956,
+            "p50_ms": 33.599,
+            "p90_ms": 36.383,
+            "p99_ms": 38.463,
+            "max_ms": 102.655
+          },
+          "end_to_end_ms": {
+            "count": 500,
+            "mean_ms": 8451.993792000001,
+            "p50_ms": 7565.311,
+            "p90_ms": 16605.183,
+            "p99_ms": 26378.239,
+            "max_ms": 27164.671
+          }
+        },
+        "kv_probe": {
+          "verdict": "pass",
+          "baseline_blocks": 28813,
+          "final_blocks": 28813,
+          "samples": 78
+        }
+      },
+      {
+        "summary": {
+          "num_requests": 500,
+          "completed": 500,
+          "failed": 0,
+          "output_tokens": 134830,
+          "duration_seconds": 72.538984403,
+          "goodput_per_second": 6.879059640919963,
+          "request_throughput_per_second": 6.892845331583129,
+          "output_token_throughput_per_second": 1858.724672114707,
+          "ttft_ms": {
+            "count": 500,
+            "mean_ms": 78.11078400000004,
+            "p50_ms": 78.911,
+            "p90_ms": 101.567,
+            "p99_ms": 109.503,
+            "max_ms": 115.583
+          },
+          "itl_ms": {
+            "count": 134330,
+            "mean_ms": 30.81230259807936,
+            "p50_ms": 33.343,
+            "p90_ms": 36.063,
+            "p99_ms": 37.663,
+            "max_ms": 109.055
+          },
+          "end_to_end_ms": {
+            "count": 500,
+            "mean_ms": 8362.074751999995,
+            "p50_ms": 7495.679,
+            "p90_ms": 16531.455,
+            "p99_ms": 26116.095,
+            "max_ms": 26886.143
+          }
+        },
+        "kv_probe": {
+          "verdict": "pass",
+          "baseline_blocks": 28813,
+          "final_blocks": 28813,
+          "samples": 78
+        }
+      }
+    ]
+  },
+  "baseline": {
+    "name": "vLLM 0.26.0",
+    "version": "0.26.0",
+    "config": {
+      "docker_command": "docker run --rm --gpus all --shm-size 16g --name atoma-bench-vllm -p 8000:8000 -v /home/ubuntu/.cache/huggingface:/root/.cache/huggingface -e HF_TOKEN vllm/vllm-openai:v0.26.0 --model NousResearch/Meta-Llama-3.1-8B-Instruct --port 8000",
+      "image": "vllm/vllm-openai:v0.26.0",
+      "model": "NousResearch/Meta-Llama-3.1-8B-Instruct",
+      "server_args": []
+    },
+    "runs": [
+      {
+        "summary": {
+          "num_requests": 500,
+          "completed": 500,
+          "failed": 0,
+          "output_tokens": 132291,
+          "duration_seconds": 64.832047866,
+          "goodput_per_second": 7.7122351747000115,
+          "request_throughput_per_second": 7.7122351747000115,
+          "output_token_throughput_per_second": 2040.5186069924785,
+          "ttft_ms": {
+            "count": 500,
+            "mean_ms": 55.935520000000075,
+            "p50_ms": 50.687,
+            "p90_ms": 78.207,
+            "p99_ms": 118.079,
+            "max_ms": 153.471
+          },
+          "itl_ms": {
+            "count": 131791,
+            "mean_ms": 11.186676358780211,
+            "p50_ms": 10.487,
+            "p90_ms": 12.935,
+            "p99_ms": 27.951,
+            "max_ms": 77.695
+          },
+          "end_to_end_ms": {
+            "count": 500,
+            "mean_ms": 3007.5073920000013,
+            "p50_ms": 2699.263,
+            "p90_ms": 6307.839,
+            "p99_ms": 8798.207,
+            "max_ms": 9297.919
+          }
+        },
+        "kv_probe": null
+      },
+      {
+        "summary": {
+          "num_requests": 500,
+          "completed": 500,
+          "failed": 0,
+          "output_tokens": 131822,
+          "duration_seconds": 64.834762799,
+          "goodput_per_second": 7.711912227551357,
+          "request_throughput_per_second": 7.711912227551357,
+          "output_token_throughput_per_second": 2033.1993873205504,
+          "ttft_ms": {
+            "count": 500,
+            "mean_ms": 50.42427199999997,
+            "p50_ms": 49.055,
+            "p90_ms": 64.511,
+            "p99_ms": 75.263,
+            "max_ms": 78.847
+          },
+          "itl_ms": {
+            "count": 131322,
+            "mean_ms": 10.862115586116577,
+            "p50_ms": 10.519,
+            "p90_ms": 12.271,
+            "p99_ms": 21.167,
+            "max_ms": 32.159
+          },
+          "end_to_end_ms": {
+            "count": 500,
+            "mean_ms": 2906.048064000001,
+            "p50_ms": 2603.007,
+            "p90_ms": 6033.407,
+            "p99_ms": 8359.935,
+            "max_ms": 8781.823
+          }
+        },
+        "kv_probe": null
+      },
+      {
+        "summary": {
+          "num_requests": 500,
+          "completed": 500,
+          "failed": 0,
+          "output_tokens": 131822,
+          "duration_seconds": 64.843129779,
+          "goodput_per_second": 7.710917127290319,
+          "request_throughput_per_second": 7.710917127290319,
+          "output_token_throughput_per_second": 2032.937035107329,
+          "ttft_ms": {
+            "count": 500,
+            "mean_ms": 49.50119999999997,
+            "p50_ms": 48.447,
+            "p90_ms": 61.567,
+            "p99_ms": 70.207,
+            "max_ms": 83.199
+          },
+          "itl_ms": {
+            "count": 131322,
+            "mean_ms": 10.8557444982562,
+            "p50_ms": 10.527,
+            "p90_ms": 12.295,
+            "p99_ms": 20.991,
+            "max_ms": 32.959
+          },
+          "end_to_end_ms": {
+            "count": 500,
+            "mean_ms": 2903.463295999998,
+            "p50_ms": 2592.767,
+            "p90_ms": 6041.599,
+            "p99_ms": 8331.263,
+            "max_ms": 8757.247
+          }
+        },
+        "kv_probe": null
+      }
+    ]
+  }
+}
