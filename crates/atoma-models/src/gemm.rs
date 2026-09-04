@@ -13,6 +13,7 @@
 //! an allocation inside a captured region invalidates the capture.
 
 use core::ffi::c_void;
+use core::fmt;
 
 use atoma_runtime::session::Allocation;
 use atoma_runtime::tensor::{Dtype, Layout, Tensor};
@@ -42,8 +43,11 @@ pub enum GemmError {
     },
     #[error("the output is {dtype:?}; it must be bf16 or f32")]
     OutputDtype { dtype: Dtype },
-    #[error("{what} of {value} does not fit the dimension cuBLAS takes")]
-    DimensionOverflow { what: &'static str, value: usize },
+    #[error("{dimension} of {value} does not fit the dimension cuBLAS takes")]
+    DimensionOverflow {
+        dimension: GemmDimension,
+        value: usize,
+    },
     #[error("cuBLAS refused the call: {status:?}")]
     Cublas { status: sys::cublasStatus_t },
 }
@@ -147,9 +151,58 @@ impl GemmShape {
     }
 }
 
-/// A dimension cuBLAS takes as a signed 32-bit integer.
-fn dimension(what: &'static str, value: usize) -> Result<i32, GemmError> {
-    i32::try_from(value).map_err(|_| GemmError::DimensionOverflow { what, value })
+/// One of the six dimensions cuBLAS takes as a signed 32-bit integer, each naming the field of a
+/// [`GemmShape`] it is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemmDimension {
+    /// `m`: the output features.
+    OutFeatures,
+    /// `n`: the tokens.
+    Tokens,
+    /// `k`: the input features.
+    InFeatures,
+    /// `lda`: the weight's row stride.
+    WeightStride,
+    /// `ldb`: the activations' row stride.
+    InputStride,
+    /// `ldc`: the output's row stride.
+    OutputStride,
+}
+
+impl GemmDimension {
+    /// This dimension of `shape`, as the argument cuBLAS takes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GemmError::DimensionOverflow`] when the value does not fit a signed 32-bit
+    /// integer.
+    pub fn argument(self, shape: &GemmShape) -> Result<i32, GemmError> {
+        let value = match self {
+            GemmDimension::OutFeatures => shape.out_features,
+            GemmDimension::Tokens => shape.tokens,
+            GemmDimension::InFeatures => shape.in_features,
+            GemmDimension::WeightStride => shape.weight_stride,
+            GemmDimension::InputStride => shape.input_stride,
+            GemmDimension::OutputStride => shape.output_stride,
+        };
+        i32::try_from(value).map_err(|_| GemmError::DimensionOverflow {
+            dimension: self,
+            value,
+        })
+    }
+}
+
+impl fmt::Display for GemmDimension {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            GemmDimension::OutFeatures => "the output feature count",
+            GemmDimension::Tokens => "the token count",
+            GemmDimension::InFeatures => "the input feature count",
+            GemmDimension::WeightStride => "the weight's row stride",
+            GemmDimension::InputStride => "the activations' row stride",
+            GemmDimension::OutputStride => "the output's row stride",
+        })
+    }
 }
 
 /// The cuBLAS handle the step's multiplications run on, bound to the capture stream and holding
@@ -220,12 +273,12 @@ impl StepBlas {
         let (weight, input, output) = (weight.address(), input.address(), output.address());
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
-        let m = dimension("the output feature count", shape.out_features)?;
-        let n = dimension("the token count", shape.tokens)?;
-        let k = dimension("the input feature count", shape.in_features)?;
-        let lda = dimension("the weight's row stride", shape.weight_stride)?;
-        let ldb = dimension("the activations' row stride", shape.input_stride)?;
-        let ldc = dimension("the output's row stride", shape.output_stride)?;
+        let m = GemmDimension::OutFeatures.argument(&shape)?;
+        let n = GemmDimension::Tokens.argument(&shape)?;
+        let k = GemmDimension::InFeatures.argument(&shape)?;
+        let lda = GemmDimension::WeightStride.argument(&shape)?;
+        let ldb = GemmDimension::InputStride.argument(&shape)?;
+        let ldc = GemmDimension::OutputStride.argument(&shape)?;
         // SAFETY: the caller's contract on the addresses; `alpha` and `beta` live across the
         // call, and the handle is live for as long as this value is.
         unsafe {
@@ -413,13 +466,41 @@ mod tests {
         );
     }
 
+    /// A shape whose six dimensions all differ, so a dimension read from the wrong field shows.
+    fn distinct() -> GemmShape {
+        GemmShape {
+            out_features: 1,
+            tokens: 2,
+            in_features: 3,
+            weight_stride: 4,
+            input_stride: 5,
+            output_stride: 6,
+            output: GemmOutput::Bf16,
+        }
+    }
+
+    #[test]
+    fn each_dimension_reads_its_own_field_of_the_shape() {
+        let shape = distinct();
+        assert_eq!(GemmDimension::OutFeatures.argument(&shape), Ok(1));
+        assert_eq!(GemmDimension::Tokens.argument(&shape), Ok(2));
+        assert_eq!(GemmDimension::InFeatures.argument(&shape), Ok(3));
+        assert_eq!(GemmDimension::WeightStride.argument(&shape), Ok(4));
+        assert_eq!(GemmDimension::InputStride.argument(&shape), Ok(5));
+        assert_eq!(GemmDimension::OutputStride.argument(&shape), Ok(6));
+    }
+
     #[test]
     fn a_dimension_past_the_cublas_limit_is_refused_by_name() {
-        let refused = dimension("the token count", usize::MAX).unwrap_err();
+        let shape = GemmShape {
+            tokens: usize::MAX,
+            ..distinct()
+        };
+        let refused = GemmDimension::Tokens.argument(&shape).unwrap_err();
         assert_eq!(
             refused,
             GemmError::DimensionOverflow {
-                what: "the token count",
+                dimension: GemmDimension::Tokens,
                 value: usize::MAX
             }
         );
