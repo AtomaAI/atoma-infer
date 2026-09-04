@@ -2,6 +2,7 @@ pub mod attention_window;
 pub mod decode_ops;
 pub mod error;
 pub mod paged_decode;
+pub mod sampler;
 pub mod splits;
 
 pub use attention_window::CAUSAL_WINDOW;

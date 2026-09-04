@@ -29,11 +29,12 @@ const STATUS_RETURNING_LAUNCHERS: [&str; 7] = [
 ];
 
 /// The modules that call into the FFI. Every launch site lives in one of these.
-const CALLER_SOURCES: [&str; 4] = [
+const CALLER_SOURCES: [&str; 5] = [
     "src/flash_attention.rs",
     "src/cache_manager.rs",
     "src/paged_decode.rs",
     "src/decode_ops.rs",
+    "src/sampler.rs",
 ];
 
 fn crate_root() -> PathBuf {

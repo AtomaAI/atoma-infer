@@ -150,6 +150,27 @@ extern "C" {
         stream: *mut c_void,
     ) -> c_int;
 
+    /// Returns the `cudaError_t` of the launch.
+    pub(crate) fn sampler_sample_f32(
+        logits: *const c_void,
+        row_slots: *const c_void,
+        records: *mut c_void,
+        sampled: *mut c_void,
+        out: *mut c_void,
+        vocab: i64,
+        n_rows: i64,
+        stream: *mut c_void,
+    ) -> c_int;
+
+    /// Returns the `cudaError_t` of the launch.
+    pub(crate) fn sampler_gather_u32(
+        token_ids: *mut c_void,
+        gather_slots: *const c_void,
+        sampled: *const c_void,
+        n_rows: i64,
+        stream: *mut c_void,
+    ) -> c_int;
+
     /// `cudaGetErrorString` for a `cudaError_t` value, as a static NUL-terminated string.
     fn flash_cuda_error_string(code: c_int) -> *const c_char;
 }

@@ -78,10 +78,11 @@ const KERNEL_FILES: [&str; 66] = [
     "kernels/flash_fwd_split_hdim256_fp16_sm80.cu",
 ];
 
-/// The decode step's own kernels, built apart from the vendored flash-attention sources so they
-/// take none of its flags: no fast math, so every transcendental is the precise one.
+/// The in-house kernels — the decode step's and the sampler's — built apart from the vendored
+/// flash-attention sources so they take none of its flags: no fast math, so every transcendental
+/// is the precise one.
 #[cfg(feature = "cuda")]
-const DECODE_KERNEL_FILE: &str = "kernels/decode_ops.cu";
+const IN_HOUSE_KERNEL_FILES: [&str; 2] = ["kernels/decode_ops.cu", "kernels/sampler.cu"];
 
 #[cfg(not(feature = "cuda"))]
 fn main() {}
@@ -104,7 +105,9 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=kernels/static_switch.h");
     println!("cargo:rerun-if-changed=kernels/rotary.h");
     println!("cargo:rerun-if-changed=kernels/alibi.h");
-    println!("cargo:rerun-if-changed={DECODE_KERNEL_FILE}");
+    for kernel_file in IN_HOUSE_KERNEL_FILES {
+        println!("cargo:rerun-if-changed={kernel_file}");
+    }
     println!("cargo:rerun-if-env-changed=FLASH_ATTN_BUILD_DIR");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").context("OUT_DIR not set")?);
@@ -129,12 +132,12 @@ fn main() -> Result<()> {
     println!("cargo:warning=Build directory: {:?}", build_dir.display());
 
     compile_cuda_files(&build_dir)?;
-    compile_decode_kernels(&build_dir);
+    compile_in_house_kernels(&build_dir);
 
     // Link libraries
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=static=flashattention");
-    println!("cargo:rustc-link-lib=static=decodeops");
+    println!("cargo:rustc-link-lib=static=inhousekernels");
     println!("cargo:rustc-link-lib=dylib=cudart");
 
     if cfg!(target_os = "windows") {
@@ -227,18 +230,22 @@ fn compile_cuda_files(build_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Compiles the decode step's kernels into their own static library.
+/// Compiles the in-house kernels into their own static library.
 #[cfg(feature = "cuda")]
-fn compile_decode_kernels(build_dir: &Path) {
+fn compile_in_house_kernels(build_dir: &Path) {
+    let kernels: Vec<String> = IN_HOUSE_KERNEL_FILES
+        .iter()
+        .map(|&file| file.to_string())
+        .collect();
     let builder = bindgen_cuda::Builder::default()
-        .kernel_paths(vec![DECODE_KERNEL_FILE.to_string()])
+        .kernel_paths(kernels)
         .out_dir(build_dir.to_path_buf())
         .arg("-std=c++17")
         .arg("-O3");
     let out_file = if cfg!(target_os = "windows") {
-        build_dir.join("decodeops.lib")
+        build_dir.join("inhousekernels.lib")
     } else {
-        build_dir.join("libdecodeops.a")
+        build_dir.join("libinhousekernels.a")
     };
     builder.build_lib(&out_file);
 }
