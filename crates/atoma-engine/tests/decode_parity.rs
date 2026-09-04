@@ -444,28 +444,7 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
     let mut sampled = Vec::with_capacity(chosen.len());
     for (row, tensor_row) in tensor_logits.iter().enumerate() {
         let candle_row = candle_logits.row(row).expect("row");
-        let (ours, theirs) = (argmax(tensor_row), argmax(candle_row));
-        if ours != theirs {
-            // Both forwards' logits for both ids. Candle reads its logits back in bf16: when it
-            // holds the two ids at one value it cannot order them, and its argmax takes the
-            // lower id, so the row is a tie rather than a disagreement.
-            let (ours_at, theirs_at) = (at(ours), at(theirs));
-            let tied = candle_row[ours_at] == candle_row[theirs_at];
-            if tied {
-                parity.ties += 1;
-            } else {
-                parity.argmax_disagreements += 1;
-            }
-            eprintln!(
-                "step {step} row {row}: {} — decode step argmax {ours} (step {:.4}, candle \
-                 {:.4}), candle argmax {theirs} (step {:.4}, candle {:.4})",
-                if tied { "tie" } else { "disagreement" },
-                tensor_row[ours_at],
-                candle_row[ours_at],
-                tensor_row[theirs_at],
-                candle_row[theirs_at]
-            );
-        }
+        let theirs = record_argmax(parity, step, row, tensor_row, candle_row);
         let diff = widest(tensor_row, candle_row);
         parity.max_abs_diff = parity.max_abs_diff.max(diff);
         parity.sum_abs_diff += f64::from(diff);
@@ -482,6 +461,65 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
     }
 }
 
+/// Compares the two forwards' argmax on one row, counting a disagreement or a tie, and returns
+/// candle's, which is what the sequence advances by.
+fn record_argmax(
+    parity: &mut Parity,
+    step: usize,
+    row: usize,
+    tensor_row: &[f32],
+    candle_row: &[f32],
+) -> u32 {
+    let (ours, theirs) = (argmax(tensor_row), argmax(candle_row));
+    if ours == theirs {
+        return theirs;
+    }
+    // Both forwards' logits for both ids. Candle reads its logits back in bf16: when it holds
+    // the two ids at one value it cannot order them, and its argmax takes the lower id, so the
+    // row is a tie rather than a disagreement. The tie is exact equality of what candle holds.
+    let (ours_at, theirs_at) = (at(ours), at(theirs));
+    let tied = candle_row[ours_at].to_bits() == candle_row[theirs_at].to_bits();
+    if tied {
+        parity.ties += 1;
+    } else {
+        parity.argmax_disagreements += 1;
+    }
+    eprintln!(
+        "step {step} row {row}: {} — decode step argmax {ours} (step {:.4}, candle {:.4}), \
+         candle argmax {theirs} (step {:.4}, candle {:.4})",
+        if tied { "tie" } else { "disagreement" },
+        tensor_row[ours_at],
+        candle_row[ours_at],
+        tensor_row[theirs_at],
+        candle_row[theirs_at]
+    );
+    theirs
+}
+
+/// The bound the variable `name` sets, or `default` when it is unset or not a number.
+fn bound_from_env(name: &str, default: f32) -> f32 {
+    env::var(name)
+        .ok()
+        .and_then(|bound| bound.parse().ok())
+        .unwrap_or(default)
+}
+
+/// `SEQUENCES` sequences of random tokens, each over its own run of blocks.
+fn seed_sequences(random: &mut Lcg, vocab: usize) -> Vec<Sequence> {
+    let blocks_each = MAX_MODEL_LEN.div_ceil(BLOCK_SIZE);
+    (0..SEQUENCES)
+        .map(|index| Sequence {
+            tokens: (0..8 + random.below(40))
+                .map(|_| u32::try_from(random.below(vocab.min(TOKEN_ID_CEILING))).expect("fits"))
+                .collect(),
+            blocks: (0..blocks_each)
+                .map(|block| u32::try_from(index * blocks_each + block).expect("fits"))
+                .collect(),
+            context_len: 0,
+        })
+        .collect()
+}
+
 #[test]
 #[ignore = "needs a device, the CUDA toolkit and a Llama checkpoint; run scripts/decode-parity.sh"]
 fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
@@ -492,14 +530,8 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
         dtype: Dtype::Bf16,
         prompt_template: PromptTemplate::Llama3,
     };
-    let bound: f32 = env::var("PARITY_MAX_ABS_DIFF")
-        .ok()
-        .and_then(|bound| bound.parse().ok())
-        .unwrap_or(DEFAULT_MAX_ABS_DIFF);
-    let kv_bound: f32 = env::var("PARITY_KV_MAX_ABS_DIFF")
-        .ok()
-        .and_then(|bound| bound.parse().ok())
-        .unwrap_or(DEFAULT_KV_MAX_ABS_DIFF);
+    let bound = bound_from_env("PARITY_MAX_ABS_DIFF", DEFAULT_MAX_ABS_DIFF);
+    let kv_bound = bound_from_env("PARITY_KV_MAX_ABS_DIFF", DEFAULT_KV_MAX_ABS_DIFF);
     let Rig {
         allocation,
         allocated,
@@ -529,18 +561,7 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     let forward = CudaForward::new(allocated, decode_step, session);
 
     let mut random = Lcg(0x5EED_2026_0903);
-    let blocks_each = MAX_MODEL_LEN.div_ceil(BLOCK_SIZE);
-    let sequences: Vec<Sequence> = (0..SEQUENCES)
-        .map(|index| Sequence {
-            tokens: (0..8 + random.below(40))
-                .map(|_| u32::try_from(random.below(vocab.min(TOKEN_ID_CEILING))).expect("fits"))
-                .collect(),
-            blocks: (0..blocks_each)
-                .map(|block| u32::try_from(index * blocks_each + block).expect("fits"))
-                .collect(),
-            context_len: 0,
-        })
-        .collect();
+    let sequences = seed_sequences(&mut random, vocab);
     let mut harness = Harness {
         forward,
         readback,
