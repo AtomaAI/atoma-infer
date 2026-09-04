@@ -353,7 +353,9 @@ __device__ long long picked(const Row& row, const Kept& kept, uint64_t uniform, 
     }
     unsigned long long total;
     const unsigned long long exclusive = block_exclusive_scan(local, scratch, total);
-    const unsigned long long point = uniform % total;
+    // The uniform's share of the total: a total a few units apart from the host's moves it by no
+    // more than those units, where a remainder would move it by the quotient.
+    const unsigned long long point = __umul64hi(uniform, total);
     if (point < exclusive || exclusive + local <= point) {
         return -1;
     }

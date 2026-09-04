@@ -13,8 +13,11 @@
 //!
 //! The kernel computes the same steps with block-wide reductions and radix selection instead of
 //! sorts. Its only sources of difference are the exponential and the division in the weights,
-//! which the device rounds within an ulp or two of the host; a row whose cutoff or pick turns on
-//! that last bit can differ, and nothing else can.
+//! which the device rounds within an ulp or two of the host: a weight can differ by a unit of the
+//! fixed point, and the total by a unit per token. The point the uniform names is its share of
+//! the total, which moves by no more than the total does, so a row's cutoff or pick differs only
+//! when it turns on those last units. Reducing the uniform modulo the total would instead move
+//! the point by the total's difference times the quotient, which is millions.
 
 use crate::sampling::philox;
 use crate::sampling::record::SlotRecord;
@@ -138,11 +141,11 @@ pub fn admitted_by_top_p(weights: &[u64], top_p: f32) -> Vec<u64> {
 }
 
 /// The token `uniform` picks in index order by its share of `weights`: the first whose cumulative
-/// weight exceeds `uniform` reduced modulo the total.
+/// weight exceeds the [`point`] `uniform` names in the total.
 #[must_use]
 pub fn pick(weights: &[u64], uniform: u64) -> usize {
     let total: u64 = weights.iter().sum();
-    let point = uniform % total;
+    let point = point(uniform, total);
     let mut cumulative = 0;
     for (index, &weight) in weights.iter().enumerate() {
         cumulative += weight;
@@ -151,6 +154,18 @@ pub fn pick(weights: &[u64], uniform: u64) -> usize {
         }
     }
     unreachable!("the cumulative weight reaches the total, which is past the point")
+}
+
+/// The point `uniform` names in `total`: `uniform / 2^64` of it, below `total`. A difference in
+/// `total` moves the point by no more than that difference, so a device whose weights sum a few
+/// units apart from the host's picks the same token unless the point sits at a boundary.
+#[must_use]
+pub fn point(uniform: u64, total: u64) -> u64 {
+    // The share is below `total`, so the cast back is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        ((u128::from(uniform) * u128::from(total)) >> 64) as u64
+    }
 }
 
 /// One row's token under `record`: the largest logit for a greedy record, and otherwise the
@@ -186,8 +201,8 @@ mod tests {
     use atoma_core::request::SamplingParams;
 
     use super::{
-        admitted_by_top_k, admitted_by_top_p, argmax, key, pick, sample, target_mass, weights,
-        UNIT_WEIGHT,
+        admitted_by_top_k, admitted_by_top_p, argmax, key, pick, point, sample, target_mass,
+        weights, UNIT_WEIGHT,
     };
     use crate::sampling::record::SlotRecord;
 
@@ -331,16 +346,39 @@ mod tests {
         }
     }
 
+    /// The smallest uniform whose point in `total` is `at`.
+    fn naming(at: u64, total: u64) -> u64 {
+        let uniform = (u128::from(at) << 64).div_ceil(u128::from(total));
+        u64::try_from(uniform).expect("a point below the total is named by some uniform")
+    }
+
+    #[test]
+    fn the_point_is_the_uniforms_share_of_the_total_and_moves_no_more_than_the_total() {
+        assert_eq!(point(0, 10), 0);
+        assert_eq!(point(1 << 63, 10), 5);
+        assert_eq!(point(u64::MAX, 10), 9, "below the total");
+        assert_eq!(point(naming(3, 10), 10), 3);
+        assert_eq!(point(naming(3, 10) - 1, 10), 2);
+        let uniform = naming(700, 1000);
+        assert!(point(uniform, 1003).abs_diff(700) <= 3);
+        assert!(point(uniform, 997).abs_diff(700) <= 3);
+    }
+
     #[test]
     fn the_pick_walks_the_weights_in_index_order_by_share() {
         let weights = [3, 0, 5, 2];
+        let at = |point| naming(point, 10);
         assert_eq!(pick(&weights, 0), 0);
-        assert_eq!(pick(&weights, 2), 0);
-        assert_eq!(pick(&weights, 3), 2, "a zero weight is never picked");
-        assert_eq!(pick(&weights, 7), 2);
-        assert_eq!(pick(&weights, 8), 3);
-        assert_eq!(pick(&weights, 9), 3);
-        assert_eq!(pick(&weights, 10), 0, "reduced modulo the total");
+        assert_eq!(pick(&weights, at(2)), 0);
+        assert_eq!(pick(&weights, at(3)), 2, "a zero weight is never picked");
+        assert_eq!(pick(&weights, at(7)), 2);
+        assert_eq!(pick(&weights, at(8)), 3);
+        assert_eq!(pick(&weights, at(9)), 3);
+        assert_eq!(
+            pick(&weights, u64::MAX),
+            3,
+            "the largest uniform names the last unit"
+        );
     }
 
     #[test]

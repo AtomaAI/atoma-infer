@@ -263,13 +263,14 @@ fn the_device_sampler_matches_its_host_reference() {
         let row = random_row(&mut random);
         let params = drawn(temperature, top_k, top_p, 0x5EED);
         for draw in 0..32u32 {
-            // A new request each time, so its slot is claimed afresh and the seed under test
-            // reaches the record; its counter is then zero, which is the draw compared.
+            // A new request each time, under an id no earlier row used, so its slot changes
+            // hands and the seed under test reaches the record; its counter is then zero, which
+            // is the draw compared.
             let slot = draw % u32::try_from(SLOTS).expect("the slot count fits u32");
             let mut params = params;
             params.seed = 0x5EED + u64::from(draw);
             let sampled = rig.sample(
-                &layout(vec![entry(u64::from(draw) + 1, slot, params)]),
+                &layout(vec![entry(1000 + u64::from(draw), slot, params)]),
                 slice::from_ref(&row),
             );
             let want = expected(&row, &params, 0);
