@@ -24,10 +24,26 @@ pub struct ModelConfig {
     pub cache_dir: Option<PathBuf>,
     /// The dtype the weights are loaded in and the forward computes in.
     pub dtype: Dtype,
+    /// The chat template a conversation is rendered through before it is tokenized.
+    pub prompt_template: PromptTemplate,
 }
 
 fn main_revision() -> String {
     "main".to_owned()
+}
+
+/// The chat template a conversation is rendered through.
+///
+/// A checkpoint's template is not derivable from its repository name: an ungated mirror carries
+/// the same weights and the same template under a different owner, and two checkpoints from one
+/// owner can differ. The template is therefore declared beside the repository rather than
+/// guessed from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptTemplate {
+    Llama2,
+    Llama3,
+    Hermes3,
 }
 
 /// The dtype the model computes in.
@@ -165,7 +181,9 @@ mod tests {
     use serde::de::DeserializeOwned;
     use validator::Validate;
 
-    use super::{CoreId, DeviceOrdinal, Dtype, ExecutorConfig, ModelConfig, RankConfig};
+    use super::{
+        CoreId, DeviceOrdinal, Dtype, ExecutorConfig, ModelConfig, PromptTemplate, RankConfig,
+    };
 
     fn from_toml<T: DeserializeOwned>(source: &str) -> Result<T, Box<figment::Error>> {
         Figment::new()
@@ -187,6 +205,7 @@ mod tests {
             r#"
             id = "meta-llama/Llama-3.2-1B-Instruct"
             dtype = "bf16"
+            prompt_template = "llama3"
             "#,
         )
         .unwrap();
@@ -197,6 +216,7 @@ mod tests {
                 revision: "main".to_owned(),
                 cache_dir: None,
                 dtype: Dtype::Bf16,
+                prompt_template: PromptTemplate::Llama3,
             }
         );
         config.validate().unwrap();
@@ -207,6 +227,7 @@ mod tests {
             revision = "abc123"
             cache_dir = "/var/cache/models"
             dtype = "f16"
+            prompt_template = "llama3"
             "#,
         )
         .unwrap();
@@ -230,6 +251,7 @@ mod tests {
             revision: "v1".to_owned(),
             cache_dir: Some(PathBuf::from("/cache")),
             dtype: Dtype::F32,
+            prompt_template: PromptTemplate::Hermes3,
         };
         let json = serde_json::to_string(&model).unwrap();
         assert_eq!(serde_json::from_str::<ModelConfig>(&json).unwrap(), model);
@@ -287,6 +309,7 @@ dtype = "int8""#
             revision: "main".to_owned(),
             cache_dir: None,
             dtype: Dtype::Bf16,
+            prompt_template: PromptTemplate::Llama3,
         };
         let error = no_id.validate().unwrap_err().to_string();
         assert!(error.contains("names no repository"), "{error}");
@@ -296,6 +319,7 @@ dtype = "int8""#
             revision: String::new(),
             cache_dir: None,
             dtype: Dtype::Bf16,
+            prompt_template: PromptTemplate::Llama3,
         };
         let error = no_revision.validate().unwrap_err().to_string();
         assert!(error.contains("revision is empty"), "{error}");

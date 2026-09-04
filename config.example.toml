@@ -71,6 +71,8 @@ revision = "main"
 # cache_dir = "/var/cache/atoma/models"
 # The dtype the weights are loaded in and the forward computes in: "bf16", "f16" or "f32".
 dtype = "bf16"
+# The chat template conversations are rendered through: "llama2", "llama3" or "hermes3".
+prompt_template = "llama3"
 
 # The HTTP server.
 [server]

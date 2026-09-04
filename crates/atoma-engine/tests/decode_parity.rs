@@ -36,7 +36,7 @@ use atoma_core::types::{
     BlockId, RequestCount, RequestId, RequestSlot, SequenceIndex, StepId, TokenCount,
 };
 use atoma_engine::batch::BatchLayout;
-use atoma_engine::config::{DeviceOrdinal, Dtype, ModelConfig};
+use atoma_engine::config::{DeviceOrdinal, Dtype, ModelConfig, PromptTemplate};
 use atoma_engine::decode::batch::Checked;
 use atoma_engine::decode::declaration;
 use atoma_engine::device::decode::{DecodeStep, DecodeStepPlan};
@@ -485,6 +485,7 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
         revision: "main".to_owned(),
         cache_dir: None,
         dtype: Dtype::Bf16,
+        prompt_template: PromptTemplate::Llama3,
     };
     let bound: f32 = env::var("PARITY_MAX_ABS_DIFF")
         .ok()
