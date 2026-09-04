@@ -13,6 +13,8 @@
 //! residual add writes the row after it, which the final norm then reads, and whose `Normed`
 //! slot the head projection reads.
 
+use std::fmt;
+
 use atoma_runtime::arena::{BucketIdx, CaptureArena, LayerIdx};
 use atoma_runtime::tensor::{Dtype, Tensor, TensorError};
 use thiserror::Error;
@@ -21,7 +23,7 @@ use crate::attention::{cache_halves, AttentionError, AttentionPlan, CacheHalves}
 use crate::dims::LlamaDims;
 use crate::kernels::RotaryTensors;
 use crate::layer::{LayerOffset, LayerWeight, QkvColumns, Role, RoleRef};
-use crate::operand::{self, Operand, OperandError};
+use crate::operand::{self, Operand, OperandError, OperandKind};
 
 /// The activations' element type: every arena slot is read and written as bf16.
 const ACTIVATION: Dtype = Dtype::Bf16;
@@ -46,9 +48,9 @@ pub enum SlotError {
     },
     #[error(transparent)]
     Operand(#[from] OperandError),
-    #[error("{what} covers {count} layers; the model has {expected}")]
+    #[error("{tensors} cover {count} layers; the model has {expected}")]
     LayerCount {
-        what: &'static str,
+        tensors: LayerCounted,
         count: usize,
         expected: usize,
     },
@@ -58,6 +60,22 @@ pub enum SlotError {
     Attention(#[from] AttentionError),
     #[error(transparent)]
     Tensor(#[from] TensorError),
+}
+
+/// What the model holds one of per layer, as a layer-count refusal names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerCounted {
+    Weights,
+    Cache,
+}
+
+impl fmt::Display for LayerCounted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            LayerCounted::Weights => "the weights",
+            LayerCounted::Cache => "the caches",
+        })
+    }
 }
 
 /// One entry of the bucket ladder: its index into the arena and the tokens it serves.
@@ -171,7 +189,7 @@ impl ActivationSlots {
                 dtype: memory.dtype(),
             });
         }
-        operand::contiguous(Operand::model("the arena memory"), memory.layout())?;
+        operand::contiguous(Operand::model(OperandKind::ArenaMemory), memory.layout())?;
         let held = memory.extent_bytes();
         if held < arena.total_size() {
             return Err(SlotError::ArenaTooSmall {
@@ -271,23 +289,23 @@ impl LayerWeights {
     fn check(&self, layer: usize, dims: &LlamaDims) -> Result<(), SlotError> {
         let (hidden, ffn) = (dims.hidden, dims.ffn);
         let (q_width, kv_width) = (dims.q_width(), dims.kv_width());
-        let expected: [(&'static str, &Tensor, &[usize]); 9] = [
-            ("input norm gain", &self.input_norm, &[hidden]),
-            ("query projection", &self.q, &[q_width, hidden]),
-            ("key projection", &self.k, &[kv_width, hidden]),
-            ("value projection", &self.v, &[kv_width, hidden]),
-            ("output projection", &self.o, &[hidden, q_width]),
+        let expected: [(LayerWeight, &Tensor, &[usize]); 9] = [
+            (LayerWeight::InputNorm, &self.input_norm, &[hidden]),
+            (LayerWeight::Q, &self.q, &[q_width, hidden]),
+            (LayerWeight::K, &self.k, &[kv_width, hidden]),
+            (LayerWeight::V, &self.v, &[kv_width, hidden]),
+            (LayerWeight::O, &self.o, &[hidden, q_width]),
             (
-                "post-attention norm gain",
+                LayerWeight::PostAttentionNorm,
                 &self.post_attention_norm,
                 &[hidden],
             ),
-            ("gate projection", &self.gate, &[ffn, hidden]),
-            ("up projection", &self.up, &[ffn, hidden]),
-            ("down projection", &self.down, &[hidden, ffn]),
+            (LayerWeight::Gate, &self.gate, &[ffn, hidden]),
+            (LayerWeight::Up, &self.up, &[ffn, hidden]),
+            (LayerWeight::Down, &self.down, &[hidden, ffn]),
         ];
-        for (what, tensor, shape) in expected {
-            weight(Operand::layer(layer, what), tensor, shape)?;
+        for (which, tensor, shape) in expected {
+            weight(Operand::layer(layer, which), tensor, shape)?;
         }
         Ok(())
     }
@@ -315,14 +333,14 @@ impl LlamaWeights {
     pub fn check(&self, dims: &LlamaDims) -> Result<(), SlotError> {
         if self.layers.len() != dims.layers {
             return Err(SlotError::LayerCount {
-                what: "the weights",
+                tensors: LayerCounted::Weights,
                 count: self.layers.len(),
                 expected: dims.layers,
             });
         }
         let (vocab, hidden) = (dims.vocab, dims.hidden);
         weight(
-            Operand::model("the embedding table"),
+            Operand::model(OperandKind::EmbeddingTable),
             &self.embedding,
             &[vocab, hidden],
         )?;
@@ -330,12 +348,12 @@ impl LlamaWeights {
             weights.check(layer, dims)?;
         }
         weight(
-            Operand::model("the final norm gain"),
+            Operand::model(OperandKind::FinalNormGain),
             &self.final_norm,
             &[hidden],
         )?;
         weight(
-            Operand::model("the head projection"),
+            Operand::model(OperandKind::HeadProjection),
             &self.lm_head,
             &[vocab, hidden],
         )
@@ -358,7 +376,7 @@ impl LlamaCache {
     pub fn new(caches: &[Tensor], dims: &LlamaDims) -> Result<Self, SlotError> {
         if caches.len() != dims.layers {
             return Err(SlotError::LayerCount {
-                what: "the cache",
+                tensors: LayerCounted::Cache,
                 count: caches.len(),
                 expected: dims.layers,
             });
@@ -437,46 +455,71 @@ impl BucketStatics {
         let shape = plan.shape();
         let pairs = dims.head_dim / 2;
         let rotary = [dims.rope.max_position, pairs];
-        static_shape("the cosine table", &statics.rotary.cos, Dtype::F32, &rotary)?;
-        static_shape("the sine table", &statics.rotary.sin, Dtype::F32, &rotary)?;
+        static_shape(
+            OperandKind::CosineTable,
+            &statics.rotary.cos,
+            Dtype::F32,
+            &rotary,
+        )?;
+        static_shape(
+            OperandKind::SineTable,
+            &statics.rotary.sin,
+            Dtype::F32,
+            &rotary,
+        )?;
         Ok(Self {
-            token_ids: leading("the token ids", &statics.token_ids, Dtype::U32, tokens)?,
-            positions: leading("the positions", &statics.positions, Dtype::I32, tokens)?,
-            seqlens_k: leading("the key lengths", &statics.seqlens_k, Dtype::I32, tokens)?,
+            token_ids: leading(
+                OperandKind::TokenIds,
+                &statics.token_ids,
+                Dtype::U32,
+                tokens,
+            )?,
+            positions: leading(
+                OperandKind::Positions,
+                &statics.positions,
+                Dtype::I32,
+                tokens,
+            )?,
+            seqlens_k: leading(
+                OperandKind::KeyLengths,
+                &statics.seqlens_k,
+                Dtype::I32,
+                tokens,
+            )?,
             slot_mapping: leading(
-                "the slot mapping",
+                OperandKind::SlotMapping,
                 &statics.slot_mapping,
                 Dtype::I64,
                 tokens,
             )?,
             block_table: leading_rows(
-                "the block table",
+                OperandKind::BlockTable,
                 &statics.block_table,
                 Dtype::I32,
                 tokens,
                 plan.max_blocks_per_seq,
             )?,
             logits: leading_rows(
-                "the logits",
+                OperandKind::Logits,
                 &statics.logits,
                 Dtype::F32,
                 tokens,
                 dims.vocab,
             )?,
             softmax_lse: leading(
-                "the log-sum-exp output",
+                OperandKind::LogSumExp,
                 &statics.softmax_lse,
                 Dtype::F32,
                 shape.softmax_lse_len(),
             )?,
             lse_accum: leading(
-                "the split log-sum-exp accumulator",
+                OperandKind::SplitLogSumExp,
                 &statics.lse_accum,
                 Dtype::F32,
                 shape.lse_accum_len(plan.num_splits),
             )?,
             o_accum: leading(
-                "the split output accumulator",
+                OperandKind::SplitOutput,
                 &statics.o_accum,
                 Dtype::F32,
                 shape.o_accum_len(plan.num_splits),
@@ -560,34 +603,34 @@ fn exact(
 
 /// A model-level static of exactly `shape`.
 fn static_shape(
-    what: &'static str,
+    kind: OperandKind,
     tensor: &Tensor,
     dtype: Dtype,
     shape: &[usize],
 ) -> Result<(), SlotError> {
-    exact(Operand::model(what), tensor, dtype, shape)
+    exact(Operand::model(kind), tensor, dtype, shape)
 }
 
 /// The first `needed` elements of a contiguous vector static of `dtype`.
 fn leading(
-    what: &'static str,
+    kind: OperandKind,
     tensor: &Tensor,
     dtype: Dtype,
     needed: usize,
 ) -> Result<Tensor, SlotError> {
-    leading_rows(what, tensor, dtype, needed, 0)
+    leading_rows(kind, tensor, dtype, needed, 0)
 }
 
 /// The first `rows` rows of a contiguous static of `dtype`: a vector when `columns` is zero, a
 /// `[rows, columns]` matrix otherwise.
 fn leading_rows(
-    what: &'static str,
+    kind: OperandKind,
     tensor: &Tensor,
     dtype: Dtype,
     rows: usize,
     columns: usize,
 ) -> Result<Tensor, SlotError> {
-    let operand = Operand::model(what);
+    let operand = Operand::model(kind);
     let layout = tensor.layout();
     operand::dtype(operand, layout, dtype)?;
     operand::contiguous(operand, layout)?;
@@ -829,7 +872,7 @@ mod tests {
         assert_eq!(
             refused,
             SlotError::Operand(OperandError::Shape {
-                operand: Operand::layer(1, "key projection"),
+                operand: Operand::layer(1, LayerWeight::K),
                 shape: Shape::new(&[4096, 4096]),
                 expected: Shape::new(&[1024, 4096])
             })
@@ -848,7 +891,7 @@ mod tests {
         assert_eq!(
             table.check(&dims).unwrap_err(),
             SlotError::Operand(OperandError::Dtype {
-                operand: Operand::model("the final norm gain"),
+                operand: Operand::model(OperandKind::FinalNormGain),
                 dtype: Dtype::F16,
                 expected: Dtype::Bf16
             })
@@ -859,7 +902,7 @@ mod tests {
         assert_eq!(
             table.check(&dims).unwrap_err(),
             SlotError::LayerCount {
-                what: "the weights",
+                tensors: LayerCounted::Weights,
                 count: 1,
                 expected: 2
             }
@@ -894,7 +937,7 @@ mod tests {
         assert_eq!(
             LlamaCache::new(&caches[..1], &dims).unwrap_err(),
             SlotError::LayerCount {
-                what: "the cache",
+                tensors: LayerCounted::Cache,
                 count: 1,
                 expected: 2
             }
@@ -975,7 +1018,7 @@ mod tests {
         assert_eq!(
             BucketStatics::resolve(&statics, &plan(8), &dims).unwrap_err(),
             SlotError::Operand(OperandError::TooShort {
-                operand: Operand::model("the positions"),
+                operand: Operand::model(OperandKind::Positions),
                 len: 4,
                 needed: 8
             })
@@ -991,7 +1034,7 @@ mod tests {
         assert_eq!(
             BucketStatics::resolve(&statics, &plan(8), &dims).unwrap_err(),
             SlotError::Operand(OperandError::Rank {
-                operand: Operand::model("the key lengths"),
+                operand: Operand::model(OperandKind::KeyLengths),
                 rank: 0,
                 expected: 1
             })
@@ -1007,7 +1050,7 @@ mod tests {
         assert_eq!(
             BucketStatics::resolve(&statics, &plan(8), &dims).unwrap_err(),
             SlotError::Operand(OperandError::Shape {
-                operand: Operand::model("the block table"),
+                operand: Operand::model(OperandKind::BlockTable),
                 shape: Shape::new(&[8, 16]),
                 expected: Shape::new(&[8, BLOCK_COLUMNS])
             })

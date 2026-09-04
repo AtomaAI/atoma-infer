@@ -14,7 +14,7 @@ use atoma_kernels::decode_ops::{AddCall, EmbeddingGatherCall, RmsNormCall, RopeC
 use atoma_runtime::tensor::{Dtype, Tensor};
 
 use crate::dims::LlamaDims;
-use crate::operand::{matrix, rows, vector, vector_len, Operand, OperandError};
+use crate::operand::{matrix, rows, vector, vector_len, Operand, OperandError, OperandKind};
 
 /// The rotary embedding's tables on the device, f32 `[max_position, head_dim / 2]` each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,19 +50,19 @@ impl DecodeKernels {
     ) -> Result<EmbeddingGatherCall, OperandError> {
         let hidden = self.dims.hidden;
         matrix(
-            Operand::model("the embedding table"),
+            Operand::model(OperandKind::EmbeddingTable),
             table.layout(),
             Dtype::Bf16,
             self.dims.vocab,
             hidden,
         )?;
         let tokens = vector_len(
-            Operand::model("the token ids"),
+            Operand::model(OperandKind::TokenIds),
             token_ids.layout(),
             Dtype::U32,
         )?;
         matrix(
-            Operand::model("the gathered rows"),
+            Operand::model(OperandKind::GatheredRows),
             out.layout(),
             Dtype::Bf16,
             tokens,
@@ -94,19 +94,19 @@ impl DecodeKernels {
     ) -> Result<RmsNormCall, OperandError> {
         let hidden = self.dims.hidden;
         let tokens = rows(
-            Operand::model("the input rows"),
+            Operand::model(OperandKind::InputRows),
             x.layout(),
             Dtype::Bf16,
             hidden,
         )?;
         vector(
-            Operand::model("the gain"),
+            Operand::model(OperandKind::Gain),
             gain.layout(),
             Dtype::Bf16,
             hidden,
         )?;
         matrix(
-            Operand::model("the normalized rows"),
+            Operand::model(OperandKind::NormalizedRows),
             out.layout(),
             Dtype::Bf16,
             tokens,
@@ -139,27 +139,27 @@ impl DecodeKernels {
     ) -> Result<RopeCall, OperandError> {
         let dims = &self.dims;
         let tokens = rows(
-            Operand::model("the fused rows"),
+            Operand::model(OperandKind::FusedRows),
             qkv.layout(),
             Dtype::Bf16,
             dims.qkv_width(),
         )?;
         vector(
-            Operand::model("the positions"),
+            Operand::model(OperandKind::Positions),
             positions.layout(),
             Dtype::I32,
             tokens,
         )?;
         let (max_position, pairs) = (dims.rope.max_position, dims.head_dim / 2);
         matrix(
-            Operand::model("the cosine table"),
+            Operand::model(OperandKind::CosineTable),
             tables.cos.layout(),
             Dtype::F32,
             max_position,
             pairs,
         )?;
         matrix(
-            Operand::model("the sine table"),
+            Operand::model(OperandKind::SineTable),
             tables.sin.layout(),
             Dtype::F32,
             max_position,
@@ -192,16 +192,21 @@ impl DecodeKernels {
         stream: *mut c_void,
     ) -> Result<SiluMulCall, OperandError> {
         let ffn = self.dims.ffn;
-        let tokens = rows(Operand::model("the gate"), gate.layout(), Dtype::Bf16, ffn)?;
+        let tokens = rows(
+            Operand::model(OperandKind::Gate),
+            gate.layout(),
+            Dtype::Bf16,
+            ffn,
+        )?;
         matrix(
-            Operand::model("the up projection"),
+            Operand::model(OperandKind::UpProjection),
             up.layout(),
             Dtype::Bf16,
             tokens,
             ffn,
         )?;
         matrix(
-            Operand::model("the activation"),
+            Operand::model(OperandKind::Activation),
             out.layout(),
             Dtype::Bf16,
             tokens,
@@ -231,20 +236,20 @@ impl DecodeKernels {
     ) -> Result<AddCall, OperandError> {
         let hidden = self.dims.hidden;
         let tokens = rows(
-            Operand::model("the residual"),
+            Operand::model(OperandKind::Residual),
             residual.layout(),
             Dtype::Bf16,
             hidden,
         )?;
         matrix(
-            Operand::model("the delta"),
+            Operand::model(OperandKind::Delta),
             delta.layout(),
             Dtype::Bf16,
             tokens,
             hidden,
         )?;
         matrix(
-            Operand::model("the sum"),
+            Operand::model(OperandKind::Sum),
             out.layout(),
             Dtype::Bf16,
             tokens,
@@ -321,7 +326,7 @@ mod tests {
         assert_eq!(
             refused,
             OperandError::Dtype {
-                operand: Operand::model("the token ids"),
+                operand: Operand::model(OperandKind::TokenIds),
                 dtype: Dtype::I64,
                 expected: Dtype::U32
             }
@@ -342,7 +347,7 @@ mod tests {
                 .embedding_gather(&table, &ids, &out, ptr::null_mut())
                 .unwrap_err(),
             OperandError::Shape {
-                operand: Operand::model("the embedding table"),
+                operand: Operand::model(OperandKind::EmbeddingTable),
                 shape: Shape::new(&[32_000, dims.hidden]),
                 expected: Shape::new(&[dims.vocab, dims.hidden])
             }
@@ -378,7 +383,7 @@ mod tests {
                 .rmsnorm(&x, &gain, &out, ptr::null_mut())
                 .unwrap_err(),
             OperandError::Rank {
-                operand: Operand::model("the gain"),
+                operand: Operand::model(OperandKind::Gain),
                 rank: 2,
                 expected: 1
             }
@@ -397,7 +402,7 @@ mod tests {
                 .rmsnorm(&x, &gain, &out, ptr::null_mut())
                 .unwrap_err(),
             OperandError::Shape {
-                operand: Operand::model("the normalized rows"),
+                operand: Operand::model(OperandKind::NormalizedRows),
                 shape: Shape::new(&[TOKENS - 1, dims.hidden]),
                 expected: Shape::new(&[TOKENS, dims.hidden])
             }
@@ -439,7 +444,7 @@ mod tests {
         assert_eq!(
             refused,
             OperandError::NotContiguous {
-                operand: Operand::model("the fused rows"),
+                operand: Operand::model(OperandKind::FusedRows),
                 strides: [dims.qkv_width(), 1, 0, 0]
             }
         );
@@ -457,7 +462,7 @@ mod tests {
                 .rope(&qkv, &positions, &tables(&dims), ptr::null_mut())
                 .unwrap_err(),
             OperandError::Length {
-                operand: Operand::model("the positions"),
+                operand: Operand::model(OperandKind::Positions),
                 len: TOKENS - 2,
                 expected: TOKENS
             }
@@ -477,7 +482,7 @@ mod tests {
                 .rope(&qkv, &positions, &tables, ptr::null_mut())
                 .unwrap_err(),
             OperandError::Shape {
-                operand: Operand::model("the sine table"),
+                operand: Operand::model(OperandKind::SineTable),
                 shape: Shape::new(&[4096, 64]),
                 expected: Shape::new(&[dims.rope.max_position, 64])
             }
@@ -513,7 +518,7 @@ mod tests {
                 .silu_mul(&gate, &up, &out, ptr::null_mut())
                 .unwrap_err(),
             OperandError::Shape {
-                operand: Operand::model("the up projection"),
+                operand: Operand::model(OperandKind::UpProjection),
                 shape: Shape::new(&[TOKENS, dims.hidden]),
                 expected: Shape::new(&[TOKENS, dims.ffn])
             }
@@ -549,7 +554,7 @@ mod tests {
                 .add(&residual, &delta, &out, ptr::null_mut())
                 .unwrap_err(),
             OperandError::Dtype {
-                operand: Operand::model("the delta"),
+                operand: Operand::model(OperandKind::Delta),
                 dtype: Dtype::F32,
                 expected: Dtype::Bf16
             }

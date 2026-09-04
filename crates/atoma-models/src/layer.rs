@@ -10,6 +10,8 @@
 //! A model whose layers differ structurally declares one class per shape. Llama's layers are all
 //! alike, so it declares one, [`LLAMA_LAYER`].
 
+use std::fmt;
+
 use atoma_runtime::arena::{Lifetime, RoleDeclaration, RoleTable, TensorRole};
 use atoma_runtime::tensor::Dtype;
 
@@ -143,6 +145,22 @@ pub enum LayerWeight {
     Gate,
     Up,
     Down,
+}
+
+impl fmt::Display for LayerWeight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            LayerWeight::InputNorm => "input norm gain",
+            LayerWeight::Q => "query projection",
+            LayerWeight::K => "key projection",
+            LayerWeight::V => "value projection",
+            LayerWeight::O => "output projection",
+            LayerWeight::PostAttentionNorm => "post-attention norm gain",
+            LayerWeight::Gate => "gate projection",
+            LayerWeight::Up => "up projection",
+            LayerWeight::Down => "down projection",
+        })
+    }
 }
 
 /// The columns of the fused qkv row a projection writes.

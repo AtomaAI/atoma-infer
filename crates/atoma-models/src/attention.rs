@@ -22,7 +22,7 @@ use atoma_runtime::tensor::{Dtype, Tensor};
 use thiserror::Error;
 
 use crate::dims::LlamaDims;
-use crate::operand::{self, Operand, OperandError};
+use crate::operand::{self, Operand, OperandError, OperandKind};
 
 /// f32 is what the split kernel accumulates in.
 const ACCUMULATOR: Dtype = Dtype::F32;
@@ -167,7 +167,11 @@ pub fn cache_halves(cache: &Tensor, dims: &LlamaDims) -> Result<CacheHalves, Att
             dims,
         });
     }
-    operand::dtype(Operand::model("the cache"), cache.layout(), Dtype::Bf16)?;
+    operand::dtype(
+        Operand::model(OperandKind::Cache),
+        cache.layout(),
+        Dtype::Bf16,
+    )?;
     let kv_width = cache.dim(3);
     if kv_width != dims.kv_width() {
         return Err(AttentionError::CacheWidth {
@@ -280,7 +284,7 @@ pub fn kv_write_call(
     stream: *mut c_void,
 ) -> Result<KvWriteCall, AttentionError> {
     let tokens = operand::rows(
-        Operand::model("the activations"),
+        Operand::model(OperandKind::Activations),
         qkv.layout(),
         Dtype::Bf16,
         dims.qkv_width(),
@@ -321,25 +325,21 @@ fn check(
         });
     }
     for (operand, tensor, dtype) in [
-        ("the activations", tensors.qkv, Dtype::Bf16),
-        ("the attention output", tensors.out, Dtype::Bf16),
-        ("the sequence lengths", tensors.seqlens_k, Dtype::I32),
-        ("the block table", tensors.block_table, Dtype::I32),
-        ("the log-sum-exp output", tensors.softmax_lse, Dtype::F32),
-        (
-            "the split log-sum-exp accumulator",
-            tensors.lse_accum,
-            Dtype::F32,
-        ),
-        ("the split output accumulator", tensors.o_accum, Dtype::F32),
+        (OperandKind::Activations, tensors.qkv, Dtype::Bf16),
+        (OperandKind::AttentionOutput, tensors.out, Dtype::Bf16),
+        (OperandKind::KeyLengths, tensors.seqlens_k, Dtype::I32),
+        (OperandKind::BlockTable, tensors.block_table, Dtype::I32),
+        (OperandKind::LogSumExp, tensors.softmax_lse, Dtype::F32),
+        (OperandKind::SplitLogSumExp, tensors.lse_accum, Dtype::F32),
+        (OperandKind::SplitOutput, tensors.o_accum, Dtype::F32),
     ] {
         operand::dtype(Operand::model(operand), tensor.layout(), dtype)?;
     }
     for (operand, tensor, expected_columns) in [
-        ("the activations", tensors.qkv, dims.qkv_width()),
-        ("the attention output", tensors.out, dims.q_width()),
+        (OperandKind::Activations, tensors.qkv, dims.qkv_width()),
+        (OperandKind::AttentionOutput, tensors.out, dims.q_width()),
         (
-            "the block table",
+            OperandKind::BlockTable,
             tensors.block_table,
             plan.max_blocks_per_seq,
         ),
@@ -564,7 +564,7 @@ mod tests {
         assert_eq!(
             refused,
             AttentionError::Operand(OperandError::Shape {
-                operand: Operand::model("the block table"),
+                operand: Operand::model(OperandKind::BlockTable),
                 shape: Shape::new(&[BUCKET, 8]),
                 expected: Shape::new(&[BUCKET, BLOCK_COLUMNS])
             })
@@ -602,7 +602,7 @@ mod tests {
         assert_eq!(
             kv_write_call(&narrow, &halves, &slot_mapping, &dims, ptr::null_mut()).unwrap_err(),
             AttentionError::Operand(OperandError::Shape {
-                operand: Operand::model("the activations"),
+                operand: Operand::model(OperandKind::Activations),
                 shape: Shape::new(&[BUCKET, dims.q_width()]),
                 expected: Shape::new(&[BUCKET, dims.qkv_width()])
             })

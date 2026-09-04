@@ -11,25 +11,104 @@ use std::fmt;
 use atoma_runtime::tensor::{Dtype, Layout, MAX_RANK};
 use thiserror::Error;
 
+use crate::layer::LayerWeight;
+
+/// What a refusal names: a tensor the model has one of, one of a layer's weights, or an
+/// operand's role in one kernel call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperandKind {
+    EmbeddingTable,
+    TokenIds,
+    Positions,
+    KeyLengths,
+    SlotMapping,
+    BlockTable,
+    Logits,
+    CosineTable,
+    SineTable,
+    Cache,
+    ArenaMemory,
+    FinalNormGain,
+    HeadProjection,
+    LayerWeight(LayerWeight),
+    GatheredRows,
+    InputRows,
+    Gain,
+    NormalizedRows,
+    FusedRows,
+    Gate,
+    UpProjection,
+    Activation,
+    Residual,
+    Delta,
+    Sum,
+    Activations,
+    Weight,
+    Output,
+    AttentionOutput,
+    LogSumExp,
+    SplitLogSumExp,
+    SplitOutput,
+}
+
+impl fmt::Display for OperandKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            OperandKind::EmbeddingTable => "the embedding table",
+            OperandKind::TokenIds => "the token ids",
+            OperandKind::Positions => "the positions",
+            OperandKind::KeyLengths => "the key lengths",
+            OperandKind::SlotMapping => "the slot mapping",
+            OperandKind::BlockTable => "the block table",
+            OperandKind::Logits => "the logits",
+            OperandKind::CosineTable => "the cosine table",
+            OperandKind::SineTable => "the sine table",
+            OperandKind::Cache => "the cache",
+            OperandKind::ArenaMemory => "the arena memory",
+            OperandKind::FinalNormGain => "the final norm gain",
+            OperandKind::HeadProjection => "the head projection",
+            OperandKind::LayerWeight(weight) => return write!(f, "{weight}"),
+            OperandKind::GatheredRows => "the gathered rows",
+            OperandKind::InputRows => "the input rows",
+            OperandKind::Gain => "the gain",
+            OperandKind::NormalizedRows => "the normalized rows",
+            OperandKind::FusedRows => "the fused rows",
+            OperandKind::Gate => "the gate",
+            OperandKind::UpProjection => "the up projection",
+            OperandKind::Activation => "the activation",
+            OperandKind::Residual => "the residual",
+            OperandKind::Delta => "the delta",
+            OperandKind::Sum => "the sum",
+            OperandKind::Activations => "the activations",
+            OperandKind::Weight => "the weight",
+            OperandKind::Output => "the output",
+            OperandKind::AttentionOutput => "the attention output",
+            OperandKind::LogSumExp => "the log-sum-exp output",
+            OperandKind::SplitLogSumExp => "the split log-sum-exp accumulator",
+            OperandKind::SplitOutput => "the split output accumulator",
+        })
+    }
+}
+
 /// Which tensor a refusal is about: one the model has, or one of a layer's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Operand {
-    pub what: &'static str,
+    pub kind: OperandKind,
     pub layer: Option<usize>,
 }
 
 impl Operand {
     /// A tensor the model has one of.
     #[must_use]
-    pub const fn model(what: &'static str) -> Self {
-        Self { what, layer: None }
+    pub const fn model(kind: OperandKind) -> Self {
+        Self { kind, layer: None }
     }
 
-    /// A tensor each layer has one of.
+    /// `weight` of layer `layer`.
     #[must_use]
-    pub const fn layer(layer: usize, what: &'static str) -> Self {
+    pub const fn layer(layer: usize, weight: LayerWeight) -> Self {
         Self {
-            what,
+            kind: OperandKind::LayerWeight(weight),
             layer: Some(layer),
         }
     }
@@ -38,8 +117,8 @@ impl Operand {
 impl fmt::Display for Operand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.layer {
-            Some(layer) => write!(f, "layer {layer}'s {}", self.what),
-            None => f.write_str(self.what),
+            Some(layer) => write!(f, "layer {layer}'s {}", self.kind),
+            None => write!(f, "{}", self.kind),
         }
     }
 }
@@ -305,16 +384,16 @@ mod tests {
 
     #[test]
     fn an_operand_names_itself_with_its_layer_when_it_has_one() {
-        assert_eq!(Operand::model("the gain").to_string(), "the gain");
+        assert_eq!(Operand::model(OperandKind::Gain).to_string(), "the gain");
         assert_eq!(
-            Operand::layer(3, "key projection").to_string(),
+            Operand::layer(3, LayerWeight::K).to_string(),
             "layer 3's key projection"
         );
     }
 
     #[test]
     fn a_matrix_is_refused_by_the_first_thing_that_fails_in_order() {
-        let operand = Operand::model("x");
+        let operand = Operand::model(OperandKind::Activations);
         assert_eq!(
             matrix(
                 operand,
@@ -359,7 +438,7 @@ mod tests {
 
     #[test]
     fn rows_are_free_and_vectors_are_held_to_their_length() {
-        let operand = Operand::model("x");
+        let operand = Operand::model(OperandKind::Activations);
         assert_eq!(rows(operand, &bf16(&[7, 4]), Dtype::Bf16, 4), Ok(7));
         assert_eq!(
             rows(operand, &bf16(&[7, 3]), Dtype::Bf16, 4).unwrap_err(),
@@ -382,7 +461,7 @@ mod tests {
 
     #[test]
     fn a_gapped_matrix_may_still_have_contiguous_rows() {
-        let operand = Operand::model("x");
+        let operand = Operand::model(OperandKind::Activations);
         let gapped = Layout::strided(&[2, 4], &[8, 1], Dtype::Bf16).unwrap();
         assert_eq!(inner_contiguous(operand, &gapped), Ok(()));
         let strided = Layout::strided(&[2, 4], &[8, 2], Dtype::Bf16).unwrap();
@@ -399,7 +478,7 @@ mod tests {
     #[test]
     fn errors_say_the_operand_and_both_numbers() {
         let refused = OperandError::TooShort {
-            operand: Operand::model("the positions"),
+            operand: Operand::model(OperandKind::Positions),
             len: 4,
             needed: 8,
         };
@@ -408,7 +487,7 @@ mod tests {
             "the positions holds 4 rows; 8 are read"
         );
         let shape = OperandError::Shape {
-            operand: Operand::layer(1, "key projection"),
+            operand: Operand::layer(1, LayerWeight::K),
             shape: Shape::new(&[4096, 4096]),
             expected: Shape::new(&[1024, 4096]),
         };

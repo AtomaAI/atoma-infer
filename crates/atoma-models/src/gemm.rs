@@ -21,7 +21,7 @@ use cudarc::cublas::{result as cublas, sys};
 use cudarc::driver::{CudaSlice, DevicePtr};
 use thiserror::Error;
 
-use crate::operand::{self, Operand, OperandError};
+use crate::operand::{self, Operand, OperandError, OperandKind};
 
 /// Bytes of workspace the handle is given. cuBLAS documents 32 MiB as the size that lets Hopper
 /// choose among all its kernels; it is allocated once, before any capture.
@@ -110,12 +110,16 @@ impl GemmShape {
     /// contiguous, the weight's input features are not the activations', the output does not
     /// hold the result, or a dtype is not one the multiplication takes.
     pub fn x_wt(x: &Layout, w: &Layout, y: &Layout) -> Result<Self, GemmError> {
-        for (operand, layout) in [("the activations", x), ("the weight", w), ("the output", y)] {
+        for (operand, layout) in [
+            (OperandKind::Activations, x),
+            (OperandKind::Weight, w),
+            (OperandKind::Output, y),
+        ] {
             let operand = Operand::model(operand);
             operand::rank(operand, layout, 2)?;
             operand::inner_contiguous(operand, layout)?;
         }
-        for (operand, layout) in [("the activations", x), ("the weight", w)] {
+        for (operand, layout) in [(OperandKind::Activations, x), (OperandKind::Weight, w)] {
             operand::dtype(Operand::model(operand), layout, Dtype::Bf16)?;
         }
         let output = match y.dtype() {
@@ -403,7 +407,7 @@ mod tests {
         assert_eq!(
             GemmShape::x_wt(&x, &w, &y).unwrap_err(),
             GemmError::Operand(OperandError::Dtype {
-                operand: Operand::model("the activations"),
+                operand: Operand::model(OperandKind::Activations),
                 dtype: Dtype::F32,
                 expected: Dtype::Bf16
             })
@@ -450,7 +454,7 @@ mod tests {
         assert_eq!(
             GemmShape::x_wt(&vector, &w, &x).unwrap_err(),
             GemmError::Operand(OperandError::Rank {
-                operand: Operand::model("the activations"),
+                operand: Operand::model(OperandKind::Activations),
                 rank: 1,
                 expected: 2
             })
@@ -460,7 +464,7 @@ mod tests {
         assert_eq!(
             GemmShape::x_wt(&gapped, &w, &x).unwrap_err(),
             GemmError::Operand(OperandError::InnerStride {
-                operand: Operand::model("the activations"),
+                operand: Operand::model(OperandKind::Activations),
                 stride: 2
             })
         );
