@@ -254,7 +254,7 @@ impl DecodeStep {
         session: &Replay,
         layout: &BatchLayout,
         batch: DecodeBatch,
-        readback: Option<&'a mut Readback>,
+        readback: Option<&'a mut Readback<f32>>,
     ) -> Result<Logits<'a>, DecodeStepError> {
         self.stage(layout, &batch)?;
         session.run(&mut Fence::new(&self.candle_done))?;
@@ -264,9 +264,10 @@ impl DecodeStep {
             session.synchronize()?;
             return Ok(Logits::new(&[], self.decode.dims().vocab));
         };
+        let vocab = self.decode.dims().vocab;
         let logits = self.decode.bucket(batch.bucket)?.statics.logits.address();
         session.run(&mut readback.copy(logits, batch.live)?)?;
-        Ok(readback.wait()?)
+        Ok(Logits::new(readback.wait()?, vocab))
     }
 
     /// Writes `batch`'s inputs from `layout` into the pinned staging.

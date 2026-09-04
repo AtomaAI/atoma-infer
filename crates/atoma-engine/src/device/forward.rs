@@ -61,7 +61,7 @@ pub struct Allocated {
     pub kv_cache: KvCache,
     /// Rank zero reads its logits back; a follower's are read by nobody, so it holds no readback
     /// and its forward returns no rows.
-    pub readback: Option<Readback>,
+    pub readback: Option<Readback<f32>>,
     pub vocab: usize,
 }
 
@@ -175,7 +175,7 @@ impl CudaForward {
         if rows == 0 {
             return Ok(Logits::new(&[], *vocab));
         }
-        read_back(readback, device.stream(), &logits, rows)
+        read_back(readback, device.stream(), &logits, rows, *vocab)
     }
 
     /// The forward's inputs and attention metadata, uploaded from `layout`.
@@ -246,10 +246,11 @@ impl Forward for CudaForward {
 
 /// Copies the `rows` rows of `logits` back through `readback` on `stream`.
 fn read_back<'a>(
-    readback: &'a mut Readback,
+    readback: &'a mut Readback<f32>,
     stream: &Arc<CudaStream>,
     logits: &Tensor,
     rows: usize,
+    vocab: usize,
 ) -> Result<Logits<'a>, CudaForwardError> {
     let (storage, layout) = logits.storage_and_layout();
     let Storage::Cuda(storage) = &*storage else {
@@ -259,5 +260,8 @@ fn read_back<'a>(
     let device_logits = storage
         .as_cuda_slice::<f32>()?
         .slice(start..start + layout.shape().elem_count());
-    Ok(readback.read(stream, &device_logits, rows)?)
+    Ok(Logits::new(
+        readback.read(stream, &device_logits, rows)?,
+        vocab,
+    ))
 }
