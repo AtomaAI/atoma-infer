@@ -2,10 +2,10 @@
 //!
 //! The engine has one ring pair, owned by rank zero. Every other rank is a follower: it is fed
 //! each step command over its own single-producer single-consumer ring, runs the forward for it
-//! and produces nothing, since rank zero alone reads the logits back and samples. A feed wakes the
-//! follower on push and the leader on pop, so the leader can wait on a full feed; both wake the
-//! far side on drop, so a rank that dies is seen by the others at once: a follower going ends the
-//! leader, and the leader going ends every follower.
+//! and produces nothing, since rank zero alone holds a sampler. A feed wakes the follower on push
+//! and the leader on pop, so the leader can wait on a full feed; both wake the far side on drop,
+//! so a rank that dies is seen by the others at once: a follower going ends the leader, and the
+//! leader going ends every follower.
 
 use std::sync::Arc;
 
