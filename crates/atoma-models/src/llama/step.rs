@@ -8,8 +8,10 @@
 //! and the arena's lookup without a device.
 //!
 //! [`LlamaStep`] is the [`Descriptor`] the session enqueues: one bucket's walk over the CUDA
-//! launcher. Nothing in the walk allocates, looks anything up, or checks a shape it could have
-//! checked when the tables were built; what remains inside a recording is the launches.
+//! launcher. Nothing in the walk allocates or looks anything up: every view was resolved when the
+//! tables were built. Each launch still holds its views to what its kernel assumes, through the
+//! operand checks, because that is what the launch then trusts; those checks are host arithmetic
+//! over copied layouts and run at capture time or on an eager step, never inside a replay.
 
 use core::ffi::c_void;
 use core::fmt;
