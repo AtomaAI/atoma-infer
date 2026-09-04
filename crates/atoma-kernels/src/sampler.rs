@@ -90,19 +90,18 @@ mod compiled {
     /// Every address in `call` must be live on the stream's device and match its documented
     /// shape; every row slot must index `records` and `sampled`, and no two rows may share one.
     pub unsafe fn sample(call: &SampleCall) -> Result<(), KernelError> {
-        // SAFETY: the caller's contract; the FFI returns the launch status.
-        let status = unsafe {
-            ffi::sampler_sample_f32(
-                call.logits as *const c_void,
-                call.row_slots as *const c_void,
-                call.records as *mut c_void,
-                call.sampled as *mut c_void,
-                call.out as *mut c_void,
-                arg_i64("vocab", call.vocab)?,
-                arg_i64("n_rows", call.n_rows)?,
-                call.stream,
-            )
+        let args = ffi::SampleArgs {
+            logits: call.logits as *const c_void,
+            row_slots: call.row_slots as *const c_void,
+            records: call.records as *mut c_void,
+            sampled: call.sampled as *mut c_void,
+            out: call.out as *mut c_void,
+            vocab: arg_i64("vocab", call.vocab)?,
+            n_rows: arg_i64("n_rows", call.n_rows)?,
         };
+        // SAFETY: the caller's contract; the FFI reads the arguments for the launch and returns
+        // its status.
+        let status = unsafe { ffi::sampler_sample_f32(&raw const args, call.stream) };
         ffi::check_launch("sampler_sample_f32", status)
     }
 }
@@ -163,6 +162,29 @@ mod tests {
         "uint64_t seed;",
     ];
 
+    /// The sample launch's arguments as the host lays them out, field for field.
+    const SAMPLE_ARGS_FIELDS: [&str; 7] = [
+        "const float* logits;",
+        "const int32_t* row_slots;",
+        "SlotRecord* records;",
+        "uint32_t* sampled;",
+        "uint32_t* out;",
+        "int64_t vocab;",
+        "int64_t n_rows;",
+    ];
+
+    /// The fields of the struct the sources declare as `name`, in order.
+    fn declared_fields(name: &str) -> Vec<&'static str> {
+        let (_, rest) = KERNEL_SOURCE
+            .split_once(&format!("struct {name} {{"))
+            .unwrap_or_else(|| panic!("the sources declare {name}"));
+        let body = rest.split_once("};").expect("the struct closes").0;
+        body.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
     #[test]
     fn the_sources_export_every_launcher_with_a_status_and_a_stream() {
         for launcher in LAUNCHERS {
@@ -187,20 +209,16 @@ mod tests {
     }
 
     #[test]
-    fn the_record_is_declared_field_for_field_as_the_host_lays_it_out() {
-        let (_, rest) = KERNEL_SOURCE
-            .split_once("struct SlotRecord {")
-            .expect("the sources declare the record");
-        let body = rest.split_once("};").expect("the record closes").0;
-        let fields: Vec<&str> = body
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect();
-        assert_eq!(fields, RECORD_FIELDS);
+    fn the_record_and_the_arguments_are_declared_field_for_field_as_the_host_lays_them_out() {
+        assert_eq!(declared_fields("SlotRecord"), RECORD_FIELDS);
         assert!(
             KERNEL_SOURCE.contains("static_assert(sizeof(SlotRecord) == 24"),
             "the sources hold the record to its size"
+        );
+        assert_eq!(declared_fields("SampleArgs"), SAMPLE_ARGS_FIELDS);
+        assert!(
+            KERNEL_SOURCE.contains("static_assert(sizeof(SampleArgs) == 56"),
+            "the sources hold the arguments to their size"
         );
     }
 

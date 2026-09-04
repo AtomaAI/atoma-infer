@@ -18,6 +18,28 @@
 
 #include <cstdint>
 
+// One request slot's record, as atoma-engine's sampling::record lays it out.
+struct SlotRecord {
+    float temperature;
+    float top_p;
+    uint32_t top_k;
+    uint32_t draws;
+    uint64_t seed;
+};
+static_assert(sizeof(SlotRecord) == 24, "the record is 24 bytes, as the host declares it");
+
+// The sample launch's arguments, as atoma-kernels' ffi::SampleArgs lays them out.
+struct SampleArgs {
+    const float* logits;
+    const int32_t* row_slots;
+    SlotRecord* records;
+    uint32_t* sampled;
+    uint32_t* out;
+    int64_t vocab;
+    int64_t n_rows;
+};
+static_assert(sizeof(SampleArgs) == 56, "the arguments are 56 bytes, as the host declares them");
+
 namespace {
 
 constexpr int kThreads = 1024;
@@ -29,15 +51,36 @@ constexpr unsigned kFullMask = 0xFFFFFFFFu;
 // The weight of the largest logit: one, in 32-bit fixed point.
 constexpr double kUnitWeight = 4294967296.0;
 
-// One request slot's record, as atoma-engine's sampling::record lays it out.
-struct SlotRecord {
-    float temperature;
-    float top_p;
-    uint32_t top_k;
-    uint32_t draws;
-    uint64_t seed;
+// One row of logits.
+struct Row {
+    const float* logits;
+    int64_t vocab;
 };
-static_assert(sizeof(SlotRecord) == 24, "the record is 24 bytes, as the host declares it");
+
+// A candidate for the row's largest logit: its order key and its index.
+struct Largest {
+    uint32_t key;
+    long long index;
+};
+
+// What a drawn row keeps: a token is admitted when its key is at least `admit_key`, weighs
+// exp((logit - max) / temperature) in fixed point, and is kept when that weight is at least
+// `keep_at_least`.
+struct Kept {
+    uint32_t admit_key;
+    float max;
+    float temperature;
+    unsigned long long keep_at_least;
+};
+
+// The block's shared memory: the histogram the radix walks bin into, the per-warp partials of
+// the reductions and the scan's total, and the digit thread zero chose.
+struct Scratch {
+    unsigned long long hist[kBins];
+    unsigned long long totals[kWarps + 1];
+    Largest largest[kWarps];
+    uint32_t chosen;
+};
 
 // Philox4x32-10, as Random123 defines it and the host computes it.
 __device__ __forceinline__ void philox_round(uint32_t c[4], const uint32_t k[2]) {
@@ -86,75 +129,71 @@ __device__ __forceinline__ unsigned long long weight_q(float logit, float max, f
     return static_cast<unsigned long long>(static_cast<double>(w) * kUnitWeight);
 }
 
-// The first largest key across the block: keys descending, then indices ascending.
-__device__ void block_argmax(uint32_t& key, long long& index, uint32_t* keys, long long* indices) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        const uint32_t other_key = __shfl_down_sync(kFullMask, key, offset);
-        const long long other_index = __shfl_down_sync(kFullMask, index, offset);
-        if (other_key > key || (other_key == key && other_index < index)) {
-            key = other_key;
-            index = other_index;
-        }
+// The weight of `logit` when its token is kept, and zero otherwise.
+__device__ __forceinline__ unsigned long long kept_weight(float logit, const Kept& kept) {
+    if (order_key(logit) < kept.admit_key) {
+        return 0ull;
     }
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    if (lane == 0) {
-        keys[warp] = key;
-        indices[warp] = index;
-    }
-    __syncthreads();
-    if (warp == 0) {
-        key = keys[lane];
-        index = indices[lane];
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            const uint32_t other_key = __shfl_down_sync(kFullMask, key, offset);
-            const long long other_index = __shfl_down_sync(kFullMask, index, offset);
-            if (other_key > key || (other_key == key && other_index < index)) {
-                key = other_key;
-                index = other_index;
-            }
-        }
-        if (lane == 0) {
-            keys[0] = key;
-            indices[0] = index;
-        }
-    }
-    __syncthreads();
-    key = keys[0];
-    index = indices[0];
-    __syncthreads();
+    const unsigned long long weight = weight_q(logit, kept.max, kept.temperature);
+    return weight >= kept.keep_at_least ? weight : 0ull;
 }
 
-// The sum of every thread's value, in a fixed order.
-__device__ unsigned long long block_sum(unsigned long long value, unsigned long long* totals) {
+// The larger of two candidates: keys descending, then indices ascending, so on a tie the
+// earlier index wins.
+struct Larger {
+    __device__ __forceinline__ Largest operator()(Largest a, Largest b) const {
+        return (b.key > a.key || (b.key == a.key && b.index < a.index)) ? b : a;
+    }
+};
+
+struct Sum {
+    __device__ __forceinline__ unsigned long long operator()(unsigned long long a,
+                                                            unsigned long long b) const {
+        return a + b;
+    }
+};
+
+__device__ __forceinline__ unsigned long long shuffle_down(unsigned long long value, int offset) {
+    return __shfl_down_sync(kFullMask, value, offset);
+}
+
+__device__ __forceinline__ Largest shuffle_down(Largest value, int offset) {
+    return {__shfl_down_sync(kFullMask, value.key, offset),
+            __shfl_down_sync(kFullMask, value.index, offset)};
+}
+
+// Every thread's value combined across the block in a fixed order: within each warp, then across
+// the warps' results in warp zero, one per lane. Every thread returns the result.
+template <typename T, typename Combine>
+__device__ T block_reduce(T value, Combine combine, T* per_warp) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(kFullMask, value, offset);
+        value = combine(value, shuffle_down(value, offset));
     }
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     if (lane == 0) {
-        totals[warp] = value;
+        per_warp[warp] = value;
     }
     __syncthreads();
     if (warp == 0) {
-        value = totals[lane];
+        value = per_warp[lane];
         for (int offset = 16; offset > 0; offset >>= 1) {
-            value += __shfl_down_sync(kFullMask, value, offset);
+            value = combine(value, shuffle_down(value, offset));
         }
         if (lane == 0) {
-            totals[0] = value;
+            per_warp[0] = value;
         }
     }
     __syncthreads();
-    value = totals[0];
+    value = per_warp[0];
     __syncthreads();
     return value;
 }
 
 // Every thread's exclusive prefix over the block's values in thread order, and the total.
-__device__ unsigned long long block_exclusive_scan(unsigned long long value,
-                                                   unsigned long long* totals,
+__device__ unsigned long long block_exclusive_scan(unsigned long long value, Scratch& scratch,
                                                    unsigned long long& total) {
+    unsigned long long* totals = scratch.totals;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     unsigned long long inclusive = value;
@@ -192,191 +231,171 @@ __device__ unsigned long long block_exclusive_scan(unsigned long long value,
 // to reach once the bins above are taken off. Thread zero walks and keeps `remaining` for the
 // next digit; the other threads' copies are never read again, and every thread reads the digit
 // from shared memory.
-__device__ uint32_t crossing_bin(const unsigned long long* hist, unsigned long long& remaining,
-                                 uint32_t* chosen) {
+__device__ uint32_t crossing_bin(Scratch& scratch, unsigned long long& remaining) {
     if (threadIdx.x == 0) {
         uint32_t digit = 0;
         for (int bin = kBins - 1; bin >= 0; --bin) {
-            if (remaining <= hist[bin]) {
+            if (remaining <= scratch.hist[bin]) {
                 digit = static_cast<uint32_t>(bin);
                 break;
             }
-            remaining -= hist[bin];
+            remaining -= scratch.hist[bin];
         }
-        *chosen = digit;
+        scratch.chosen = digit;
     }
     __syncthreads();
-    const uint32_t digit = *chosen;
+    const uint32_t digit = scratch.chosen;
     __syncthreads();
     return digit;
 }
 
+__device__ __forceinline__ void clear_histogram(Scratch& scratch) {
+    for (int bin = threadIdx.x; bin < kBins; bin += kThreads) {
+        scratch.hist[bin] = 0;
+    }
+    __syncthreads();
+}
+
 // The k-th largest key of the row: after four digit walks the prefix is that key exactly. Every
 // token whose key is at least it is admitted, which is the k largest and every tie of the k-th.
-__device__ uint32_t kth_largest_key(const float* row, int64_t vocab, uint32_t k,
-                                    unsigned long long* hist, uint32_t* chosen) {
+__device__ uint32_t kth_largest_key(const Row& row, uint32_t k, Scratch& scratch) {
     uint32_t prefix = 0;
     unsigned long long remaining = k;
     for (int shift = 24; shift >= 0; shift -= 8) {
-        for (int bin = threadIdx.x; bin < kBins; bin += kThreads) {
-            hist[bin] = 0;
-        }
-        __syncthreads();
+        clear_histogram(scratch);
         const uint32_t prefix_mask = shift == 24 ? 0u : (0xFFFFFFFFu << (shift + 8));
-        for (int64_t i = threadIdx.x; i < vocab; i += kThreads) {
-            const uint32_t key = order_key(row[i]);
+        for (int64_t i = threadIdx.x; i < row.vocab; i += kThreads) {
+            const uint32_t key = order_key(row.logits[i]);
             if ((key & prefix_mask) == prefix) {
-                atomicAdd(&hist[(key >> shift) & 0xFFu], 1ull);
+                atomicAdd(&scratch.hist[(key >> shift) & 0xFFu], 1ull);
             }
         }
         __syncthreads();
-        prefix |= crossing_bin(hist, remaining, chosen) << shift;
+        prefix |= crossing_bin(scratch, remaining) << shift;
     }
     return prefix;
 }
 
-// The weight of the token the walk down the admitted weights crosses `target` at: after five
-// digit walks over the 33-bit weights the prefix is that weight exactly. Every admitted token
-// weighing at least it is kept, which is the heaviest reaching the target and every tie of the
-// last.
-__device__ unsigned long long crossing_weight(const float* row, int64_t vocab, uint32_t admit_key,
-                                              float max, float temperature,
-                                              unsigned long long target,
-                                              unsigned long long* hist, uint32_t* chosen) {
+// The key every admitted token's key is at least: the top_k-th largest when top_k filters, and
+// zero, which admits every token, when it is unset or covers the row.
+__device__ uint32_t admit_key(const Row& row, const SlotRecord& record, Scratch& scratch) {
+    const uint32_t vocab =
+        row.vocab > 0xFFFFFFFFll ? 0xFFFFFFFFu : static_cast<uint32_t>(row.vocab);
+    const bool filters = record.top_k != 0 && record.top_k < vocab;
+    return filters ? kth_largest_key(row, record.top_k, scratch) : 0u;
+}
+
+// The mass of what the row keeps.
+__device__ unsigned long long kept_mass(const Row& row, const Kept& kept, Scratch& scratch) {
+    unsigned long long local = 0;
+    for (int64_t i = threadIdx.x; i < row.vocab; i += kThreads) {
+        local += kept_weight(row.logits[i], kept);
+    }
+    return block_reduce(local, Sum{}, scratch.totals);
+}
+
+// The mass top_p asks to keep of `mass`: that share rounded up, and at least one.
+__device__ __forceinline__ unsigned long long target_mass(float top_p, unsigned long long mass) {
+    const double target = ceil(static_cast<double>(top_p) * static_cast<double>(mass));
+    const unsigned long long rounded = static_cast<unsigned long long>(target);
+    return rounded < 1 ? 1 : rounded;
+}
+
+// The weight of the token the walk down the kept weights crosses `target` at: after five digit
+// walks over the 33-bit weights the prefix is that weight exactly. Every kept token weighing at
+// least it stays kept, which is the heaviest reaching the target and every tie of the last.
+__device__ unsigned long long crossing_weight(const Row& row, const Kept& kept,
+                                              unsigned long long target, Scratch& scratch) {
     unsigned long long prefix = 0;
     unsigned long long remaining = target;
     for (int shift = 32; shift >= 0; shift -= 8) {
-        for (int bin = threadIdx.x; bin < kBins; bin += kThreads) {
-            hist[bin] = 0;
-        }
-        __syncthreads();
+        clear_histogram(scratch);
         const unsigned long long prefix_mask = shift == 32 ? 0ull : (~0ull << (shift + 8));
-        for (int64_t i = threadIdx.x; i < vocab; i += kThreads) {
-            const float logit = row[i];
-            if (order_key(logit) < admit_key) {
-                continue;
-            }
-            const unsigned long long q = weight_q(logit, max, temperature);
-            if ((q & prefix_mask) == prefix) {
-                atomicAdd(&hist[(q >> shift) & 0xFFull], q);
+        for (int64_t i = threadIdx.x; i < row.vocab; i += kThreads) {
+            const unsigned long long weight = kept_weight(row.logits[i], kept);
+            if ((weight & prefix_mask) == prefix) {
+                atomicAdd(&scratch.hist[(weight >> shift) & 0xFFull], weight);
             }
         }
         __syncthreads();
-        prefix |= static_cast<unsigned long long>(crossing_bin(hist, remaining, chosen)) << shift;
+        prefix |= static_cast<unsigned long long>(crossing_bin(scratch, remaining)) << shift;
     }
     return prefix;
 }
 
-// The tokens thread `thread` owns for the pick: a contiguous run, so the block's threads in
-// order cover the row in index order.
+// The first largest logit of the row. A thread's run is in index order, so on a tie the earlier
+// index wins by staying; the sentinel index sits past the row and loses every tie.
+__device__ Largest row_largest(const Row& row, Scratch& scratch) {
+    Largest best = {order_key(-INFINITY), row.vocab};
+    for (int64_t i = threadIdx.x; i < row.vocab; i += kThreads) {
+        best = Larger{}(best, Largest{order_key(row.logits[i]), i});
+    }
+    return block_reduce(best, Larger{}, scratch.largest);
+}
+
+// The tokens this thread owns for the pick: a contiguous run, so the block's threads in order
+// cover the row in index order.
 __device__ __forceinline__ void owned_range(int64_t vocab, int64_t& begin, int64_t& end) {
     const int64_t thread = threadIdx.x;
     begin = (thread * vocab) / kThreads;
     end = ((thread + 1) * vocab) / kThreads;
 }
 
-__global__ void __launch_bounds__(kThreads)
-    sample_kernel(const float* __restrict__ logits, const int32_t* __restrict__ row_slots,
-                  SlotRecord* records, uint32_t* sampled, uint32_t* __restrict__ out,
-                  int64_t vocab) {
-    __shared__ unsigned long long hist[kBins];
-    __shared__ unsigned long long totals[kWarps + 1];
-    __shared__ uint32_t keys[kWarps];
-    __shared__ long long indices[kWarps];
-    __shared__ uint32_t chosen;
-
-    const int64_t row = blockIdx.x;
-    const float* logits_row = logits + row * vocab;
-    const int32_t slot = row_slots[row];
-    const SlotRecord record = records[slot];
-
-    // The first largest logit. A thread's run is in index order, so on a tie the earlier index
-    // wins by staying; the sentinel index sits past the row and loses every tie.
-    uint32_t best_key = order_key(-INFINITY);
-    long long best_index = vocab;
-    for (int64_t i = threadIdx.x; i < vocab; i += kThreads) {
-        const uint32_t key = order_key(logits_row[i]);
-        if (key > best_key || (key == best_key && i < best_index)) {
-            best_key = key;
-            best_index = i;
+// The kept token the uniform's point falls on, walking the row in index order by weight, from
+// the one thread whose run holds it; every other thread returns a negative index.
+__device__ long long picked(const Row& row, const Kept& kept, uint64_t uniform, Scratch& scratch) {
+    int64_t begin;
+    int64_t end;
+    owned_range(row.vocab, begin, end);
+    unsigned long long local = 0;
+    for (int64_t i = begin; i < end; ++i) {
+        local += kept_weight(row.logits[i], kept);
+    }
+    unsigned long long total;
+    const unsigned long long exclusive = block_exclusive_scan(local, scratch, total);
+    const unsigned long long point = uniform % total;
+    if (point < exclusive || exclusive + local <= point) {
+        return -1;
+    }
+    unsigned long long cumulative = exclusive;
+    for (int64_t i = begin; i < end; ++i) {
+        cumulative += kept_weight(row.logits[i], kept);
+        if (cumulative > point) {
+            return i;
         }
     }
-    block_argmax(best_key, best_index, keys, indices);
-    const float max = logits_row[best_index];
-    const uint32_t best = static_cast<uint32_t>(best_index);
+    return -1;
+}
 
-    // A greedy record takes it; so does a row with no finite logit to draw from.
+__global__ void __launch_bounds__(kThreads) sample_kernel(SampleArgs args) {
+    __shared__ Scratch scratch;
+    const int64_t row_index = blockIdx.x;
+    const Row row = {args.logits + row_index * args.vocab, args.vocab};
+    const int32_t slot = args.row_slots[row_index];
+    const SlotRecord record = args.records[slot];
+
+    const Largest largest = row_largest(row, scratch);
+    const float max = row.logits[largest.index];
+    // A greedy record takes the largest; so does a row with no finite logit to draw from.
     if (record.temperature == 0.0f || !isfinite(max)) {
         if (threadIdx.x == 0) {
-            out[row] = best;
-            sampled[slot] = best;
+            const uint32_t token = static_cast<uint32_t>(largest.index);
+            args.out[row_index] = token;
+            args.sampled[slot] = token;
         }
         return;
     }
 
-    // The top_k largest, ties included.
-    const uint32_t vocab_u32 = vocab > 0xFFFFFFFFll ? 0xFFFFFFFFu : static_cast<uint32_t>(vocab);
-    const bool filter_k = record.top_k != 0 && record.top_k < vocab_u32;
-    const uint32_t admit_key =
-        filter_k ? kth_largest_key(logits_row, vocab, record.top_k, hist, &chosen) : 0u;
-
-    // The mass of what is admitted, and the heaviest of it reaching top_p.
-    unsigned long long local = 0;
-    for (int64_t i = threadIdx.x; i < vocab; i += kThreads) {
-        const float logit = logits_row[i];
-        if (order_key(logit) >= admit_key) {
-            local += weight_q(logit, max, record.temperature);
-        }
-    }
-    const unsigned long long mass = block_sum(local, totals);
-    unsigned long long keep_at_least = 1;
+    Kept kept = {admit_key(row, record, scratch), max, record.temperature, 1ull};
     if (record.top_p < 1.0f) {
-        const double target = ceil(static_cast<double>(record.top_p) * static_cast<double>(mass));
-        unsigned long long target_mass = static_cast<unsigned long long>(target);
-        if (target_mass < 1) {
-            target_mass = 1;
-        }
-        keep_at_least = crossing_weight(logits_row, vocab, admit_key, max, record.temperature,
-                                        target_mass, hist, &chosen);
+        const unsigned long long target = target_mass(record.top_p, kept_mass(row, kept, scratch));
+        kept.keep_at_least = crossing_weight(row, kept, target, scratch);
     }
-
-    // The pick: each thread's run of tokens, its mass, and where the uniform falls.
-    int64_t begin;
-    int64_t end;
-    owned_range(vocab, begin, end);
-    local = 0;
-    for (int64_t i = begin; i < end; ++i) {
-        const float logit = logits_row[i];
-        if (order_key(logit) >= admit_key) {
-            const unsigned long long q = weight_q(logit, max, record.temperature);
-            if (q >= keep_at_least) {
-                local += q;
-            }
-        }
-    }
-    unsigned long long total;
-    const unsigned long long exclusive = block_exclusive_scan(local, totals, total);
-    const unsigned long long point = philox_draw(record.seed, record.draws) % total;
-    if (exclusive <= point && point < exclusive + local) {
-        unsigned long long cumulative = exclusive;
-        for (int64_t i = begin; i < end; ++i) {
-            const float logit = logits_row[i];
-            if (order_key(logit) < admit_key) {
-                continue;
-            }
-            const unsigned long long q = weight_q(logit, max, record.temperature);
-            if (q < keep_at_least) {
-                continue;
-            }
-            cumulative += q;
-            if (cumulative > point) {
-                const uint32_t token = static_cast<uint32_t>(i);
-                out[row] = token;
-                sampled[slot] = token;
-                records[slot].draws = record.draws + 1;
-                break;
-            }
-        }
+    const long long token = picked(row, kept, philox_draw(record.seed, record.draws), scratch);
+    if (token >= 0) {
+        args.out[row_index] = static_cast<uint32_t>(token);
+        args.sampled[slot] = static_cast<uint32_t>(token);
+        args.records[slot].draws = record.draws + 1;
     }
 }
 
@@ -395,16 +414,11 @@ __global__ void gather_kernel(uint32_t* token_ids, const int32_t* __restrict__ g
 
 }  // namespace
 
-extern "C" cudaError_t sampler_sample_f32(const void* logits, const void* row_slots, void* records,
-                                          void* sampled, void* out, int64_t vocab, int64_t n_rows,
-                                          cudaStream_t stream) {
-    if (n_rows == 0 || vocab == 0) {
+extern "C" cudaError_t sampler_sample_f32(const SampleArgs* args, cudaStream_t stream) {
+    if (args->n_rows == 0 || args->vocab == 0) {
         return cudaSuccess;
     }
-    sample_kernel<<<static_cast<unsigned int>(n_rows), kThreads, 0, stream>>>(
-        static_cast<const float*>(logits), static_cast<const int32_t*>(row_slots),
-        static_cast<SlotRecord*>(records), static_cast<uint32_t*>(sampled),
-        static_cast<uint32_t*>(out), vocab);
+    sample_kernel<<<static_cast<unsigned int>(args->n_rows), kThreads, 0, stream>>>(*args);
     return cudaGetLastError();
 }
 
@@ -415,8 +429,8 @@ extern "C" cudaError_t sampler_gather_u32(void* token_ids, const void* gather_sl
         return cudaSuccess;
     }
     constexpr int kGatherThreads = 256;
-    const unsigned int blocks = static_cast<unsigned int>((n_rows + kGatherThreads - 1) / kGatherThreads);
-    gather_kernel<<<blocks, kGatherThreads, 0, stream>>>(
+    const int64_t blocks = (n_rows + kGatherThreads - 1) / kGatherThreads;
+    gather_kernel<<<static_cast<unsigned int>(blocks), kGatherThreads, 0, stream>>>(
         static_cast<uint32_t*>(token_ids), static_cast<const int32_t*>(gather_slots),
         static_cast<const uint32_t*>(sampled), n_rows);
     return cudaGetLastError();
