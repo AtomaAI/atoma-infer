@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 const NON_LAUNCHING_FFI: [&str; 2] = ["flash_last_error", "flash_cuda_error_string"];
 
 /// The launchers we own, which return their status directly.
-const STATUS_RETURNING_LAUNCHERS: [&str; 7] = [
+const STATUS_RETURNING_LAUNCHERS: [&str; 9] = [
     "copy_blocks_cache",
     "reshape_and_cache_flash_cache",
     "decode_embedding_gather_bf16",
@@ -26,6 +26,8 @@ const STATUS_RETURNING_LAUNCHERS: [&str; 7] = [
     "decode_rope_bf16",
     "decode_silu_mul_bf16",
     "decode_add_bf16",
+    "sampler_sample_f32",
+    "sampler_gather_u32",
 ];
 
 /// The modules that call into the FFI. Every launch site lives in one of these.

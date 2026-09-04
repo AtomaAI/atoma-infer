@@ -22,6 +22,8 @@ namespace {
 
 constexpr int kThreads = 1024;
 constexpr int kWarps = kThreads / 32;
+// The block reductions finish in warp zero, which reads one entry per warp with one lane each.
+static_assert(kWarps == 32, "one block of kThreads threads must hold exactly one warp of warps");
 constexpr int kBins = 256;
 constexpr unsigned kFullMask = 0xFFFFFFFFu;
 // The weight of the largest logit: one, in 32-bit fixed point.
@@ -187,7 +189,9 @@ __device__ unsigned long long block_exclusive_scan(unsigned long long value,
 }
 
 // The digit of the bin the walk from the top crosses `remaining` in; `remaining` is what is left
-// to reach once the bins above are taken off. Thread zero walks; every thread reads the answer.
+// to reach once the bins above are taken off. Thread zero walks and keeps `remaining` for the
+// next digit; the other threads' copies are never read again, and every thread reads the digit
+// from shared memory.
 __device__ uint32_t crossing_bin(const unsigned long long* hist, unsigned long long& remaining,
                                  uint32_t* chosen) {
     if (threadIdx.x == 0) {

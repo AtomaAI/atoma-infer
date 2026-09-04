@@ -197,7 +197,8 @@ fn the_device_sampler_matches_its_host_reference() {
         let params = drawn(temperature, top_k, top_p, 0x5EED);
         let mut slot_free = 0;
         for draw in 0..32 {
-            // A fresh slot per draw, so the record's counter is the draw under test.
+            // A new request each time, so its slot is claimed afresh and the seed under test
+            // reaches the record; its counter is then zero, which is the draw compared.
             let slot = slot_free % SLOTS as u32;
             slot_free += 1;
             let mut params = params;
@@ -287,10 +288,11 @@ fn drawn_tokens_follow_the_distribution_the_filters_leave() {
     }
     let params = drawn(1.0, 0, 0.999, 9090);
 
+    // One request in one slot throughout, so its record is written once and the kernel advances
+    // its draw counter: what is measured is one seeded request's stream, which is what a client
+    // gets.
     let mut counts = [0usize; 4];
     for draw in 0..DRAWS {
-        let mut params = params;
-        params.seed = 9090 + draw as u64;
         let token = rig.sample(&layout(vec![entry(1, 0, params)]), &[row.clone()])[0];
         let index = heavy
             .iter()

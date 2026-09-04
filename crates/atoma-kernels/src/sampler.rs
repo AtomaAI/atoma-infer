@@ -143,6 +143,9 @@ pub unsafe fn sample(_call: &SampleCall) -> Result<(), KernelError> {
 #[cfg(test)]
 mod tests {
     #[cfg(not(feature = "cuda"))]
+    use core::ptr;
+
+    #[cfg(not(feature = "cuda"))]
     use super::*;
 
     /// The kernel sources, so the launcher list and the sources are held to the same names.
@@ -211,7 +214,7 @@ mod tests {
     #[cfg(not(feature = "cuda"))]
     #[test]
     fn a_build_without_kernels_refuses_each_by_name() {
-        let stream = core::ptr::null_mut();
+        let stream = ptr::null_mut();
         // SAFETY: the stubs dereference nothing.
         let refusals = unsafe {
             [

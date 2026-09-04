@@ -192,7 +192,6 @@ dependencies = [
  "atoma-runtime",
  "candle-core",
  "candle-nn",
- "candle-transformers",
  "core_affinity",
  "crossbeam-utils",
  "cudarc 0.19.8",
