@@ -179,11 +179,13 @@ impl CausalSelfAttention {
     ) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "attn");
         let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
-        let q_proj = TensorParallelColumnLinear::load(vb.pp("q_proj"), comm.clone())?;
-        let k_proj = TensorParallelColumnLinear::load(vb.pp("k_proj"), comm.clone())?;
-        let v_proj = TensorParallelColumnLinear::load(vb.pp("v_proj"), comm.clone())?;
-        let o_proj = TensorParallelRowLinear::load(vb.pp("o_proj"), comm.clone())?;
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let q = (cfg.num_attention_heads * head_dim, cfg.hidden_size);
+        let kv = (cfg.num_key_value_heads * head_dim, cfg.hidden_size);
+        let q_proj = TensorParallelColumnLinear::load(vb.pp("q_proj"), q, comm.clone())?;
+        let k_proj = TensorParallelColumnLinear::load(vb.pp("k_proj"), kv, comm.clone())?;
+        let v_proj = TensorParallelColumnLinear::load(vb.pp("v_proj"), kv, comm.clone())?;
+        let o_proj = TensorParallelRowLinear::load(vb.pp("o_proj"), (q.1, q.0), comm.clone())?;
 
         Ok(Self {
             q_proj,
@@ -224,11 +226,12 @@ impl Mlp {
         self.c_proj.forward(&x)
     }
 
-    fn load(vb: VarBuilder, _cfg: &Config, comm: Rc<Comm>) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &Config, comm: Rc<Comm>) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "mlp");
-        let c_fc1 = TensorParallelColumnLinear::load(vb.pp("gate_proj"), comm.clone())?;
-        let c_fc2 = TensorParallelColumnLinear::load(vb.pp("up_proj"), comm.clone())?;
-        let c_proj = TensorParallelRowLinear::load(vb.pp("down_proj"), comm)?;
+        let up = (cfg.intermediate_size, cfg.hidden_size);
+        let c_fc1 = TensorParallelColumnLinear::load(vb.pp("gate_proj"), up, comm.clone())?;
+        let c_fc2 = TensorParallelColumnLinear::load(vb.pp("up_proj"), up, comm.clone())?;
+        let c_proj = TensorParallelRowLinear::load(vb.pp("down_proj"), (up.1, up.0), comm)?;
         Ok(Self {
             c_fc1,
             c_fc2,
