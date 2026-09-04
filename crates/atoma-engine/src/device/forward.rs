@@ -206,7 +206,7 @@ impl CudaForward {
             metadata,
         } = self.upload(layout)?;
         let Allocated {
-            device,
+            device: _,
             weights,
             kv_cache,
             sampler: _,
@@ -217,7 +217,8 @@ impl CudaForward {
             .llama_mut()
             .forward(&tokens, &positions, &selected, &kv_caches, metadata)?;
         #[cfg(not(feature = "nccl"))]
-        self.decode_step.after_candle(device.stream())?;
+        self.decode_step
+            .after_candle(self.allocated.device.stream())?;
         Ok(logits)
     }
 
