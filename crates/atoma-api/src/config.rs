@@ -97,7 +97,7 @@ mod tests {
             let config: Config = load(path).expect("the example configuration loads");
             assert_eq!(config.engine.scheduler.block_size.get(), 16);
             assert_eq!(config.executor.ranks.len(), 1);
-            assert_eq!(config.model.id, "meta-llama/Llama-3.2-1B-Instruct");
+            assert_eq!(config.model.id.as_str(), "meta-llama/Llama-3.2-1B-Instruct");
             assert_eq!(config.server.bind.port(), 8080);
             assert_eq!(config.server.keep_alive, Duration::from_millis(100));
             assert_eq!(config.server.heartbeat_stale_after, Duration::from_secs(1));

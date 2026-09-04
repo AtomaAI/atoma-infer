@@ -10,7 +10,7 @@
 #
 # The model defaults to the Llama 3.1 8B Instruct checkpoint; any Llama loadable in bf16 that
 # fits the device works. The flash-attention kernels are a long nvcc build the first time; set
-# ATOMA_FLASH_ATTN_BUILD_DIR to keep the build across checkouts.
+# FLASH_ATTN_BUILD_DIR to keep the build across checkouts.
 #
 # The test prints an evidence block with the argmax agreement and the largest absolute
 # difference on the f32 logits; paste it into the pull request.
@@ -36,8 +36,8 @@ if [[ ! -f $cutlass_header ]]; then
 	git submodule update --init --depth 1 crates/atoma-kernels/cutlass
 fi
 
-export ATOMA_PARITY_MODEL="${1:-${ATOMA_PARITY_MODEL:-NousResearch/Meta-Llama-3.1-8B-Instruct}}"
-echo "==> model: $ATOMA_PARITY_MODEL"
+export PARITY_MODEL="${1:-${PARITY_MODEL:-NousResearch/Meta-Llama-3.1-8B-Instruct}}"
+echo "==> model: $PARITY_MODEL"
 echo "==> commit: $(git rev-parse HEAD)"
 echo "==> gpu: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n 1)"
 

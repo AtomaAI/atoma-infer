@@ -216,6 +216,7 @@ mod tests {
     };
     use crate::detokenize::Detokenizer;
     use crate::test_support::tokenizer;
+    use atoma_engine::config::ModelId;
 
     fn token(token: u32) -> RequestEvent {
         RequestEvent::Token {
@@ -239,7 +240,7 @@ mod tests {
     fn completion(stop: Vec<String>) -> Completion {
         let identity = CompletionIdentity {
             id: "chatcmpl-1".into(),
-            model: "llama".into(),
+            model: ModelId::new("llama"),
             created: 17,
         };
         Completion::new(identity, Detokenizer::new(tokenizer(), stop), 3)
@@ -383,7 +384,7 @@ mod tests {
         let completion = completion(Vec::new());
         let chunk = completion.chunk("hi".into());
         assert_eq!(chunk.id, "chatcmpl-1");
-        assert_eq!(chunk.model, "llama");
+        assert_eq!(chunk.model.as_str(), "llama");
         assert_eq!(chunk.created, 17);
         assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
         let last = completion.last_chunk(FinishReason::Length, Usage::new(3, 4));

@@ -53,10 +53,10 @@ CUDA_COMPUTE_CAP=80 cargo check --workspace --features cuda
 
 Use a CUDA 12.x toolkit. The workspace pins `cudarc`'s `cuda-12000` feature as its API baseline, and 12.x is the range GPU verification runs against; newer toolkits are unverified. NVIDIA's `cuda-toolkit` metapackage currently installs 13.3, so request a specific version instead — for example `cuda-toolkit-12-9` on Ubuntu 24.04.
 
-Compiling the kernels takes considerably longer than the Rust build. Set `ATOMA_FLASH_ATTN_BUILD_DIR` to an absolute path outside `target/` to cache the compiled kernel archive across builds:
+Compiling the kernels takes considerably longer than the Rust build. Set `FLASH_ATTN_BUILD_DIR` to an absolute path outside `target/` to cache the compiled kernel archive across builds:
 
 ```shell
-export ATOMA_FLASH_ATTN_BUILD_DIR="$HOME/.cache/atoma-flash-attn-build"
+export FLASH_ATTN_BUILD_DIR="$HOME/.cache/atoma-flash-attn-build"
 ```
 
 Multi-GPU builds additionally enable `nccl`, which is compile-checked with `cargo check --workspace --features cuda,nccl`. Running tensor-parallel inference is not verified in this checkout.
@@ -92,15 +92,17 @@ on one H100 PCIe against vLLM `v0.26.0` are
 ## Configuration and running
 
 The example configuration at the repository root holds everything the server is built from: the
-engine, the executor's ranks, the model and the server itself. Copy it and set the model, the
-device and core of each rank, and where to listen:
+engine, the executor's ranks, the model and the server itself. Copy it and set the model and the
+chat template it is served under, the device and core of each rank, and where to listen:
 
 ```shell
 cp config.example.toml config.toml
 ```
 
 `config.toml` is ignored by Git. Every field can be overridden by an environment variable under
-`ATOMA_`, nesting with `__`, and a Hugging Face token is read from `HF_TOKEN`. The server requires
+`ATOMA_`, nesting with `__`, and a Hugging Face token is read from `HF_TOKEN`. The prefix is the
+configuration's alone: a variable carrying it that names no field refuses the whole configuration,
+so a build-time setting such as `FLASH_ATTN_BUILD_DIR` stays outside it. The server requires
 the opt-in `cuda` feature, `nccl` as well for more than one rank, and accepts the configuration
 path through `--config-path`:
 

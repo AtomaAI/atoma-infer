@@ -4,6 +4,11 @@
 //! individual fields, nesting with `__`, so a deployment can change one setting without rewriting
 //! the file: `ATOMA_SCHEDULER__TOKEN_BUDGET=4096` sets `token_budget` under `[scheduler]`.
 //!
+//! The prefix is the configuration's alone. A variable carrying it that names no field refuses
+//! the whole configuration, which catches a misspelt override but also claims every other use of
+//! the name: a build-time variable under `ATOMA_` would stop the server from starting on any
+//! machine that sets it. Build-time settings therefore sit outside the prefix.
+//!
 //! What is read is validated before it is returned, so a process either starts under a
 //! configuration that holds together or refuses to start and says which fields disagree. This
 //! answers configuration questions only — whether the settings are consistent with each other.
@@ -131,6 +136,19 @@ mod tests {
 
             let config: EngineConfig = load(path).expect("the overridden configuration loads");
             assert_eq!(config.scheduler.token_budget.get(), 4096);
+        });
+    }
+
+    #[test]
+    fn a_build_time_variable_leaves_the_configuration_alone() {
+        in_a_jail_with_the_example(|jail, path| {
+            // The kernels' build directory names no configuration field. It is set on every rig
+            // that caches the flash-attention archive across checkouts, and the server has to
+            // start there.
+            jail.set_env("FLASH_ATTN_BUILD_DIR", "/var/cache/atoma/flash-attn");
+
+            let config: EngineConfig = load(path).expect("the example configuration loads");
+            assert_eq!(config.scheduler.block_size.get(), 16);
         });
     }
 

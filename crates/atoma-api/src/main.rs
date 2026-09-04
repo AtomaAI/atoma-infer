@@ -29,6 +29,7 @@ mod startup {
     use tokio::net::TcpListener;
     use tracing::{error, info};
 
+    use crate::api::chat_completions::ServedModel;
     use crate::config::Config;
     use crate::server::{run_server, AppState, EngineThreads};
 
@@ -88,6 +89,7 @@ mod startup {
         let state = AppState {
             engine: handle,
             tokenizer: Arc::new(tokenizer),
+            served: ServedModel::new(config.model.id.clone(), config.model.prompt_template),
             max_model_len: config.engine.scheduler.max_model_len,
             keep_alive: config.server.keep_alive,
             heartbeat_stale_after: config.server.heartbeat_stale_after,

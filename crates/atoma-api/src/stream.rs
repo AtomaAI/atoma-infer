@@ -119,6 +119,7 @@ mod tests {
     use crate::api::chat_completions::CompletionIdentity;
     use crate::detokenize::Detokenizer;
     use crate::test_support::tokenizer;
+    use atoma_engine::config::ModelId;
 
     /// A waker that counts how many times the stream asked to be polled again.
     struct CountingWaker {
@@ -135,7 +136,7 @@ mod tests {
         let (sender, receiver) = egress();
         let identity = CompletionIdentity {
             id: "chatcmpl-1".into(),
-            model: "llama".into(),
+            model: ModelId::new("llama"),
             created: 17,
         };
         let completion = Completion::new(identity, Detokenizer::new(tokenizer(), stop), 3);

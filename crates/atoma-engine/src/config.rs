@@ -13,8 +13,8 @@ use validator::{Validate, ValidationError};
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// The Hugging Face Hub repository the model is fetched from.
-    #[validate(length(min = 1, message = "model.id names no repository"))]
-    pub id: String,
+    #[validate(custom(function = "names_a_repository"))]
+    pub id: ModelId,
     /// The revision of the repository to fetch.
     #[serde(default = "main_revision")]
     #[validate(length(min = 1, message = "model.revision is empty"))]
@@ -24,10 +24,65 @@ pub struct ModelConfig {
     pub cache_dir: Option<PathBuf>,
     /// The dtype the weights are loaded in and the forward computes in.
     pub dtype: Dtype,
+    /// The chat template a conversation is rendered through before it is tokenized.
+    pub prompt_template: PromptTemplate,
 }
 
 fn main_revision() -> String {
     "main".to_owned()
+}
+
+/// A Hugging Face Hub repository the engine is served from.
+///
+/// Its own type because the strings it sits beside mean other things — the revision in this
+/// configuration, the completion's own id in a response — and a swap between two `String` fields
+/// is silent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ModelId(String);
+
+impl ModelId {
+    /// The repository `id` names.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The repository as the Hub and the API spell it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ModelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn names_a_repository(id: &ModelId) -> Result<(), ValidationError> {
+    if id.as_str().is_empty() {
+        return Err(validation_error(
+            "model_names_no_repository",
+            "model.id names no repository".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The chat template a conversation is rendered through.
+///
+/// A checkpoint's template is not derivable from its repository name: an ungated mirror carries
+/// the same weights and the same template under a different owner, and two checkpoints from one
+/// owner can differ. The template is therefore declared beside the repository rather than
+/// guessed from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptTemplate {
+    Llama2,
+    Llama3,
+    Hermes3,
 }
 
 /// The dtype the model computes in.
@@ -165,7 +220,10 @@ mod tests {
     use serde::de::DeserializeOwned;
     use validator::Validate;
 
-    use super::{CoreId, DeviceOrdinal, Dtype, ExecutorConfig, ModelConfig, RankConfig};
+    use super::{
+        CoreId, DeviceOrdinal, Dtype, ExecutorConfig, ModelConfig, ModelId, PromptTemplate,
+        RankConfig,
+    };
 
     fn from_toml<T: DeserializeOwned>(source: &str) -> Result<T, Box<figment::Error>> {
         Figment::new()
@@ -187,16 +245,18 @@ mod tests {
             r#"
             id = "meta-llama/Llama-3.2-1B-Instruct"
             dtype = "bf16"
+            prompt_template = "llama3"
             "#,
         )
         .unwrap();
         assert_eq!(
             config,
             ModelConfig {
-                id: "meta-llama/Llama-3.2-1B-Instruct".to_owned(),
+                id: ModelId::new("meta-llama/Llama-3.2-1B-Instruct"),
                 revision: "main".to_owned(),
                 cache_dir: None,
                 dtype: Dtype::Bf16,
+                prompt_template: PromptTemplate::Llama3,
             }
         );
         config.validate().unwrap();
@@ -207,6 +267,7 @@ mod tests {
             revision = "abc123"
             cache_dir = "/var/cache/models"
             dtype = "f16"
+            prompt_template = "llama3"
             "#,
         )
         .unwrap();
@@ -226,10 +287,11 @@ mod tests {
     #[test]
     fn both_configurations_round_trip_through_serde() {
         let model = ModelConfig {
-            id: "org/model".to_owned(),
+            id: ModelId::new("org/model"),
             revision: "v1".to_owned(),
             cache_dir: Some(PathBuf::from("/cache")),
             dtype: Dtype::F32,
+            prompt_template: PromptTemplate::Hermes3,
         };
         let json = serde_json::to_string(&model).unwrap();
         assert_eq!(serde_json::from_str::<ModelConfig>(&json).unwrap(), model);
@@ -283,19 +345,21 @@ dtype = "int8""#
     #[test]
     fn a_model_with_no_repository_or_no_revision_is_refused() {
         let no_id = ModelConfig {
-            id: String::new(),
+            id: ModelId::new(""),
             revision: "main".to_owned(),
             cache_dir: None,
             dtype: Dtype::Bf16,
+            prompt_template: PromptTemplate::Llama3,
         };
         let error = no_id.validate().unwrap_err().to_string();
         assert!(error.contains("names no repository"), "{error}");
 
         let no_revision = ModelConfig {
-            id: "org/model".to_owned(),
+            id: ModelId::new("org/model"),
             revision: String::new(),
             cache_dir: None,
             dtype: Dtype::Bf16,
+            prompt_template: PromptTemplate::Llama3,
         };
         let error = no_revision.validate().unwrap_err().to_string();
         assert!(error.contains("revision is empty"), "{error}");
