@@ -15,7 +15,7 @@
 
 use std::fmt;
 
-use atoma_runtime::arena::{BucketIdx, CaptureArena, LayerIdx};
+use atoma_runtime::arena::{BucketIdx, CaptureArena, LayerIdx, SLOT_ALIGN};
 use atoma_runtime::tensor::{Dtype, Tensor, TensorError};
 use thiserror::Error;
 
@@ -27,6 +27,11 @@ use crate::operand::{self, Operand, OperandError, OperandKind};
 
 /// The activations' element type: every arena slot is read and written as bf16.
 const ACTIVATION: Dtype = Dtype::Bf16;
+
+/// Every arena slot starts on a whole activation element: the slot views below divide the
+/// arena's byte offsets by the element size, which holds only while the arena's alignment is a
+/// multiple of it.
+const _: () = assert!(SLOT_ALIGN.is_multiple_of(ACTIVATION.size_in_bytes()));
 
 /// Why a table could not be resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -120,8 +125,8 @@ impl LayerSlots {
                     view_bytes,
                 });
             }
-            // Slot offsets are aligned to the arena's slot alignment, a multiple of every
-            // element size, so the byte offset is a whole number of elements.
+            // The byte offset is a whole number of elements: the arena aligns every slot, and
+            // the assertion by `ACTIVATION` holds that alignment to the element size.
             let offset = arena.offset(bucket.index, row, role.tensor_role());
             let start = offset / ACTIVATION.size_in_bytes();
             let slot = memory

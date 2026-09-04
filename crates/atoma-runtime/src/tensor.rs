@@ -37,7 +37,7 @@ pub enum Dtype {
 
 impl Dtype {
     /// Size of one element in bytes.
-    pub fn size_in_bytes(self) -> usize {
+    pub const fn size_in_bytes(self) -> usize {
         match self {
             Dtype::F32 | Dtype::U32 | Dtype::I32 => 4,
             Dtype::Bf16 | Dtype::F16 => 2,
@@ -47,7 +47,7 @@ impl Dtype {
     }
 
     /// Per-token width in bytes of a role holding `elements_per_token` elements of this type.
-    pub fn width_bytes(self, elements_per_token: usize) -> usize {
+    pub const fn width_bytes(self, elements_per_token: usize) -> usize {
         elements_per_token * self.size_in_bytes()
     }
 }
