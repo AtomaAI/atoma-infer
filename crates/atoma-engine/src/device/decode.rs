@@ -304,8 +304,7 @@ impl DecodeStep {
     }
 
     /// The device address of the uploaded token ids, which the gather overwrites.
-    #[must_use]
-    pub fn token_ids_address(&self) -> u64 {
+    fn token_ids_address(&self) -> u64 {
         self.inputs.tensors().token_ids.address()
     }
 
