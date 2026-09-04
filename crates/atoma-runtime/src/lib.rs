@@ -29,6 +29,7 @@
 //! | [`session`] | The capture session: phase-typed Allocation, Capture and Replay of one graph set |
 //! | `communicator` | The NCCL communicator behind a surface that reaches no stream (`nccl` feature only) |
 //! | [`arena`] | Activation addresses as a pure function of (bucket, layer, role) |
+//! | [`tensor`] | A tensor as a view over runtime-owned device memory: address, shape, strides, dtype |
 //! | [`error`] | Driver statuses classified into named errors with remediation text |
 
 pub mod arena;
@@ -40,3 +41,4 @@ pub mod error;
 pub mod graph_entry;
 pub mod session;
 pub mod stream;
+pub mod tensor;

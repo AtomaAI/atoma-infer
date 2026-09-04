@@ -36,6 +36,13 @@ implementation per backend — the descriptor seam — is the only place a raw s
 appears.
 _Avoid_: launcher, enqueue callback, work item
 
+**Op launcher**:
+Where a step's walk hands each op once its operands are resolved: the CUDA launcher issues the
+op's kernel call on the stream the enclosing descriptor was handed, passing the handle through
+to the C-ABI launch and keeping it nowhere; a recording launcher lists the addresses the op
+would touch. Lives inside a descriptor and is never one.
+_Avoid_: descriptor (for this), backend, executor
+
 **Weight reload**:
 The explicit reload of model weights, and the one transition from Replay back to Allocation:
 new weights mean new baked addresses, so the graph set is torn down with the phase.
@@ -87,6 +94,23 @@ _Avoid_: buffer (for arena extents), region
 **Activation**:
 An intermediate tensor produced and consumed within a single step.
 _Avoid_: scratch, temporary
+
+**Tensor view**:
+A device address with a layout — shape, element strides and dtype — over runtime-owned memory,
+minted in the Allocation phase and never an owner. Sub-views narrow, select and reshape inside
+the extent their root declared.
+_Avoid_: tensor (where candle's owning tensor could be meant), buffer handle, pointer
+
+**Layer class**:
+The linear op order every layer of a class runs, with the roles each op reads and writes: the
+coordinate system the roles' lifetimes index. Llama declares one class of fifteen ops.
+_Avoid_: layer type, block definition, op list
+
+**Slot table**:
+Every address one bucket's step touches, resolved once at Allocation: a tensor view per role per
+arena row, the column views of the fused row, the weights, the cache halves, and the leading rows
+of the fixed buffers.
+_Avoid_: pointer table, address map
 
 **Segment**:
 One captured graph within a forward pass that is split around eager operations.

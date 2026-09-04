@@ -18,11 +18,10 @@ mod startup {
     use std::sync::Arc;
 
     use anyhow::{anyhow, Context};
-    use atoma_core::attention::{
-        BackendDeclaration, CaptureContract, ModelDeclaration, SupportLevel,
-    };
+    use atoma_core::attention::{CaptureContract, ModelDeclaration};
     use atoma_core::config::load;
     use atoma_core::engine::{Control, Engine};
+    use atoma_engine::decode::declaration;
     use atoma_engine::executor::spawn_ranks;
     use atoma_engine::model::{check_eos_token_ids, eos_token_ids, fetch};
     use clap::Parser;
@@ -42,16 +41,10 @@ mod startup {
         config_path: PathBuf,
     }
 
-    /// No routine is captured in this build, so nothing is valid to replay and every step runs
-    /// eagerly: what the flash-attention backend declares until a capture path exists.
+    /// The decode step over runtime tensors serves uniform single-token decodes, which the
+    /// engine keys and pads; every other step runs eagerly on candle.
     fn contract(model: &str) -> CaptureContract {
-        CaptureContract::resolve(
-            &[BackendDeclaration::new(
-                "flash-attention",
-                SupportLevel::Never,
-            )],
-            &ModelDeclaration::new(model),
-        )
+        CaptureContract::resolve(&[declaration()], &ModelDeclaration::new(model))
     }
 
     pub async fn run() -> anyhow::Result<()> {

@@ -188,6 +188,7 @@ name = "atoma-engine"
 version = "0.1.0"
 dependencies = [
  "atoma-core",
+ "atoma-models",
  "atoma-runtime",
  "candle-core",
  "candle-nn",
@@ -219,6 +220,16 @@ dependencies = [
  "candle-nn",
  "half",
  "serial_test",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "atoma-models"
+version = "0.1.0"
+dependencies = [
+ "atoma-kernels",
+ "atoma-runtime",
+ "cudarc 0.19.8",
  "thiserror 2.0.19",
 ]
 

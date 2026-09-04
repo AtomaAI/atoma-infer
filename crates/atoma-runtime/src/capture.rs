@@ -106,6 +106,30 @@ impl CapturedGraph {
         Ok(unsafe { graph_nodes(self.cu_graph) }?.len())
     }
 
+    /// The count of recorded nodes that allocate or free device memory. A clean capture has
+    /// none: every buffer a step touches is fixed in Allocation, and a stream-ordered allocation
+    /// inside a recording is legal in relaxed mode, so it would become a node the replay runs
+    /// rather than a failure at capture time.
+    pub fn memory_node_count(&self) -> Result<usize, RuntimeError> {
+        // SAFETY: this type owns a live graph handle.
+        let nodes = unsafe { graph_nodes(self.cu_graph) }?;
+        let mut count = 0;
+        for node in nodes {
+            let mut node_type = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL;
+            // SAFETY: `node` is a live node of this graph, and the out-pointer lives for the
+            // call.
+            unsafe { sys::cuGraphNodeGetType(node, &raw mut node_type) }.result()?;
+            if matches!(
+                node_type,
+                sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC
+                    | sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE
+            ) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Writes the recorded topology to `path` as Graphviz dot, so a failed or suspect capture is
     /// diagnosed by inspecting what was actually recorded rather than by guessing.
     ///

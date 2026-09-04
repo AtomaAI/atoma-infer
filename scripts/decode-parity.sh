@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+#
+# Decode parity and capture cleanliness on a CUDA rig: runs the ignored integration test that
+# builds the decode step over runtime tensors beside the candle forward on the same weights and
+# KV cache, records the step under capture, and compares the two forwards' logits over decode
+# steps of varying ids, lengths and block tables.
+#
+# Usage, from a checkout on the rig with a CUDA 12.x toolkit on PATH:
+#   HF_TOKEN=... scripts/decode-parity.sh [model-id]
+#
+# The model defaults to the Llama 3.1 8B Instruct checkpoint; any Llama loadable in bf16 that
+# fits the device works. The flash-attention kernels are a long nvcc build the first time; set
+# ATOMA_FLASH_ATTN_BUILD_DIR to keep the build across checkouts.
+#
+# The test prints an evidence block with the argmax agreement and the largest absolute
+# difference on the f32 logits; paste it into the pull request.
+
+set -euo pipefail
+
+export CARGO_TERM_COLOR=never
+
+die() {
+	echo "decode-parity: error: $*" >&2
+	exit 1
+}
+
+command -v nvidia-smi >/dev/null || die "nvidia-smi not found — NVIDIA driver is not installed"
+nvidia-smi >/dev/null || die "nvidia-smi failed — no visible GPU"
+command -v nvcc >/dev/null || die "nvcc not on PATH — install a CUDA 12.x toolkit"
+command -v cargo >/dev/null || die "cargo not found — install rustup; rust-toolchain.toml pins the version"
+[[ -n ${HF_TOKEN:-} ]] || echo "decode-parity: HF_TOKEN is unset; a gated checkpoint will fail to fetch" >&2
+
+cutlass_header=crates/atoma-kernels/cutlass/include/cutlass/cutlass.h
+if [[ ! -f $cutlass_header ]]; then
+	echo "==> CUTLASS submodule is empty; fetching"
+	git submodule update --init --depth 1 crates/atoma-kernels/cutlass
+fi
+
+export ATOMA_PARITY_MODEL="${1:-${ATOMA_PARITY_MODEL:-NousResearch/Meta-Llama-3.1-8B-Instruct}}"
+echo "==> model: $ATOMA_PARITY_MODEL"
+echo "==> commit: $(git rev-parse HEAD)"
+echo "==> gpu: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n 1)"
+
+cargo test -p atoma-engine --locked --features cuda --test decode_parity -- --ignored --nocapture

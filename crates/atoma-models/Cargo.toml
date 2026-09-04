@@ -1,0 +1,33 @@
+[package]
+description = "The Llama decode step over engine-owned device memory, addressed through tensor views"
+edition     = { workspace = true }
+license     = "Apache-2.0"
+name        = "atoma-models"
+version     = { workspace = true }
+
+[dependencies]
+atoma-kernels = { workspace = true }
+atoma-runtime = { workspace = true }
+cudarc        = { workspace = true }
+thiserror     = { workspace = true }
+
+[features]
+cuda = [ "atoma-kernels/cuda" ]
+
+[dev-dependencies]
+atoma-runtime = { workspace = true, features = [ "test-support" ] }
+
+[lints.clippy]
+await_holding_lock      = "deny"
+dbg_macro               = "deny"
+exit                    = "deny"
+large_futures           = "deny"
+mem_forget              = "deny"
+module_name_repetitions = "allow"
+panic_in_result_fn      = "deny"
+pedantic                = { level = "warn", priority = -1 }
+print_stderr            = "deny"
+print_stdout            = "deny"
+similar_names           = "allow"
+todo                    = "warn"
+unimplemented           = "deny"

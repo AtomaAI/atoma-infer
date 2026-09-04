@@ -173,6 +173,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use atoma_core::dispatch::{DispatchDecision, EagerReason};
     use atoma_core::engine::{Control, Engine, EngineHandle, EngineThread, ExecutorRings};
     use atoma_core::request::{FinishReason, RequestEvent};
 
@@ -216,8 +217,25 @@ mod tests {
         let served = served.lock().clone();
         assert_eq!(served.len(), 2, "one prefill, one decode");
         assert_eq!(served[0].tokens, [1, 2, 3]);
+        assert!(
+            matches!(
+                served[0].dispatch,
+                DispatchDecision::Eager(EagerReason::NotUniformDecode { .. })
+            ),
+            "the prefill runs eagerly: {:?}",
+            served[0].dispatch
+        );
         assert_eq!(served[1].tokens, [5], "decoding what was sampled");
         assert_eq!(served[1].context_lengths, [3]);
+        assert!(
+            matches!(
+                served[1].dispatch,
+                DispatchDecision::FullReplay(key) if key.padded_token_count().get() == 1
+            ),
+            "the one-token decode is keyed to the bucket of one: {:?}",
+            served[1].dispatch
+        );
+        assert_eq!(served[1].padding_count, 0);
 
         handle.control.try_send(Control::Shutdown).unwrap();
         engine.join();
