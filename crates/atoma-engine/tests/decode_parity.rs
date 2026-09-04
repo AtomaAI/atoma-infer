@@ -36,7 +36,7 @@ use atoma_core::types::{
     BlockId, RequestCount, RequestId, RequestSlot, SequenceIndex, StepId, TokenCount,
 };
 use atoma_engine::batch::BatchLayout;
-use atoma_engine::config::{DeviceOrdinal, Dtype, ModelConfig, PromptTemplate};
+use atoma_engine::config::{DeviceOrdinal, Dtype, ModelConfig, ModelId, PromptTemplate};
 use atoma_engine::decode::batch::Checked;
 use atoma_engine::decode::declaration;
 use atoma_engine::device::decode::{DecodeStep, DecodeStepPlan};
@@ -486,7 +486,7 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
 #[ignore = "needs a device, the CUDA toolkit and a Llama checkpoint; run scripts/decode-parity.sh"]
 fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     let model = ModelConfig {
-        id: env::var("PARITY_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned()),
+        id: env::var("PARITY_MODEL").map_or_else(|_| ModelId::new(DEFAULT_MODEL), ModelId::new),
         revision: "main".to_owned(),
         cache_dir: None,
         dtype: Dtype::Bf16,

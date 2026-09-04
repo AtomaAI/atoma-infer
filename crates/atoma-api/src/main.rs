@@ -62,7 +62,8 @@ mod startup {
             )
         })?;
 
-        let (handle, rings, engine) = Engine::spawn(&config.engine, &contract(&config.model.id))?;
+        let (handle, rings, engine) =
+            Engine::spawn(&config.engine, &contract(config.model.id.as_str()))?;
         let executors = match spawn_ranks(
             &config.engine,
             &config.executor,
