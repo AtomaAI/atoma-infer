@@ -11,6 +11,7 @@
 #[cfg(not(feature = "nccl"))]
 pub mod decode;
 pub mod forward;
+pub mod sampler;
 
 use std::sync::Arc;
 
