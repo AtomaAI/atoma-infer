@@ -79,7 +79,7 @@ impl SlotOwners {
     #[must_use]
     pub fn gathers(&self, slot: RequestSlot, request: RequestId) -> bool {
         self.slots
-            .get(index(slot))
+            .get(slot.index())
             .copied()
             .flatten()
             .is_some_and(|held| held.request == request && held.sampled)
@@ -103,13 +103,9 @@ impl SlotOwners {
     fn owner_mut(&mut self, slot: RequestSlot) -> Result<&mut Option<Owner>, OwnersError> {
         let slots = self.slots.len();
         self.slots
-            .get_mut(index(slot))
+            .get_mut(slot.index())
             .ok_or(OwnersError::SlotOutOfRange { slot, slots })
     }
-}
-
-fn index(slot: RequestSlot) -> usize {
-    slot.get() as usize
 }
 
 #[cfg(test)]

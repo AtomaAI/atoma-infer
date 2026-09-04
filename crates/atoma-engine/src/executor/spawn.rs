@@ -172,7 +172,7 @@ fn open_forward(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<C
             &allocation,
             device.stream(),
             plan.slot_count,
-            plan.max_batch.get(),
+            plan.max_batch,
             config.vocab_size,
         )?)
     } else {

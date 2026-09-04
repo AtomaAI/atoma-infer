@@ -100,7 +100,7 @@ fn the_slot_count_covers_every_live_request_and_every_padding_dummy() {
         let slot = scheduler
             .intake(new_request(3, 4, egress))
             .expect("the prompt fits the model");
-        highest = highest.max(slot.get() as usize);
+        highest = highest.max(slot.index());
     }
     assert_eq!(highest, MAX_REQUESTS - 1, "the slab filled from zero");
     assert!(

@@ -33,7 +33,7 @@ use cudarc::driver::{CudaSlice, CudaStream};
 /// several strides.
 const VOCAB: usize = 4096;
 const SLOTS: usize = 16;
-const MAX_ROWS: usize = 8;
+const MAX_ROWS: RequestCount = RequestCount::new(8).expect("nonzero");
 const BLOCK_SIZE: TokenCount = TokenCount::new(16).expect("nonzero");
 /// Draws per distribution when a frequency is measured.
 const DRAWS: usize = 4096;
@@ -73,7 +73,7 @@ impl Rig {
         let sampler = DeviceSampler::new(&allocation, &stream, SLOTS, MAX_ROWS, VOCAB)
             .expect("the sampler allocates");
         let logits = stream
-            .alloc_zeros::<f32>(MAX_ROWS * VOCAB)
+            .alloc_zeros::<f32>(MAX_ROWS.get() * VOCAB)
             .expect("the logits allocate");
         Self {
             sampler,

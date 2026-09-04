@@ -18,7 +18,7 @@ use std::mem::size_of;
 use std::ptr;
 use std::sync::Arc;
 
-use atoma_core::types::RequestSlot;
+use atoma_core::types::{RequestCount, RequestSlot};
 use atoma_kernels::error::KernelError;
 use atoma_kernels::sampler::{gather, sample, GatherCall, SampleCall};
 use atoma_runtime::error::RuntimeError;
@@ -135,8 +135,8 @@ pub struct DeviceSampler {
 }
 
 impl DeviceSampler {
-    /// Allocates the sampler for `slots` request slots and up to `max_rows` rows of `vocab`
-    /// logits, during the Allocation session phase, on `stream`'s device.
+    /// Allocates the sampler for `slots` request slots and up to `max_rows` sampling rows of
+    /// `vocab` logits, during the Allocation session phase, on `stream`'s device.
     ///
     /// # Errors
     ///
@@ -146,12 +146,13 @@ impl DeviceSampler {
         allocation: &Allocation,
         stream: &Arc<CudaStream>,
         slots: usize,
-        max_rows: usize,
+        max_rows: RequestCount,
         vocab: usize,
     ) -> Result<Self, SamplerError> {
         if i32::try_from(slots).is_err() {
             return Err(SamplerError::TooManySlots { slots });
         }
+        let max_rows = max_rows.get();
         let context = stream.context();
         context.bind_to_thread().map_err(RuntimeError::from)?;
         let uploaded = context
@@ -213,7 +214,7 @@ impl DeviceSampler {
         self.pending_records.clear();
         let records_host = self.records.host.as_mut_slice();
         for (slot, record) in records {
-            let index = slot_index(slot);
+            let index = slot.index();
             records_host[index] = record;
             self.pending_records.push(index);
         }
@@ -419,10 +420,6 @@ impl Descriptor for Sample<'_> {
         }
         Ok(())
     }
-}
-
-fn slot_index(slot: RequestSlot) -> usize {
-    slot.get() as usize
 }
 
 /// A staged slot as the kernel indexes it; the mirror refused any past the count that fits.
