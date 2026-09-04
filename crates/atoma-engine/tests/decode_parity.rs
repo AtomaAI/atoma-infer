@@ -22,6 +22,9 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::env;
+use std::ops::Range;
+use std::ptr;
+use std::sync::Arc;
 
 use atoma_core::attention::{CaptureContract, ModelDeclaration};
 use atoma_core::dispatch::{
@@ -45,7 +48,9 @@ use atoma_engine::readback::Readback;
 use atoma_runtime::arena::BucketIdx;
 use atoma_runtime::context::RuntimeContext;
 use atoma_runtime::session::{Allocation, BakedBuffers, Replay};
+use candle_core::{DType, Tensor};
 use cudarc::driver::result::mem_get_info;
+use cudarc::driver::{sys, CudaContext};
 
 const DEFAULT_MODEL: &str = "NousResearch/Meta-Llama-3.1-8B-Instruct";
 const BLOCK_SIZE: usize = 16;
@@ -60,6 +65,11 @@ const MAX_BATCH: usize = 8;
 /// by when only the live batch they are computed in changes, which the run measures: on an A100,
 /// 0.375 for both Llama 3.1 8B and 3.2 1B, against 0.579 for the step.
 const DEFAULT_MAX_ABS_DIFF: f32 = 0.75;
+/// The largest absolute difference accepted between the key and value rows the step writes into
+/// the cache and candle's writes of the same slots, unless `ATOMA_PARITY_KV_MAX_ABS_DIFF` says
+/// otherwise; the measured value is printed either way. Both paths write bf16 from their own
+/// projections, and the step rotates keys in f32 where candle rotates in bf16.
+const DEFAULT_KV_MAX_ABS_DIFF: f32 = 0.5;
 /// Prompt tokens are drawn below this id: Llama 3's special tokens sit at the top of the
 /// vocabulary, and a prompt of those is not a prompt.
 const TOKEN_ID_CEILING: usize = 120_000;
@@ -242,14 +252,14 @@ fn open(model: &ModelConfig) -> Rig {
 }
 
 /// Capture cleanliness: the bucket-of-one step, over a staged one-token batch, warms up and
-/// records without the driver invalidating it. Returns the Replay phase and the graph's node
-/// count.
+/// records without the driver invalidating it. Returns the Replay phase, the graph's node count,
+/// and how many of its nodes allocate or free memory.
 fn record_bucket_of_one(
     allocation: Allocation,
     decode_step: &mut DecodeStep,
     dispatcher: &mut Dispatcher,
     dummy_block: u32,
-) -> (Replay, usize) {
+) -> (Replay, usize, usize) {
     let first = Sequence {
         tokens: vec![1],
         blocks: vec![0],
@@ -277,12 +287,12 @@ fn record_bucket_of_one(
             BakedBuffers::default(),
         )
         .expect("the step records without invalidating the capture");
-    let nodes = capture
-        .entry(graph)
-        .graph()
-        .node_count()
-        .expect("the graph reports its nodes");
-    (capture.into_replay(), nodes)
+    let recorded = capture.entry(graph).graph();
+    let nodes = recorded.node_count().expect("the graph reports its nodes");
+    let memory_nodes = recorded
+        .memory_node_count()
+        .expect("the graph reports its node types");
+    (capture.into_replay(), nodes, memory_nodes)
 }
 
 /// Prefills every sequence through candle over its own blocks, and appends the token each
@@ -317,6 +327,9 @@ struct Parity {
     /// The same rows through candle alone against candle in the live batch.
     candle_max_abs_diff: f32,
     candle_sum_abs_diff: f64,
+    /// The key and value rows the step wrote into the cache against candle's writes of the same
+    /// slots.
+    kv_max_abs_diff: f32,
 }
 
 impl Parity {
@@ -339,6 +352,10 @@ struct Harness {
     sequences: Vec<Sequence>,
     dispatcher: Dispatcher,
     parity: Parity,
+    /// Every layer's cache, the handles candle holds, for reading slots back.
+    cache: Vec<Tensor>,
+    /// The device's stream-ordered allocator, watched around every keyed step.
+    pool: Option<sys::CUmemoryPool>,
 }
 
 /// Runs one decode step over `chosen` through both forwards and compares them row by row, then
@@ -352,6 +369,8 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
         sequences,
         dispatcher,
         parity,
+        cache,
+        pool,
     } = harness;
     let dummy_block = u32::try_from(BLOCK_COUNT - 1).expect("fits");
     let live: Vec<(usize, &Sequence)> = chosen
@@ -359,10 +378,18 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
         .map(|&index| (index, &sequences[index]))
         .collect();
     let (keyed, on_candle) = decode_commands(&live, dispatcher, dummy_block, 200 + step as u64);
+    let keyed = lay_out(&keyed);
+    let written: Vec<usize> = keyed.slot_mapping[..chosen.len()]
+        .iter()
+        .map(|&slot| usize::try_from(slot).expect("a live row's slot"))
+        .collect();
+    let kv_width = kv_width(cache);
+    let before = snapshot(cache, &written);
     let (free_before, _) = mem_get_info().expect("the device reports its free memory");
+    let used_before = (*pool).map(pool_watch);
     let tensor_logits: Vec<Vec<f32>> = {
         let logits = forward
-            .forward(&lay_out(&keyed))
+            .forward(&keyed)
             .expect("the keyed batch runs on the decode step");
         (0..logits.rows())
             .map(|row| logits.row(row).expect("row").to_vec())
@@ -375,6 +402,17 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
         "step {step}: the decode step left {} bytes allocated",
         free_before.abs_diff(free_after)
     );
+    if let (Some(pool), Some(used_before)) = (*pool, used_before) {
+        let high = pool_high(pool);
+        assert_eq!(
+            high,
+            used_before,
+            "step {step}: the decode step took {} bytes from the stream-ordered allocator",
+            high.abs_diff(used_before)
+        );
+    }
+    let after_step = snapshot(cache, &written);
+    check_step_writes(&before, &after_step, &written, kv_width, step);
     let alone: Vec<Vec<f32>> = live
         .iter()
         .map(|&(index, sequence)| {
@@ -393,6 +431,9 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
     let candle_logits = forward
         .forward(&lay_out(&on_candle))
         .expect("the eager step runs on candle");
+    let after_candle = snapshot(cache, &written);
+    let kv_diff = widest_slot_diff(&after_step, &after_candle, &written, kv_width);
+    parity.kv_max_abs_diff = parity.kv_max_abs_diff.max(kv_diff);
     assert_eq!(tensor_logits.len(), chosen.len(), "one row per live entry");
     assert_eq!(candle_logits.rows(), chosen.len());
     let mut sampled = Vec::with_capacity(chosen.len());
@@ -449,6 +490,10 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
         .ok()
         .and_then(|bound| bound.parse().ok())
         .unwrap_or(DEFAULT_MAX_ABS_DIFF);
+    let kv_bound: f32 = env::var("ATOMA_PARITY_KV_MAX_ABS_DIFF")
+        .ok()
+        .and_then(|bound| bound.parse().ok())
+        .unwrap_or(DEFAULT_KV_MAX_ABS_DIFF);
     let Rig {
         allocation,
         allocated,
@@ -459,9 +504,21 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     let mut dispatcher = Dispatcher::new(&dispatch_config(), &contract);
     let dummy_block = u32::try_from(BLOCK_COUNT - 1).expect("fits");
 
-    let (session, nodes) =
+    let (session, nodes, memory_nodes) =
         record_bucket_of_one(allocation, &mut decode_step, &mut dispatcher, dummy_block);
-    println!("capture: the bucket-of-one step recorded as a graph of {nodes} nodes");
+    println!(
+        "capture: the bucket-of-one step recorded as a graph of {nodes} nodes, {memory_nodes} of \
+         them allocating or freeing memory"
+    );
+    assert_eq!(
+        memory_nodes, 0,
+        "the recorded graph allocates or frees memory"
+    );
+    let cache: Vec<Tensor> = allocated.kv_cache.layers().to_vec();
+    let pool = default_pool(allocated.device.stream().context());
+    if pool.is_none() {
+        println!("pool: the device has no stream-ordered allocator to watch");
+    }
     let forward = CudaForward::new(allocated, decode_step, session);
 
     let mut random = Lcg(0x5EED_2026_0903);
@@ -482,6 +539,8 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
         sequences,
         dispatcher,
         parity: Parity::default(),
+        cache,
+        pool,
     };
     prefill(&mut harness.forward, &mut harness.sequences);
 
@@ -509,6 +568,10 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     println!("  max |logit diff|:   {:.6}", parity.candle_max_abs_diff);
     println!("  mean |logit diff|:  {:.6}", parity.candle_mean_abs_diff());
     println!("capture graph nodes:  {nodes}");
+    println!("capture memory nodes: {memory_nodes}");
+    println!("cache writes, the step against candle over the same slots:");
+    println!("  max |k/v diff|:     {:.6}", parity.kv_max_abs_diff);
+    println!("  bound:              {kv_bound}");
     assert_eq!(
         parity.argmax_disagreements, 0,
         "every live row's argmax agrees on ids candle's logits separate"
@@ -518,6 +581,172 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
         "the largest logit difference {} is above the bound {bound}",
         parity.max_abs_diff
     );
+    assert!(
+        parity.kv_max_abs_diff <= kv_bound,
+        "the largest cache-write difference {} is above the bound {kv_bound}",
+        parity.kv_max_abs_diff
+    );
+}
+
+/// Elements one slot holds for K or V: every key-value head's row.
+fn kv_width(cache: &[Tensor]) -> usize {
+    let dims = cache[0].dims();
+    dims[3] * dims[4]
+}
+
+/// The K then V rows of one block of every layer, as f32 on the host: `[block_size, kv_width]`
+/// each, row-major.
+fn block_of(cache: &[Tensor], block: usize) -> Vec<Vec<f32>> {
+    cache
+        .iter()
+        .map(|layer| {
+            layer
+                .narrow(1, block, 1)
+                .expect("the block lies in the cache")
+                .to_dtype(DType::F32)
+                .expect("bf16 reads as f32")
+                .flatten_all()
+                .expect("flattens")
+                .to_vec1::<f32>()
+                .expect("copies to the host")
+        })
+        .collect()
+}
+
+/// The blocks a keyed step may write, read back: each live row's block, and the dummies'.
+struct Snapshot {
+    rows: Vec<Vec<Vec<f32>>>,
+    dummy: Vec<Vec<f32>>,
+}
+
+fn snapshot(cache: &[Tensor], written: &[usize]) -> Snapshot {
+    Snapshot {
+        rows: written
+            .iter()
+            .map(|&slot| block_of(cache, slot / BLOCK_SIZE))
+            .collect(),
+        dummy: block_of(cache, BLOCK_COUNT - 1),
+    }
+}
+
+/// The K and V ranges of the slot at `offset` in one block's values.
+fn slot_ranges(offset: usize, kv_width: usize) -> [Range<usize>; 2] {
+    let k = offset * kv_width..(offset + 1) * kv_width;
+    let v_base = BLOCK_SIZE * kv_width;
+    [k.clone(), v_base + k.start..v_base + k.end]
+}
+
+/// Holds the decode step to writing each live row's own slot, and the dummies' slot of the dummy
+/// block, and nothing else in those blocks. Candle's run of the same batch overwrites the rows'
+/// slots afterwards, so a write that landed anywhere else would otherwise go unseen: later steps
+/// would read the same wrong cache through both forwards.
+fn check_step_writes(
+    before: &Snapshot,
+    after: &Snapshot,
+    written: &[usize],
+    kv_width: usize,
+    step: usize,
+) {
+    for (row, (before, after)) in before.rows.iter().zip(&after.rows).enumerate() {
+        let ranges = slot_ranges(written[row] % BLOCK_SIZE, kv_width);
+        for (layer, (before, after)) in before.iter().zip(after).enumerate() {
+            assert!(
+                ranges
+                    .iter()
+                    .any(|range| before[range.clone()] != after[range.clone()]),
+                "step {step} row {row} layer {layer}: the decode step did not write its slot"
+            );
+            untouched_outside(
+                before,
+                after,
+                &ranges,
+                &format!("step {step} row {row} layer {layer}"),
+            );
+        }
+    }
+    let ranges = slot_ranges(0, kv_width);
+    for (layer, (before, after)) in before.dummy.iter().zip(&after.dummy).enumerate() {
+        untouched_outside(
+            before,
+            after,
+            &ranges,
+            &format!("step {step} dummy block layer {layer}"),
+        );
+    }
+}
+
+/// Every value outside `ranges` is bit-identical between `before` and `after`.
+fn untouched_outside(before: &[f32], after: &[f32], ranges: &[Range<usize>], at: &str) {
+    for (index, (before, after)) in before.iter().zip(after).enumerate() {
+        if ranges.iter().any(|range| range.contains(&index)) {
+            continue;
+        }
+        assert!(
+            before.to_bits() == after.to_bits(),
+            "{at}: the decode step wrote outside its slot, at value {index}"
+        );
+    }
+}
+
+/// The largest absolute difference between the slots the step wrote and candle's writes of the
+/// same slots.
+fn widest_slot_diff(step: &Snapshot, candle: &Snapshot, written: &[usize], kv_width: usize) -> f32 {
+    let mut widest_diff = 0.0f32;
+    for (row, (step, candle)) in step.rows.iter().zip(&candle.rows).enumerate() {
+        for range in slot_ranges(written[row] % BLOCK_SIZE, kv_width) {
+            for (step, candle) in step.iter().zip(candle) {
+                widest_diff = widest_diff.max(widest(&step[range.clone()], &candle[range.clone()]));
+            }
+        }
+    }
+    widest_diff
+}
+
+/// The device's default stream-ordered allocator, or `None` where the driver has none.
+fn default_pool(context: &Arc<CudaContext>) -> Option<sys::CUmemoryPool> {
+    let mut pool: sys::CUmemoryPool = ptr::null_mut();
+    // SAFETY: a driver query for the context's device; the out-pointer lives for the call.
+    unsafe { sys::cuDeviceGetDefaultMemPool(&raw mut pool, context.cu_device()) }
+        .result()
+        .ok()
+        .map(|()| pool)
+}
+
+/// Resets the pool's used-memory high-water mark and returns its usage now: a step that takes
+/// nothing from the pool leaves the mark at this value.
+fn pool_watch(pool: sys::CUmemoryPool) -> u64 {
+    let mut zero = 0u64;
+    // SAFETY: `pool` is the device's default pool, and the attribute takes a u64.
+    unsafe {
+        sys::cuMemPoolSetAttribute(
+            pool,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+            (&raw mut zero).cast(),
+        )
+    }
+    .result()
+    .expect("the high-water mark resets");
+    pool_attribute(
+        pool,
+        sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+    )
+}
+
+/// The pool's used-memory high-water mark since the last [`pool_watch`].
+fn pool_high(pool: sys::CUmemoryPool) -> u64 {
+    pool_attribute(
+        pool,
+        sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+    )
+}
+
+fn pool_attribute(pool: sys::CUmemoryPool, attribute: sys::CUmemPool_attribute) -> u64 {
+    let mut value = 0u64;
+    // SAFETY: `pool` is the device's default pool, and both usage attributes are u64s.
+    unsafe { sys::cuMemPoolGetAttribute(pool, attribute, (&raw mut value).cast()) }
+        .result()
+        .expect("the pool reports its usage");
+    value
 }
 
 /// The largest absolute difference between two logits rows.
