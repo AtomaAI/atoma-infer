@@ -42,7 +42,6 @@ use atoma_engine::decode::declaration;
 use atoma_engine::device::decode::{DecodeStep, DecodeStepPlan};
 use atoma_engine::device::forward::{Allocated, CudaForward};
 use atoma_engine::device::{Checkpoint, KvCache, KvGeometry, RankDevice, Weights};
-use atoma_engine::forward::Forward;
 use atoma_engine::model::{fetch, llama_config};
 use atoma_engine::readback::Readback;
 use atoma_runtime::arena::BucketIdx;
@@ -306,7 +305,7 @@ fn prefill(forward: &mut CudaForward, sequences: &mut [Sequence]) {
             dispatch: eager(),
         };
         let logits = forward
-            .forward(&lay_out(&command))
+            .forward_logits(&lay_out(&command))
             .expect("the prefill runs on candle");
         let next = argmax(logits.row(0).expect("one row"));
         sequence.context_len = sequence.tokens.len();
@@ -389,7 +388,7 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
     let used_before = (*pool).map(pool_watch);
     let tensor_logits: Vec<Vec<f32>> = {
         let logits = forward
-            .forward(&keyed)
+            .forward_logits(&keyed)
             .expect("the keyed batch runs on the decode step");
         (0..logits.rows())
             .map(|row| logits.row(row).expect("row").to_vec())
@@ -423,13 +422,13 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
                 dispatch: eager(),
             };
             let logits = forward
-                .forward(&lay_out(&command))
+                .forward_logits(&lay_out(&command))
                 .expect("the one-entry step runs on candle");
             logits.row(0).expect("row").to_vec()
         })
         .collect();
     let candle_logits = forward
-        .forward(&lay_out(&on_candle))
+        .forward_logits(&lay_out(&on_candle))
         .expect("the eager step runs on candle");
     let after_candle = snapshot(cache, &written);
     let kv_diff = widest_slot_diff(&after_step, &after_candle, &written, kv_width);

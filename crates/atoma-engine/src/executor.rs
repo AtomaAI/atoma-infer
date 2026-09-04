@@ -1,6 +1,6 @@
-//! The executor loop: step commands off the ring, through the forward and the sampler, and step
-//! results back, until the engine is gone. One pinned thread per rank runs it: rank zero owns the
-//! engine's rings and feeds every other rank, which follows.
+//! The executor loop: step commands off the ring, through the forward, and step results back,
+//! until the engine is gone. One pinned thread per rank runs it: rank zero owns the engine's rings
+//! and feeds every other rank, which follows.
 //!
 //! The loop parks with nothing to serve and is woken by the next command or by the engine's ends
 //! dropping. Any error ends the loop: the rings drop with it, which the engine sees as the
@@ -27,7 +27,6 @@ pub use thread::{launch, spawn, wait_all, Cause, ExecutorThread, Launched, Spawn
 use crate::batch::{BatchLayout, LayoutError};
 use crate::config::Rank;
 use crate::forward::Forward;
-use crate::sampler::{SampleError, Sampler};
 
 /// Why an executor stopped.
 #[derive(Debug, Error)]
@@ -36,8 +35,9 @@ pub enum ExecutorError {
     Layout(#[from] LayoutError),
     #[error("the forward failed: {0}")]
     Forward(#[source] Cause),
-    #[error(transparent)]
-    Sample(#[from] SampleError),
+    /// The forward returned tokens for other than the rows the layout selected: its bug.
+    #[error("{expected} rows were selected but the forward sampled {got} tokens")]
+    SampledMismatch { expected: usize, got: usize },
     /// The engine keeps one step in flight, so a full result ring means it broke the protocol.
     #[error("the result ring is full: more than one step is in flight")]
     ResultRingFull,
@@ -65,7 +65,6 @@ pub trait ExecutorLoop {
 pub struct Executor<F> {
     rings: ExecutorRings,
     forward: F,
-    sampler: Sampler,
     block_size: TokenCount,
     followers: Vec<FollowerFeed>,
 }
@@ -77,7 +76,6 @@ impl<F: Forward> Executor<F> {
         Self {
             rings,
             forward,
-            sampler: Sampler::new(),
             block_size,
             followers: Vec::new(),
         }
@@ -95,13 +93,21 @@ impl<F: Forward> Executor<F> {
         let command = Arc::new(command);
         self.feed_followers(&command)?;
         let layout = BatchLayout::lay_out(&command, self.block_size)?;
-        let logits = self
+        let by_row = self
             .forward
             .forward(&layout)
             .map_err(|cause| ExecutorError::Forward(Box::new(cause)))?;
-        let sampled = self
-            .sampler
-            .sample(&command, layout.sampling_rows(), logits)?;
+        if by_row.len() != layout.selected.len() {
+            return Err(ExecutorError::SampledMismatch {
+                expected: layout.selected.len(),
+                got: by_row.len(),
+            });
+        }
+        let sampled: Vec<u32> = layout
+            .sampling_rows()
+            .iter()
+            .map(|&row| by_row[row])
+            .collect();
         debug!(
             step = command.step.get(),
             entries = command.entries.len(),
@@ -304,7 +310,7 @@ mod tests {
                     client.recv_timeout(WAIT).unwrap(),
                     RequestEvent::Token { token: 5, .. }
                 ),
-                "the leader's logits are the ones sampled, never the follower's"
+                "the leader's tokens are the step's, never the follower's"
             );
         }
         assert!(matches!(

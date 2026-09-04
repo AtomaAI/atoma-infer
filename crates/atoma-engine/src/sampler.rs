@@ -1,28 +1,25 @@
-//! Sampling each entry's next token on the host from the logits the forward selected.
+//! Sampling each selected row's next token on the host from the logits the forward read back.
 //!
 //! One state per request slot outlives the step: the random number generator the request's seed
-//! opened. The state is replaced when a slot changes hands — the request id in the entry is not
-//! the one the state was built for. A greedy entry takes the largest logit straight off its row;
+//! opened. The state is replaced when a slot changes hands — the request id in the row is not
+//! the one the state was built for. A greedy row takes the largest logit straight off its row;
 //! the rest go through candle's `LogitsProcessor` for temperature, top-k and top-p.
 
 use atoma_core::request::SamplingParams;
-use atoma_core::step::StepCommand;
 use atoma_core::types::{RequestId, RequestSlot};
 use candle_core::{Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use thiserror::Error;
 
+use crate::batch::RowSampling;
 use crate::logits::Logits;
 
 /// Why a step's tokens could not be sampled.
 #[derive(Debug, Error)]
 pub enum SampleError {
-    /// The rows handed over do not pair up with the command's sampling entries.
-    #[error("{expected} entries sample this step but {got} logits rows were selected for them")]
+    /// The logits rows read back do not pair up with the rows the layout selected.
+    #[error("{expected} rows were selected this step but {got} logits rows came back")]
     RowsMismatch { expected: usize, got: usize },
-    /// A selected row lies past the logits the forward produced.
-    #[error("row {row} was selected but only {rows} logits rows came back")]
-    RowOutOfRange { row: usize, rows: usize },
     #[error(transparent)]
     Candle(#[from] candle_core::Error),
 }
@@ -40,41 +37,34 @@ impl Sampler {
         Self::default()
     }
 
-    /// Samples one token per sampling entry of `command`, in entry order. `rows[i]` is the row of
-    /// `logits` the command's `i`-th sampling entry reads.
+    /// Samples one token per selected row into `sampled`, in batch order: row `i` of `logits`
+    /// under `rows[i]`.
     ///
     /// # Errors
     ///
-    /// Returns [`SampleError`] when `rows` does not pair up with the sampling entries, a row lies
-    /// past the logits, or candle cannot draw from a row.
+    /// Returns [`SampleError`] when the logits are not one row per selected row, or candle
+    /// cannot draw from a row.
     pub fn sample(
         &mut self,
-        command: &StepCommand,
-        rows: &[usize],
+        rows: &[RowSampling],
         logits: Logits<'_>,
-    ) -> Result<Vec<u32>, SampleError> {
-        let expected = command.sampling_count();
-        if rows.len() != expected {
+        sampled: &mut Vec<u32>,
+    ) -> Result<(), SampleError> {
+        if logits.rows() != rows.len() {
             return Err(SampleError::RowsMismatch {
-                expected,
-                got: rows.len(),
+                expected: rows.len(),
+                got: logits.rows(),
             });
         }
-        let sampling = command
-            .entries
-            .iter()
-            .filter_map(|entry| entry.sampling.map(|params| (entry, params)));
-        let mut sampled = Vec::with_capacity(expected);
-        for ((entry, params), &row) in sampling.zip(rows) {
-            let row_logits = logits.row(row).ok_or(SampleError::RowOutOfRange {
-                row,
-                rows: logits.rows(),
-            })?;
-            let state = self.state_for(entry.slot, entry.request, &params);
-            let token = state.sample(row_logits)?;
-            sampled.push(token);
+        sampled.clear();
+        for (row, sampling) in rows.iter().enumerate() {
+            let Some(row_logits) = logits.row(row) else {
+                unreachable!("the logits hold one row per selected row")
+            };
+            let state = self.state_for(sampling.slot, sampling.request, &sampling.params);
+            sampled.push(state.sample(row_logits)?);
         }
-        Ok(sampled)
+        Ok(())
     }
 
     /// The slot's state for `request`: what it holds when that is who it was built for, and a
@@ -172,11 +162,11 @@ fn argmax(row: &[f32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use atoma_core::request::SamplingParams;
-    use atoma_core::step::StepCommand;
+    use atoma_core::types::{RequestId, RequestSlot};
 
     use super::{SampleError, Sampler};
+    use crate::batch::RowSampling;
     use crate::logits::Logits;
-    use crate::test_support::{command, entry, sampling_entry};
 
     const VOCAB: usize = 4;
     /// Token 1 leads.
@@ -195,31 +185,42 @@ mod tests {
         }
     }
 
-    /// One sampling entry for `request` in slot `slot`, under `params`.
-    fn one(request: u64, slot: u32, params: SamplingParams) -> StepCommand {
-        command(vec![sampling_entry(request, slot, params)], 0)
+    /// The sampling of one row for `request` in slot `slot`, under `params`.
+    fn row(request: u64, slot: u32, params: SamplingParams) -> RowSampling {
+        RowSampling {
+            request: RequestId::new(request),
+            slot: RequestSlot::new(slot),
+            params,
+        }
+    }
+
+    /// Samples one row of `data` for `request` in slot `slot`.
+    fn one(sampler: &mut Sampler, request: u64, slot: u32, params: SamplingParams) -> u32 {
+        let data = logits(&[ROW]);
+        let mut sampled = Vec::new();
+        sampler
+            .sample(
+                &[row(request, slot, params)],
+                Logits::new(&data, VOCAB),
+                &mut sampled,
+            )
+            .unwrap();
+        sampled[0]
     }
 
     #[test]
-    fn greedy_entries_take_the_largest_logit_off_their_row_in_entry_order() {
+    fn greedy_rows_take_the_largest_logit_off_their_row_in_batch_order() {
         let mut sampler = Sampler::new();
-        let command = command(
-            vec![
-                entry(1, 3, vec![9], &[10], true),
-                entry(2, 0, vec![1, 2, 3], &[20], false),
-                entry(3, 5, vec![9], &[30], true),
-            ],
-            0,
-        );
+        let rows = [
+            row(1, 3, SamplingParams::default()),
+            row(3, 5, SamplingParams::default()),
+        ];
         let data = logits(&[[0.0, 0.0, 9.0, 0.0], [5.0, 0.0, 0.0, 0.0]]);
-        let sampled = sampler
-            .sample(&command, &[1, 0], Logits::new(&data, VOCAB))
+        let mut sampled = vec![7, 7, 7];
+        sampler
+            .sample(&rows, Logits::new(&data, VOCAB), &mut sampled)
             .unwrap();
-        assert_eq!(
-            sampled,
-            [0, 2],
-            "request 1 reads row 1, request 3 reads row 0"
-        );
+        assert_eq!(sampled, [2, 0], "one token per row, and nothing left over");
     }
 
     #[test]
@@ -232,26 +233,17 @@ mod tests {
             seed: 3,
         };
         let mut sampler = Sampler::new();
-        let data = logits(&[ROW]);
         for _ in 0..8 {
-            let sampled = sampler
-                .sample(&one(1, 0, params), &[0], Logits::new(&data, VOCAB))
-                .unwrap();
-            assert_eq!(sampled, [1]);
+            assert_eq!(one(&mut sampler, 1, 0, params), 1);
         }
     }
 
     #[test]
     fn the_same_seed_draws_the_same_tokens_step_after_step() {
-        let data = logits(&[ROW]);
         let draw = |seed: u64| -> Vec<u32> {
             let mut sampler = Sampler::new();
             (0..16)
-                .map(|_| {
-                    sampler
-                        .sample(&one(1, 0, drawn(seed)), &[0], Logits::new(&data, VOCAB))
-                        .unwrap()[0]
-                })
+                .map(|_| one(&mut sampler, 1, 0, drawn(seed)))
                 .collect()
         };
         assert_eq!(draw(7), draw(7));
@@ -263,29 +255,14 @@ mod tests {
 
     #[test]
     fn a_slot_changing_hands_reseeds_the_draw() {
-        let data = logits(&[ROW]);
         let mut fresh = Sampler::new();
-        let expected: Vec<u32> = (0..8)
-            .map(|_| {
-                fresh
-                    .sample(&one(2, 0, drawn(5)), &[0], Logits::new(&data, VOCAB))
-                    .unwrap()[0]
-            })
-            .collect();
+        let expected: Vec<u32> = (0..8).map(|_| one(&mut fresh, 2, 0, drawn(5))).collect();
 
         let mut sampler = Sampler::new();
         for _ in 0..8 {
-            sampler
-                .sample(&one(1, 0, drawn(5)), &[0], Logits::new(&data, VOCAB))
-                .unwrap();
+            one(&mut sampler, 1, 0, drawn(5));
         }
-        let after_handover: Vec<u32> = (0..8)
-            .map(|_| {
-                sampler
-                    .sample(&one(2, 0, drawn(5)), &[0], Logits::new(&data, VOCAB))
-                    .unwrap()[0]
-            })
-            .collect();
+        let after_handover: Vec<u32> = (0..8).map(|_| one(&mut sampler, 2, 0, drawn(5))).collect();
         assert_eq!(
             after_handover, expected,
             "the seed was reopened for request 2"
@@ -293,24 +270,22 @@ mod tests {
     }
 
     #[test]
-    fn rows_that_do_not_pair_up_with_the_entries_are_refused() {
+    fn logits_that_are_not_one_row_per_selected_row_are_refused() {
         let mut sampler = Sampler::new();
         let data = logits(&[ROW]);
-        let command = one(1, 0, SamplingParams::default());
+        let rows = [
+            row(1, 0, SamplingParams::default()),
+            row(2, 1, SamplingParams::default()),
+        ];
+        let mut sampled = Vec::new();
         assert!(matches!(
             sampler
-                .sample(&command, &[0, 1], Logits::new(&data, VOCAB))
+                .sample(&rows, Logits::new(&data, VOCAB), &mut sampled)
                 .unwrap_err(),
             SampleError::RowsMismatch {
-                expected: 1,
-                got: 2
+                expected: 2,
+                got: 1
             }
-        ));
-        assert!(matches!(
-            sampler
-                .sample(&command, &[1], Logits::new(&data, VOCAB))
-                .unwrap_err(),
-            SampleError::RowOutOfRange { row: 1, rows: 1 }
         ));
     }
 }

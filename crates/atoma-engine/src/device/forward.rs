@@ -1,7 +1,8 @@
 //! The forward on the device: a keyed decode batch on the step over runtime-owned tensors, every
-//! other batch through the Llama forward on candle's stream, and the selected logits read back
-//! to the host either way.
+//! other batch through the Llama forward on candle's stream, the selected logits read back to the
+//! host either way, and the tokens sampled from them there.
 
+use std::mem;
 use std::sync::Arc;
 
 use atoma_runtime::session::Replay;
@@ -15,6 +16,7 @@ use crate::device::{KvCache, RankDevice, Weights};
 use crate::forward::Forward;
 use crate::logits::Logits;
 use crate::readback::{Readback, ReadbackError};
+use crate::sampler::{SampleError, Sampler};
 
 #[cfg(not(feature = "nccl"))]
 use atoma_core::dispatch::DispatchDecision;
@@ -33,6 +35,8 @@ pub enum CudaForwardError {
     Candle(#[from] candle_core::Error),
     #[error(transparent)]
     Readback(#[from] ReadbackError),
+    #[error(transparent)]
+    Sample(#[from] SampleError),
     #[cfg(not(feature = "nccl"))]
     #[error(transparent)]
     DecodeStep(Box<DecodeStepError>),
@@ -74,6 +78,9 @@ pub struct CudaForward {
     /// under NCCL nothing is enqueued through it.
     #[cfg_attr(feature = "nccl", allow(dead_code))]
     session: Replay,
+    sampler: Sampler,
+    /// The tokens the last step sampled, one per selected row in batch order.
+    sampled: Vec<u32>,
 }
 
 impl CudaForward {
@@ -88,7 +95,23 @@ impl CudaForward {
             #[cfg(not(feature = "nccl"))]
             decode_step,
             session,
+            sampler: Sampler::new(),
+            sampled: Vec::new(),
         }
+    }
+
+    /// Runs `layout` and reads the logits of the rows it selected back to the host: one row per
+    /// selected row, in batch order, a vocabulary wide; no rows on a rank with no readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaForwardError`] when the step could not be run or read back.
+    pub fn forward_logits(&mut self, layout: &BatchLayout) -> Result<Logits<'_>, CudaForwardError> {
+        #[cfg(not(feature = "nccl"))]
+        if let Some(batch) = self.keyed_batch(layout)? {
+            return self.run_decode_step(layout, batch);
+        }
+        self.candle_forward(layout)
     }
 
     /// The batch as the decode step serves it, when the layout is keyed and the shape its graphs
@@ -205,12 +228,19 @@ struct Uploaded {
 impl Forward for CudaForward {
     type Error = CudaForwardError;
 
-    fn forward(&mut self, layout: &BatchLayout) -> Result<Logits<'_>, CudaForwardError> {
-        #[cfg(not(feature = "nccl"))]
-        if let Some(batch) = self.keyed_batch(layout)? {
-            return self.run_decode_step(layout, batch);
+    /// A rank with no readback samples nothing: it ran the step for its share of the model, and
+    /// the leader's tokens are the step's.
+    fn forward(&mut self, layout: &BatchLayout) -> Result<&[u32], CudaForwardError> {
+        let logits = self.forward_logits(layout)?;
+        if self.allocated.readback.is_none() {
+            self.sampled.clear();
+            return Ok(&self.sampled);
         }
-        self.candle_forward(layout)
+        let mut sampled = mem::take(&mut self.sampled);
+        let outcome = self.sampler.sample(&layout.sampling, logits, &mut sampled);
+        self.sampled = sampled;
+        outcome?;
+        Ok(&self.sampled)
     }
 }
 
