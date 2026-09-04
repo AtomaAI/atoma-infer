@@ -16,7 +16,6 @@ pub mod forward;
 pub mod logits;
 pub mod model;
 pub mod readback;
-pub mod sampler;
 pub mod sampling;
 
 #[cfg(test)]

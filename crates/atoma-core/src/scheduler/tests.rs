@@ -31,7 +31,7 @@ mod prefix_cache;
 mod priority;
 mod stop_criteria;
 
-use crate::kv::{BlockPool, HashAlgorithm};
+use crate::kv::{BlockPool, HashAlgorithm, PaddingReservation};
 use crate::request::{
     egress, EgressReceiver, EgressSender, FinishReason, NewRequest, Priority, RequestEvent,
     SamplingParams, StopCriteria,
@@ -70,6 +70,33 @@ fn config(blocks: u32, token_budget: usize, max_batch: usize) -> SchedulerConfig
         eos_token_ids: vec![EOS],
         hash_algorithm: HashAlgorithm::Sha256V1,
     }
+}
+
+#[test]
+fn the_slot_count_covers_every_live_request_and_every_padding_dummy() {
+    let config = config(16, 100, 4);
+    assert_eq!(
+        config.slot_count(),
+        MAX_REQUESTS + PaddingReservation::dummies_for(config.max_batch),
+        "the slab's requests, plus the dummies a full batch pads with"
+    );
+
+    // The slab hands out its lowest free slot, and a full slab is the most it ever holds.
+    let mut scheduler = scheduler(16, 100, 4);
+    let mut clients = Vec::new();
+    let mut highest = 0;
+    for _ in 0..MAX_REQUESTS {
+        let (egress, client) = egress();
+        clients.push(client);
+        let slot = scheduler
+            .intake(new_request(3, 4, egress))
+            .expect("the prompt fits the model");
+        highest = highest.max(slot.get() as usize);
+    }
+    assert!(
+        highest < config.slot_count(),
+        "the highest slot {highest} is past the slot count"
+    );
 }
 
 /// A scheduler that retires a client leaving more than `max_backlog` events unread.

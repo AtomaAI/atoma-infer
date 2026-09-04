@@ -18,13 +18,13 @@ use crate::config::{DeviceOrdinal, ExecutorConfig, ModelConfig, Rank, RankConfig
 #[cfg(not(feature = "nccl"))]
 use crate::device::decode::{DecodeStep, DecodeStepPlan};
 use crate::device::forward::{Allocated, CudaForward};
+use crate::device::sampler::DeviceSampler;
 use crate::device::{Checkpoint, KvCache, KvGeometry, RankDevice, Weights};
 use crate::executor::{
     feed, launch, wait_all, Cause, Executor, ExecutorThread, Follower, FollowerRings, Launched,
     SpawnError,
 };
 use crate::model::{llama_config, ModelFiles};
-use crate::readback::Readback;
 
 #[cfg(feature = "nccl")]
 use cudarc::nccl::sys::ncclResult_t;
@@ -58,6 +58,8 @@ struct RankPlan {
     block_count: usize,
     block_size: TokenCount,
     max_batch: RequestCount,
+    /// The request slots whatever is indexed by slot is sized for.
+    slot_count: usize,
     dtype: DType,
     files: ModelFiles,
     #[cfg(not(feature = "nccl"))]
@@ -97,6 +99,7 @@ pub fn spawn_ranks(
         block_count: usize::try_from(engine.block_count).expect("a u32 block count fits usize"),
         block_size: engine.scheduler.block_size,
         max_batch: engine.scheduler.max_batch,
+        slot_count: engine.scheduler.slot_count(),
         dtype: model.dtype.into(),
         files: files.clone(),
         #[cfg(not(feature = "nccl"))]
@@ -162,10 +165,13 @@ fn open_forward(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<C
     let weights = Weights::load(&allocation, &device, checkpoint, &communicator)?;
     let geometry = KvGeometry::new(&config, plan.block_count, plan.block_size, plan.world_size)?;
     let kv_cache = KvCache::allocate(&allocation, &device, &config, geometry, plan.dtype)?;
-    let readback = if rank == Rank::ZERO {
-        Some(Readback::new(
+    // Rank zero alone samples: a follower runs the forward for its share of the model and
+    // produces nothing, so it holds no sampler.
+    let sampler = if rank == Rank::ZERO {
+        Some(DeviceSampler::new(
             &allocation,
-            device.stream().context(),
+            device.stream(),
+            plan.slot_count,
             plan.max_batch.get(),
             config.vocab_size,
         )?)
@@ -182,7 +188,7 @@ fn open_forward(rank: Rank, ordinal: DeviceOrdinal, plan: &RankPlan) -> Result<C
             device,
             weights,
             kv_cache,
-            readback,
+            sampler,
             vocab: config.vocab_size,
         },
         #[cfg(not(feature = "nccl"))]

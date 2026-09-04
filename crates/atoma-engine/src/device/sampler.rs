@@ -184,6 +184,7 @@ impl DeviceSampler {
     /// Returns [`SamplerError`] when the layout has more rows than the sampler holds or names a
     /// slot past it.
     pub fn stage(&mut self, layout: &BatchLayout) -> Result<(), SamplerError> {
+        self.staged = None;
         let rows = layout.sampling.len();
         if rows > self.max_rows {
             return Err(SamplerError::TooManyRows {

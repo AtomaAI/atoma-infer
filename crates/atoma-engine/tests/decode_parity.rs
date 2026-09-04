@@ -201,6 +201,8 @@ struct Rig {
     allocation: Allocation,
     allocated: Allocated,
     decode_step: DecodeStep,
+    /// The harness reads logits, and samples nothing; the readback is its own.
+    readback: Readback<f32>,
     vocab: usize,
 }
 
@@ -242,10 +244,12 @@ fn open(model: &ModelConfig) -> Rig {
             device,
             weights,
             kv_cache,
-            readback: Some(readback),
+            // The harness compares logits and samples nothing, so it holds no sampler.
+            sampler: None,
             vocab: config.vocab_size,
         },
         decode_step,
+        readback,
         vocab: config.vocab_size,
     }
 }
@@ -294,9 +298,9 @@ fn record_bucket_of_one(
     (capture.into_replay(), nodes, memory_nodes)
 }
 
-/// Prefills every sequence through candle over its own blocks, and appends the token each
-/// prefill sampled.
-fn prefill(forward: &mut CudaForward, sequences: &mut [Sequence]) {
+/// Prefills every sequence through candle over its own blocks, and appends the token the
+/// prefill's largest logit names.
+fn prefill(forward: &mut CudaForward, readback: &mut Readback<f32>, sequences: &mut [Sequence]) {
     for (index, sequence) in sequences.iter_mut().enumerate() {
         let command = StepCommand {
             step: StepId::new(100 + index as u64),
@@ -305,7 +309,7 @@ fn prefill(forward: &mut CudaForward, sequences: &mut [Sequence]) {
             dispatch: eager(),
         };
         let logits = forward
-            .forward_logits(&lay_out(&command))
+            .forward_logits(&lay_out(&command), readback)
             .expect("the prefill runs on candle");
         let next = argmax(logits.row(0).expect("one row"));
         sequence.context_len = sequence.tokens.len();
@@ -348,6 +352,7 @@ impl Parity {
 /// Both forwards over the sequences under test, and what comparing them has found so far.
 struct Harness {
     forward: CudaForward,
+    readback: Readback<f32>,
     sequences: Vec<Sequence>,
     dispatcher: Dispatcher,
     parity: Parity,
@@ -365,6 +370,7 @@ struct Harness {
 fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
     let Harness {
         forward,
+        readback,
         sequences,
         dispatcher,
         parity,
@@ -388,7 +394,7 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
     let used_before = (*pool).map(pool_watch);
     let tensor_logits: Vec<Vec<f32>> = {
         let logits = forward
-            .forward_logits(&keyed)
+            .forward_logits(&keyed, readback)
             .expect("the keyed batch runs on the decode step");
         (0..logits.rows())
             .map(|row| logits.row(row).expect("row").to_vec())
@@ -422,13 +428,13 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
                 dispatch: eager(),
             };
             let logits = forward
-                .forward_logits(&lay_out(&command))
+                .forward_logits(&lay_out(&command), readback)
                 .expect("the one-entry step runs on candle");
             logits.row(0).expect("row").to_vec()
         })
         .collect();
     let candle_logits = forward
-        .forward_logits(&lay_out(&on_candle))
+        .forward_logits(&lay_out(&on_candle), readback)
         .expect("the eager step runs on candle");
     let after_candle = snapshot(cache, &written);
     let kv_diff = widest_slot_diff(&after_step, &after_candle, &written, kv_width);
@@ -498,6 +504,7 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
         allocation,
         allocated,
         mut decode_step,
+        readback,
         vocab,
     } = open(&model);
     let contract = CaptureContract::resolve(&[declaration()], &ModelDeclaration::new("llama"));
@@ -536,13 +543,18 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
         .collect();
     let mut harness = Harness {
         forward,
+        readback,
         sequences,
         dispatcher,
         parity: Parity::default(),
         cache,
         pool,
     };
-    prefill(&mut harness.forward, &mut harness.sequences);
+    prefill(
+        &mut harness.forward,
+        &mut harness.readback,
+        &mut harness.sequences,
+    );
 
     for step in 0..STEPS {
         let mut chosen: Vec<usize> = (0..SEQUENCES).collect();

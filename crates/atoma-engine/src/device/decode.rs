@@ -4,9 +4,11 @@
 //! Candle keeps owning the weights and the cache; this module snapshots their device addresses
 //! into tensor views, allocates the arena, the step's fixed buffers and the cuBLAS workspace,
 //! resolves every usable bucket's slot tables, and holds the step descriptor over them. A step is
-//! then four descriptors on the capture stream: the fence after candle's stream, the input upload,
-//! the model step, and the logits copy, followed by one host wait. Nothing is captured here; going
-//! through the descriptor seam is what lets a later capture record the same step unchanged.
+//! then six descriptors on the capture stream: the fence after candle's stream, the input upload,
+//! the sampler's upload, the gather that takes each decoding row's token from what the device
+//! sampled for its slot, the model step, and the sample, which leaves the tokens on the device and
+//! copies them back; then one host wait. Nothing is captured here; going through the descriptor
+//! seam is what lets a later capture record the same step unchanged.
 
 use std::sync::Arc;
 
@@ -40,6 +42,7 @@ use crate::config::Dtype as ConfiguredDtype;
 use crate::decode::batch::{Checked, DecodeBatch, DecodeBatchError, DecodeBuckets};
 use crate::decode::inputs::{DecodeInputs, Fence, InputTensors, InputsError, Upload};
 use crate::decode::staging::StagingShape;
+use crate::device::sampler::{DeviceSampler, SamplerError};
 use crate::device::{KvCache, RankDevice, Weights};
 use crate::logits::Logits;
 use crate::readback::{Readback, ReadbackError};
@@ -92,6 +95,8 @@ pub enum DecodeStepError {
     Inputs(#[from] InputsError),
     #[error(transparent)]
     Readback(#[from] ReadbackError),
+    #[error(transparent)]
+    Sampler(#[from] SamplerError),
     #[error(transparent)]
     Batch(#[from] DecodeBatchError),
     #[error(transparent)]
@@ -240,10 +245,11 @@ impl DecodeStep {
         )?)
     }
 
-    /// Runs `batch`'s step through `session`: the inputs staged, then the fence, the upload, the
-    /// model step and the logits copy enqueued in that order, then the host wait on the copy.
-    /// A rank with no readback runs the same step and waits for it instead, so the next step's
-    /// staging is fenced either way, and returns no rows.
+    /// Runs `batch`'s step through `session` and samples it: the inputs staged, then the fence,
+    /// the input upload, the sampler's upload, the gather, the model step and the sample enqueued
+    /// in that order, then the host wait on the sampled tokens. A rank with no sampler runs the
+    /// same step without the sampler's descriptors and waits for it instead, so the next step's
+    /// staging is fenced either way, and returns no tokens.
     ///
     /// # Errors
     ///
@@ -254,20 +260,53 @@ impl DecodeStep {
         session: &Replay,
         layout: &BatchLayout,
         batch: DecodeBatch,
-        readback: Option<&'a mut Readback<f32>>,
+        sampler: Option<&'a mut DeviceSampler>,
+    ) -> Result<&'a [u32], DecodeStepError> {
+        self.stage(layout, &batch)?;
+        session.run(&mut Fence::new(&self.candle_done))?;
+        session.run(&mut self.upload(&batch))?;
+        let Some(sampler) = sampler else {
+            session.run(&mut self.descriptor(batch.bucket)?)?;
+            session.synchronize()?;
+            return Ok(&[]);
+        };
+        session.run(&mut sampler.upload()?)?;
+        session.run(&mut sampler.gather(self.token_ids_address())?)?;
+        session.run(&mut self.descriptor(batch.bucket)?)?;
+        let logits = self.decode.bucket(batch.bucket)?.statics.logits.address();
+        session.run(&mut sampler.sample(logits)?)?;
+        Ok(sampler.wait()?)
+    }
+
+    /// Runs `batch`'s step through `session` and reads the logits of its live rows back into
+    /// `readback`: the parity path, which compares the step against the candle forward. Nothing
+    /// is sampled, so no slot's record or draw counter moves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeStepError`] when the inputs cannot be staged, a descriptor cannot be
+    /// enqueued, or the wait fails.
+    pub fn run_for_logits<'a>(
+        &mut self,
+        session: &Replay,
+        layout: &BatchLayout,
+        batch: DecodeBatch,
+        readback: &'a mut Readback<f32>,
     ) -> Result<Logits<'a>, DecodeStepError> {
         self.stage(layout, &batch)?;
         session.run(&mut Fence::new(&self.candle_done))?;
         session.run(&mut self.upload(&batch))?;
         session.run(&mut self.descriptor(batch.bucket)?)?;
-        let Some(readback) = readback else {
-            session.synchronize()?;
-            return Ok(Logits::new(&[], self.decode.dims().vocab));
-        };
         let vocab = self.decode.dims().vocab;
         let logits = self.decode.bucket(batch.bucket)?.statics.logits.address();
         session.run(&mut readback.copy(logits, batch.live)?)?;
         Ok(Logits::new(readback.wait()?, vocab))
+    }
+
+    /// The device address of the uploaded token ids, which the gather overwrites.
+    #[must_use]
+    pub fn token_ids_address(&self) -> u64 {
+        self.inputs.tensors().token_ids.address()
     }
 
     /// Writes `batch`'s inputs from `layout` into the pinned staging.
