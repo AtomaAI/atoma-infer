@@ -108,6 +108,10 @@ mod tests {
     /// An H100's SM count.
     const H100_SMS: usize = 114;
 
+    /// The vendored launch template, so the cap and the combine kernels it dispatches are held to
+    /// the same number.
+    const LAUNCH_TEMPLATE: &str = include_str!("../kernels/flash_fwd_launch_template.h");
+
     fn decode(batch_size: usize, head_dim: usize, max_seqlen_k: usize) -> SplitShape {
         SplitShape {
             batch_size,
@@ -173,5 +177,21 @@ mod tests {
             ..decode(4, 128, 2048)
         };
         assert!(num_splits(two_blocks, H100_SMS) <= num_splits(one_block, H100_SMS));
+    }
+
+    #[test]
+    fn the_cap_is_the_largest_count_the_template_dispatches_a_combine_kernel_for() {
+        let dispatched = LAUNCH_TEMPLATE
+            .split("params.num_splits <= ")
+            .skip(1)
+            .map(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits
+                    .parse::<usize>()
+                    .expect("a split count follows every comparison in the dispatch chain")
+            })
+            .max()
+            .expect("the template dispatches the combine kernel by split count");
+        assert_eq!(dispatched, MAX_SPLITS);
     }
 }
