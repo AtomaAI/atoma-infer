@@ -40,11 +40,12 @@ pub struct BenchConfig {
 }
 
 impl BenchConfig {
-    /// Reads a configuration from a TOML file, applying any `ATOMA_BENCH_` environment overrides.
+    /// Reads a configuration from a TOML file, applying any `BENCH_` environment overrides.
     ///
-    /// A variable names the field it sets, nesting with `__`, so
-    /// `ATOMA_BENCH_RUN__RUNS=5` sets `runs` under `[run]`. It lets one checked-in file describe
-    /// the comparison while a single setting is changed per invocation.
+    /// A variable names the field it sets, nesting with `__`, so `BENCH_RUN__RUNS=5` sets `runs`
+    /// under `[run]`. It lets one checked-in file describe the comparison while a single setting
+    /// is changed per invocation. The prefix stays outside the server's `ATOMA_`, which refuses
+    /// any variable carrying it that names no field of its own configuration.
     ///
     /// # Errors
     ///
@@ -57,7 +58,7 @@ impl BenchConfig {
         }
         let config: Self = Figment::new()
             .merge(Toml::file(path))
-            .merge(Env::prefixed("ATOMA_BENCH_").split("__"))
+            .merge(Env::prefixed("BENCH_").split("__"))
             .extract()
             .map_err(|error| BenchError::ConfigFile(Box::new(error)))?;
 

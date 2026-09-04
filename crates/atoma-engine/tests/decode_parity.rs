@@ -60,13 +60,13 @@ const SEQUENCES: usize = 4;
 const STEPS: usize = 32;
 const LADDER: [usize; 4] = [1, 2, 4, 8];
 const MAX_BATCH: usize = 8;
-/// The largest absolute difference on the f32 logits accepted unless `ATOMA_PARITY_MAX_ABS_DIFF`
+/// The largest absolute difference on the f32 logits accepted unless `PARITY_MAX_ABS_DIFF`
 /// says otherwise; the measured value is printed either way. Above what candle's own logits move
 /// by when only the live batch they are computed in changes, which the run measures: on an A100,
 /// 0.375 for both Llama 3.1 8B and 3.2 1B, against 0.579 for the step.
 const DEFAULT_MAX_ABS_DIFF: f32 = 0.75;
 /// The largest absolute difference accepted between the key and value rows the step writes into
-/// the cache and candle's writes of the same slots, unless `ATOMA_PARITY_KV_MAX_ABS_DIFF` says
+/// the cache and candle's writes of the same slots, unless `PARITY_KV_MAX_ABS_DIFF` says
 /// otherwise; the measured value is printed either way. Both paths write bf16 from their own
 /// projections, and the step rotates keys in f32 where candle rotates in bf16.
 const DEFAULT_KV_MAX_ABS_DIFF: f32 = 0.5;
@@ -481,16 +481,16 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
 #[ignore = "needs a device, the CUDA toolkit and a Llama checkpoint; run scripts/decode-parity.sh"]
 fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     let model = ModelConfig {
-        id: env::var("ATOMA_PARITY_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned()),
+        id: env::var("PARITY_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned()),
         revision: "main".to_owned(),
         cache_dir: None,
         dtype: Dtype::Bf16,
     };
-    let bound: f32 = env::var("ATOMA_PARITY_MAX_ABS_DIFF")
+    let bound: f32 = env::var("PARITY_MAX_ABS_DIFF")
         .ok()
         .and_then(|bound| bound.parse().ok())
         .unwrap_or(DEFAULT_MAX_ABS_DIFF);
-    let kv_bound: f32 = env::var("ATOMA_PARITY_KV_MAX_ABS_DIFF")
+    let kv_bound: f32 = env::var("PARITY_KV_MAX_ABS_DIFF")
         .ok()
         .and_then(|bound| bound.parse().ok())
         .unwrap_or(DEFAULT_KV_MAX_ABS_DIFF);

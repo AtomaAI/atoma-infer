@@ -36,8 +36,8 @@ if [[ ! -f $cutlass_header ]]; then
 	git submodule update --init --depth 1 crates/atoma-kernels/cutlass
 fi
 
-export ATOMA_PARITY_MODEL="${1:-${ATOMA_PARITY_MODEL:-NousResearch/Meta-Llama-3.1-8B-Instruct}}"
-echo "==> model: $ATOMA_PARITY_MODEL"
+export PARITY_MODEL="${1:-${PARITY_MODEL:-NousResearch/Meta-Llama-3.1-8B-Instruct}}"
+echo "==> model: $PARITY_MODEL"
 echo "==> commit: $(git rev-parse HEAD)"
 echo "==> gpu: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n 1)"
 
