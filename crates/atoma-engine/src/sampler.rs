@@ -1,15 +1,9 @@
 //! Sampling each entry's next token on the host from the logits the forward selected.
 //!
 //! One state per request slot outlives the step: the random number generator the request's seed
-//! opened, and the tokens sampled for the request so far, which its repetition penalty ranges
-//! over. The state is replaced when a slot changes hands — the request id in the entry is not the
-//! one the state was built for. A greedy entry takes the largest logit straight off its row; the
-//! rest go through candle's `LogitsProcessor` for temperature, top-k and top-p. A request's
-//! `typical_p` and `frequency_penalty` are not applied here, and the API refuses a request that
-//! sets them.
-
-use std::borrow::Cow;
-use std::collections::HashSet;
+//! opened. The state is replaced when a slot changes hands — the request id in the entry is not
+//! the one the state was built for. A greedy entry takes the largest logit straight off its row;
+//! the rest go through candle's `LogitsProcessor` for temperature, top-k and top-p.
 
 use atoma_core::request::SamplingParams;
 use atoma_core::step::StepCommand;
@@ -77,8 +71,7 @@ impl Sampler {
                 rows: logits.rows(),
             })?;
             let state = self.state_for(entry.slot, entry.request, &params);
-            let token = state.sample(row_logits, &params)?;
-            state.generated.push(token);
+            let token = state.sample(row_logits)?;
             sampled.push(token);
         }
         Ok(sampled)
@@ -108,8 +101,6 @@ impl Sampler {
 struct SlotState {
     request: RequestId,
     choice: Choice,
-    /// Every token sampled for the request so far, in order.
-    generated: Vec<u32>,
 }
 
 /// How a request's next token is chosen.
@@ -126,27 +117,15 @@ impl SlotState {
             Sampling::ArgMax => Choice::Greedy,
             drawn => Choice::Drawn(Box::new(LogitsProcessor::from_sampling(params.seed, drawn))),
         };
-        Self {
-            request,
-            choice,
-            generated: Vec::new(),
-        }
+        Self { request, choice }
     }
 
-    /// One token off `row`, penalised over the last `repeat_last_n` tokens generated.
-    fn sample(&mut self, row: &[f32], params: &SamplingParams) -> Result<u32, candle_core::Error> {
-        let window = penalty_window(&self.generated, params);
-        let row = if window.is_empty() || !penalises(params) {
-            Cow::Borrowed(row)
-        } else {
-            let mut penalised = row.to_vec();
-            apply_repeat_penalty(&mut penalised, params.repetition_penalty, window);
-            Cow::Owned(penalised)
-        };
+    /// One token off `row`.
+    fn sample(&mut self, row: &[f32]) -> Result<u32, candle_core::Error> {
         match &mut self.choice {
-            Choice::Greedy => Ok(argmax(&row)),
+            Choice::Greedy => Ok(argmax(row)),
             Choice::Drawn(processor) => {
-                processor.sample(&Tensor::from_slice(&row, row.len(), &Device::Cpu)?)
+                processor.sample(&Tensor::from_slice(row, row.len(), &Device::Cpu)?)
             }
         }
     }
@@ -179,34 +158,6 @@ fn strategy(params: &SamplingParams) -> Sampling {
     }
 }
 
-fn penalises(params: &SamplingParams) -> bool {
-    params.repetition_penalty.to_bits() != 1.0_f32.to_bits()
-}
-
-/// The last `repeat_last_n` tokens generated; none when that is zero.
-fn penalty_window<'a>(generated: &'a [u32], params: &SamplingParams) -> &'a [u32] {
-    let window = params.repeat_last_n as usize;
-    &generated[generated.len().saturating_sub(window)..]
-}
-
-/// Divides a positive logit by `penalty` and multiplies a negative one by it, once per distinct
-/// token in `context`: candle's formula, applied in place on the host copy.
-fn apply_repeat_penalty(logits: &mut [f32], penalty: f32, context: &[u32]) {
-    let mut seen = HashSet::with_capacity(context.len());
-    for &token in context {
-        if !seen.insert(token) {
-            continue;
-        }
-        if let Some(logit) = logits.get_mut(token as usize) {
-            if *logit >= 0.0 {
-                *logit /= penalty;
-            } else {
-                *logit *= penalty;
-            }
-        }
-    }
-}
-
 /// The first largest logit's index. A not-a-number logit is never the largest.
 fn argmax(row: &[f32]) -> u32 {
     let mut best = 0;
@@ -228,7 +179,7 @@ mod tests {
     use crate::test_support::{command, entry, sampling_entry};
 
     const VOCAB: usize = 4;
-    /// Token 1 leads, token 3 is second; penalising 1 by two hands the lead to 3.
+    /// Token 1 leads.
     const ROW: [f32; VOCAB] = [0.1, 2.0, 0.3, 1.5];
 
     fn logits(rows: &[[f32; VOCAB]]) -> Vec<f32> {
@@ -240,14 +191,6 @@ mod tests {
             do_sample: true,
             temperature: 1.0,
             seed,
-            ..SamplingParams::default()
-        }
-    }
-
-    fn penalised(repeat_last_n: u32) -> SamplingParams {
-        SamplingParams {
-            repetition_penalty: 2.0,
-            repeat_last_n,
             ..SamplingParams::default()
         }
     }
@@ -287,7 +230,6 @@ mod tests {
             top_k: 2,
             top_p: 0.5,
             seed: 3,
-            ..SamplingParams::default()
         };
         let mut sampler = Sampler::new();
         let data = logits(&[ROW]);
@@ -317,64 +259,6 @@ mod tests {
             draw(7).iter().all(|&token| (token as usize) < VOCAB),
             "every draw is a vocabulary index"
         );
-    }
-
-    #[test]
-    fn the_penalty_ranges_over_generated_tokens_only_never_the_prompt() {
-        let mut sampler = Sampler::new();
-        let data = logits(&[ROW]);
-        // The prompt holds token 1, which leads: the first draw is still 1, unpenalised.
-        let first = sampler
-            .sample(&one(1, 0, penalised(8)), &[0], Logits::new(&data, VOCAB))
-            .unwrap();
-        assert_eq!(first, [1], "the prompt's token is not penalised");
-        let second = sampler
-            .sample(&one(1, 0, penalised(8)), &[0], Logits::new(&data, VOCAB))
-            .unwrap();
-        assert_eq!(second, [3], "the generated 1 is halved, and 3 leads");
-        let third = sampler
-            .sample(&one(1, 0, penalised(8)), &[0], Logits::new(&data, VOCAB))
-            .unwrap();
-        assert_eq!(third, [1], "both are halved and 1 leads again");
-    }
-
-    #[test]
-    fn the_penalty_window_is_the_last_repeat_last_n_tokens_and_zero_is_none() {
-        let mut sampler = Sampler::new();
-        let data = logits(&[ROW]);
-        let mut draw = |params: SamplingParams| {
-            sampler
-                .sample(&one(1, 0, params), &[0], Logits::new(&data, VOCAB))
-                .unwrap()[0]
-        };
-        assert_eq!(draw(penalised(1)), 1);
-        assert_eq!(draw(penalised(1)), 3, "1 is in the window");
-        assert_eq!(draw(penalised(1)), 1, "only 3 is in the window now");
-        assert_eq!(draw(penalised(0)), 1, "no window, no penalty");
-        assert_eq!(draw(penalised(0)), 1);
-    }
-
-    #[test]
-    fn a_slot_changing_hands_starts_the_new_request_afresh() {
-        let mut sampler = Sampler::new();
-        let data = logits(&[ROW]);
-        let mut draw = |request: u64| {
-            sampler
-                .sample(
-                    &one(request, 0, penalised(8)),
-                    &[0],
-                    Logits::new(&data, VOCAB),
-                )
-                .unwrap()[0]
-        };
-        assert_eq!(draw(1), 1);
-        assert_eq!(draw(1), 3, "request 1 is penalised on what it generated");
-        assert_eq!(
-            draw(2),
-            1,
-            "request 2 took over the slot and owes nothing to request 1"
-        );
-        assert_eq!(draw(2), 3);
     }
 
     #[test]
