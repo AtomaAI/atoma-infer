@@ -1,22 +1,26 @@
 //! The host's mirror of what each request slot holds on the device: whose record is written
-//! there, and the last token sampled for it. It answers the two questions the executor asks
+//! there, and whether a step has sampled for it. It answers the two questions the executor asks
 //! before a step: which records this step must write, because a slot changed hands, and which
-//! rows can take their token from the device, because the token the engine sent is the one the
-//! device sampled for that slot last.
+//! rows can take their token from the device, because a step sampling for the request in that
+//! slot has already been issued, so the token the slot holds is that request's last.
 //!
-//! Nothing tells the executor a request is over; a slot is released by the next request claiming
-//! it, which is when its record is rewritten and its last token forgotten.
+//! Nothing the mirror knows comes back from the device: a slot is marked as sampled for when the
+//! step that samples for it is staged, which is enough, since the stream runs that step's sample
+//! before any later step's gather. Nothing tells the executor a request is over either; a slot is
+//! released by the next request claiming it, which is when its record is rewritten and its
+//! sampling forgotten.
 
 use atoma_core::types::{RequestId, RequestSlot};
 use thiserror::Error;
 
-/// A slot the mirror does not cover: the device arrays are sized to the mirror, so this is the
-/// engine handing out a slot past the bound it declared.
+/// A slot the mirror refuses: one it does not cover, which is the engine handing out a slot past
+/// the bound it declared, since the device arrays are sized to the mirror; or one that holds no
+/// request, yet is said to sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum OwnersError {
     #[error("request slot {} is past the {slots} slots the sampler holds", slot.get())]
     SlotOutOfRange { slot: RequestSlot, slots: usize },
-    #[error("request slot {} holds no request, yet a token was sampled for it", slot.get())]
+    #[error("request slot {} holds no request, yet a step samples for it", slot.get())]
     SlotUnclaimed { slot: RequestSlot },
 }
 
@@ -29,11 +33,11 @@ pub enum Claim {
     Taken,
 }
 
-/// The request a slot holds and what was last sampled for it.
+/// The request a slot holds and whether a step has sampled for it there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Owner {
     request: RequestId,
-    last_token: Option<u32>,
+    sampled: bool,
 }
 
 /// One entry per request slot the sampler holds on the device.
@@ -51,11 +55,6 @@ impl SlotOwners {
         }
     }
 
-    #[must_use]
-    pub fn slot_count(&self) -> usize {
-        self.slots.len()
-    }
-
     /// Claims `slot` for `request`: [`Claim::Held`] when the slot already holds it, and
     /// [`Claim::Taken`] when it did not, in which case whatever the slot held is forgotten.
     ///
@@ -69,33 +68,35 @@ impl SlotOwners {
         }
         *owner = Some(Owner {
             request,
-            last_token: None,
+            sampled: false,
         });
         Ok(Claim::Taken)
     }
 
-    /// Whether a row for `request` in `slot` whose input is `token` can take that token from the
-    /// device: the slot holds the request, and `token` is what was last sampled for it there.
+    /// Whether a row for `request` in `slot` can take its token from the device: the slot holds
+    /// the request, and a step sampling for it there has been issued, so the token the slot holds
+    /// is the request's last.
     #[must_use]
-    pub fn holds_token(&self, slot: RequestSlot, request: RequestId, token: u32) -> bool {
+    pub fn gathers(&self, slot: RequestSlot, request: RequestId) -> bool {
         self.slots
             .get(index(slot))
             .copied()
             .flatten()
-            .is_some_and(|held| held.request == request && held.last_token == Some(token))
+            .is_some_and(|held| held.request == request && held.sampled)
     }
 
-    /// Records that `token` was sampled for the request `slot` holds.
+    /// Records that a step sampling for the request `slot` holds is issued: from the next step
+    /// on, the token the slot holds is that request's last.
     ///
     /// # Errors
     ///
     /// Returns [`OwnersError`] when the mirror does not cover `slot` or the slot holds no
     /// request.
-    pub fn sampled(&mut self, slot: RequestSlot, token: u32) -> Result<(), OwnersError> {
+    pub fn samples(&mut self, slot: RequestSlot) -> Result<(), OwnersError> {
         let Some(owner) = self.owner_mut(slot)? else {
             return Err(OwnersError::SlotUnclaimed { slot });
         };
-        owner.last_token = Some(token);
+        owner.sampled = true;
         Ok(())
     }
 
@@ -128,7 +129,6 @@ mod tests {
     #[test]
     fn a_slot_is_taken_once_and_held_until_another_request_claims_it() {
         let mut owners = SlotOwners::new(4);
-        assert_eq!(owners.slot_count(), 4);
         assert_eq!(owners.claim(slot(2), request(7)).unwrap(), Claim::Taken);
         assert_eq!(owners.claim(slot(2), request(7)).unwrap(), Claim::Held);
         assert_eq!(owners.claim(slot(2), request(8)).unwrap(), Claim::Taken);
@@ -141,37 +141,27 @@ mod tests {
     }
 
     #[test]
-    fn a_row_takes_its_token_from_the_device_only_for_the_token_last_sampled_there() {
+    fn a_row_takes_its_token_from_the_device_once_a_step_has_sampled_for_its_slot() {
         let mut owners = SlotOwners::new(4);
         owners.claim(slot(1), request(7)).unwrap();
+        assert!(!owners.gathers(slot(1), request(7)), "nothing sampled yet");
+        owners.samples(slot(1)).unwrap();
+        assert!(owners.gathers(slot(1), request(7)));
+        assert!(!owners.gathers(slot(1), request(8)), "another request");
+        assert!(!owners.gathers(slot(3), request(7)), "an empty slot");
         assert!(
-            !owners.holds_token(slot(1), request(7), 5),
-            "nothing sampled yet"
-        );
-        owners.sampled(slot(1), 5).unwrap();
-        assert!(owners.holds_token(slot(1), request(7), 5));
-        assert!(!owners.holds_token(slot(1), request(7), 6), "another token");
-        assert!(
-            !owners.holds_token(slot(1), request(8), 5),
-            "another request"
-        );
-        assert!(!owners.holds_token(slot(3), request(7), 5), "an empty slot");
-        assert!(
-            !owners.holds_token(slot(9), request(7), 5),
+            !owners.gathers(slot(9), request(7)),
             "a slot past the mirror holds nothing"
         );
-        owners.sampled(slot(1), 6).unwrap();
-        assert!(!owners.holds_token(slot(1), request(7), 5));
-        assert!(owners.holds_token(slot(1), request(7), 6));
     }
 
     #[test]
-    fn a_slot_changing_hands_forgets_the_token_sampled_for_the_last_request() {
+    fn a_slot_changing_hands_forgets_that_it_sampled_for_the_last_request() {
         let mut owners = SlotOwners::new(2);
         owners.claim(slot(0), request(1)).unwrap();
-        owners.sampled(slot(0), 5).unwrap();
+        owners.samples(slot(0)).unwrap();
         owners.claim(slot(0), request(2)).unwrap();
-        assert!(!owners.holds_token(slot(0), request(2), 5));
+        assert!(!owners.gathers(slot(0), request(2)));
     }
 
     #[test]
@@ -185,14 +175,14 @@ mod tests {
             }
         );
         assert_eq!(
-            owners.sampled(slot(2), 5).unwrap_err(),
+            owners.samples(slot(2)).unwrap_err(),
             OwnersError::SlotOutOfRange {
                 slot: slot(2),
                 slots: 2
             }
         );
         assert_eq!(
-            owners.sampled(slot(1), 5).unwrap_err(),
+            owners.samples(slot(1)).unwrap_err(),
             OwnersError::SlotUnclaimed { slot: slot(1) }
         );
         assert!(OwnersError::SlotOutOfRange {

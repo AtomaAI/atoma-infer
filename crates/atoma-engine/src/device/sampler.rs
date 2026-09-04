@@ -32,7 +32,7 @@ use tracing::{info, warn};
 use crate::batch::BatchLayout;
 use crate::decode::inputs::Pinned;
 use crate::readback::{Readback, ReadbackCopy, ReadbackError};
-use crate::sampling::owners::{OwnersError, SlotOwners};
+use crate::sampling::owners::SlotOwners;
 use crate::sampling::plan::{plan_step, PlanError, StepPlan};
 use crate::sampling::record::{SlotRecord, RECORD_BYTES};
 
@@ -53,8 +53,6 @@ pub enum SamplerError {
     NoStepStaged,
     #[error(transparent)]
     Plan(#[from] PlanError),
-    #[error(transparent)]
-    Owners(#[from] OwnersError),
     #[error(transparent)]
     Readback(#[from] ReadbackError),
     #[error(transparent)]
@@ -122,8 +120,6 @@ pub struct DeviceSampler {
     sampled: Device,
     /// i32 per row: the slot each selected row samples under, as the kernel indexes it.
     row_slots: Mirror<i32>,
-    /// The same slots as the mirror names them, for recording what came back.
-    row_request_slots: Vec<RequestSlot>,
     /// i32 per token row: the slot the row takes its token from, or negative to keep the host's.
     gather_slots: Mirror<i32>,
     /// u32 per row: the token sampled for each selected row this step.
@@ -165,7 +161,6 @@ impl DeviceSampler {
             pending_records: Vec::new(),
             sampled: Device::new(stream, slots * size_of::<u32>())?,
             row_slots: Mirror::new(stream, max_rows)?,
-            row_request_slots: Vec::with_capacity(max_rows),
             gather_slots: Mirror::new(stream, max_rows)?,
             out: Device::new(stream, max_rows * size_of::<u32>())?,
             readback: Readback::new(allocation, context, max_rows, 1)?,
@@ -223,7 +218,6 @@ impl DeviceSampler {
         for (row, slot) in row_slots.iter().enumerate() {
             row_slots_host[row] = slot_i32(*slot);
         }
-        self.row_request_slots = row_slots;
         let gather_host = self.gather_slots.host.as_mut_slice();
         for (row, slot) in gather.iter().enumerate() {
             gather_host[row] = slot.map_or(-1, slot_i32);
@@ -289,29 +283,18 @@ impl DeviceSampler {
         Ok(Sample { call, copy })
     }
 
-    /// Waits for the staged step's tokens, and that copy alone, records each in the mirror as
-    /// its slot's last, and returns them: one per selected row, in batch order.
+    /// Waits for the staged step's tokens, and that copy alone, and returns them: one per
+    /// selected row, in batch order.
     ///
     /// # Errors
     ///
     /// Returns [`SamplerError`] when no step is staged, no copy was enqueued, or the wait
     /// fails.
     pub fn wait(&mut self) -> Result<&[u32], SamplerError> {
-        let Self {
-            readback,
-            owners,
-            row_request_slots,
-            staged,
-            ..
-        } = self;
-        if staged.take().is_none() {
+        if self.staged.take().is_none() {
             return Err(SamplerError::NoStepStaged);
         }
-        let tokens = readback.wait()?;
-        for (&slot, &token) in row_request_slots.iter().zip(tokens) {
-            owners.sampled(slot, token)?;
-        }
-        Ok(tokens)
+        Ok(self.readback.wait()?)
     }
 
     /// Runs the staged step's sampling on `stream` — the upload, the sample and the copy back —

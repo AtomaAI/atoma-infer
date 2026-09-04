@@ -45,14 +45,16 @@ pub struct StepPlan {
     /// The slot each selected row samples under, in batch order.
     pub row_slots: Vec<RequestSlot>,
     /// One entry per token row the caller said the gather covers: the slot whose last sampled
-    /// token is the row's input, so the row can take it from the device; none for a row the
-    /// host's upload serves. Empty when the caller covers none.
+    /// token is the row's input, so the row takes it from the device; none for a row the host's
+    /// upload serves, which is one whose request no step has sampled for yet. Empty when the
+    /// caller covers none.
     pub gather: Vec<Option<RequestSlot>>,
 }
 
-/// Decides `layout`'s step against `owners`, claiming every selected row's slot for its request.
-/// `gather_rows` is how many leading token rows the gather covers, which only a caller holding a
-/// batch of one token per entry may state; a caller that states none uploads every token.
+/// Decides `layout`'s step against `owners`, claiming every selected row's slot for its request
+/// and marking each as sampled for. `gather_rows` is how many leading token rows the gather
+/// covers, which only a caller holding a batch of one token per entry may state; a caller that
+/// states none uploads every token.
 ///
 /// # Errors
 ///
@@ -63,9 +65,17 @@ pub fn plan_step(
     owners: &mut SlotOwners,
     gather_rows: Option<usize>,
 ) -> Result<StepPlan, PlanError> {
+    let gather_rows = gather_rows.unwrap_or(0);
+    if gather_rows > layout.token_count() {
+        return Err(PlanError::GatherPastBatch {
+            rows: gather_rows,
+            tokens: layout.token_count(),
+        });
+    }
     let mut records = Vec::new();
     let mut row_slots: Vec<RequestSlot> = Vec::with_capacity(layout.sampling.len());
-    for sampling in &layout.sampling {
+    let mut gather = vec![None; gather_rows];
+    for (sampling, &token_row) in layout.sampling.iter().zip(&layout.selected) {
         if let Some(row) = row_slots.iter().position(|held| *held == sampling.slot) {
             return Err(PlanError::SlotTwice {
                 slot: sampling.slot,
@@ -76,27 +86,14 @@ pub fn plan_step(
         if owners.claim(sampling.slot, sampling.request)? == Claim::Taken {
             records.push((sampling.slot, SlotRecord::new(&sampling.params)));
         }
-        row_slots.push(sampling.slot);
-    }
-    let mut gather = Vec::new();
-    if let Some(rows) = gather_rows {
-        if rows > layout.token_count() {
-            return Err(PlanError::GatherPastBatch {
-                rows,
-                tokens: layout.token_count(),
-            });
-        }
-        gather = vec![None; rows];
         // The caller states that every entry computes one token, so a selected row's token row
-        // is its entry's row.
-        for (sampling, &token_row) in layout.sampling.iter().zip(&layout.selected) {
-            let token_row = token_row as usize;
-            if token_row < rows
-                && owners.holds_token(sampling.slot, sampling.request, layout.tokens[token_row])
-            {
-                gather[token_row] = Some(sampling.slot);
-            }
+        // is its entry's row; it gathers on what the steps before this one sampled.
+        let token_row = token_row as usize;
+        if token_row < gather_rows && owners.gathers(sampling.slot, sampling.request) {
+            gather[token_row] = Some(sampling.slot);
         }
+        owners.samples(sampling.slot)?;
+        row_slots.push(sampling.slot);
     }
     Ok(StepPlan {
         records,
@@ -165,20 +162,20 @@ mod tests {
     }
 
     #[test]
-    fn a_row_gathers_when_the_device_last_sampled_its_input_token_for_its_slot() {
+    fn a_row_gathers_once_a_step_has_sampled_for_its_slot_whatever_the_host_uploads() {
         let mut owners = SlotOwners::new(8);
         plan_step(&decodes(), &mut owners, Some(3)).unwrap();
-        owners.sampled(slot(1), 5).unwrap();
-        owners.sampled(slot(2), 9).unwrap();
-        let plan = plan_step(&decodes(), &mut owners, Some(3)).unwrap();
+        let mut layout = decodes();
+        layout.tokens[0] = 77;
+        let plan = plan_step(&layout, &mut owners, Some(3)).unwrap();
         assert!(
             plan.records.is_empty(),
             "the slots still hold their requests"
         );
         assert_eq!(
             plan.gather,
-            [Some(slot(1)), None, None],
-            "request 1's input is what its slot sampled; request 2's is not; the dummy never"
+            [Some(slot(1)), Some(slot(2)), None],
+            "both requests' slots sampled last step; the dummy never"
         );
     }
 
@@ -186,12 +183,15 @@ mod tests {
     fn a_slot_changing_hands_rewrites_its_record_and_gathers_nothing() {
         let mut owners = SlotOwners::new(8);
         plan_step(&decodes(), &mut owners, Some(3)).unwrap();
-        owners.sampled(slot(1), 5).unwrap();
         let mut layout = decodes();
         layout.sampling[0].request = RequestId::new(9);
         let plan = plan_step(&layout, &mut owners, Some(3)).unwrap();
         assert_eq!(plan.records, [(slot(1), SlotRecord::new(&drawn(3)))]);
-        assert_eq!(plan.gather, [None, None, None]);
+        assert_eq!(
+            plan.gather,
+            [None, Some(slot(2)), None],
+            "slot 1 changed hands; slot 2 still holds the request it sampled for"
+        );
     }
 
     #[test]
