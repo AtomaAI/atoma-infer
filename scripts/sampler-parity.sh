@@ -2,8 +2,9 @@
 #
 # The device sampler against its host reference, on a CUDA rig: runs the ignored integration
 # tests that build the sampler over synthetic logits and compare every row's token with the
-# reference, check that a seeded request's tokens do not depend on its batch or its slot, and
-# measure the draw frequencies against the distribution the filters leave.
+# reference, check that a seeded request's tokens do not depend on its batch, its row or its
+# slot, measure the draw frequencies against the distribution the filters leave, and check that
+# the gather overwrites a decoding row's token with what its slot sampled.
 #
 # Needs a device and a CUDA 12.x toolkit; no checkpoint and no model.
 #
@@ -25,7 +26,7 @@ die() {
 command -v nvidia-smi >/dev/null || die "nvidia-smi not found — NVIDIA driver is not installed"
 nvidia-smi >/dev/null || die "nvidia-smi failed — no visible GPU"
 command -v nvcc >/dev/null || die "nvcc not on PATH — install a CUDA 12.x toolkit"
-command -v cargo >/dev/null || die "cargo not found — install rustup; rust-toolchain.toml pins the version"
+command -v cargo >/dev/null || die "cargo not found — install rustup; rust-toolchain.toml pins it"
 
 cutlass_header=crates/atoma-kernels/cutlass/include/cutlass/cutlass.h
 if [[ ! -f $cutlass_header ]]; then

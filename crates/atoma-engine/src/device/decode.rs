@@ -7,8 +7,10 @@
 //! then six descriptors on the capture stream: the fence after candle's stream, the input upload,
 //! the sampler's upload, the gather that takes each decoding row's token from what the device
 //! sampled for its slot, the model step, and the sample, which leaves the tokens on the device and
-//! reads them back; then one host wait. Nothing is captured here; going through the descriptor
-//! seam is what lets a later capture record the same step unchanged.
+//! reads them back; then one host wait. Nothing is captured here. Going through the descriptor
+//! seam is what lets a later capture record the gather, the model step and the sample unchanged;
+//! the two uploads are the host's copies of what changed, as many as changed, and stay in front
+//! of the graph.
 
 use std::sync::Arc;
 
