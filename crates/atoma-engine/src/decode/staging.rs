@@ -9,23 +9,47 @@
 //! The arrays are borrowed rather than owned so the same fill writes pinned host memory in
 //! serving and plain vectors in tests.
 
+use std::fmt;
+
 use thiserror::Error;
 
 use crate::batch::BatchLayout;
 use crate::decode::batch::DecodeBatch;
 
+/// One of the five inputs the step reads, as the staging names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedInput {
+    TokenIds,
+    Positions,
+    KeyLengths,
+    SlotMapping,
+    BlockTable,
+}
+
+impl fmt::Display for StagedInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            StagedInput::TokenIds => "token ids",
+            StagedInput::Positions => "positions",
+            StagedInput::KeyLengths => "key lengths",
+            StagedInput::SlotMapping => "slot mapping",
+            StagedInput::BlockTable => "block table",
+        })
+    }
+}
+
 /// Why the inputs could not be staged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum StagingError {
-    #[error("the {array} array holds {len} values; a bucket of {tokens} tokens stages {needed}")]
+    #[error("the {input} array holds {len} values; a bucket of {tokens} tokens stages {needed}")]
     ArrayTooShort {
-        array: &'static str,
+        input: StagedInput,
         len: usize,
         tokens: usize,
         needed: usize,
     },
-    #[error("{what} of {value} does not fit the kernel's 32-bit input")]
-    Overflow { what: &'static str, value: i64 },
+    #[error("{value} in the {input} does not fit the kernel's 32-bit input")]
+    Overflow { input: StagedInput, value: i64 },
     #[error("position {position} is past the rotary tables, which cover {max_position} positions")]
     PositionPastTables {
         position: usize,
@@ -87,17 +111,22 @@ pub fn stage(
         slot_mapping,
         block_table,
     } = arrays;
-    fits("token ids", token_ids.len(), tokens, tokens)?;
-    fits("positions", positions.len(), tokens, tokens)?;
-    fits("key lengths", seqlens_k.len(), tokens, tokens)?;
-    fits("slot mapping", slot_mapping.len(), tokens, tokens)?;
-    fits("block table", block_table.len(), tokens, tokens * width)?;
+    fits(StagedInput::TokenIds, token_ids.len(), tokens, tokens)?;
+    fits(StagedInput::Positions, positions.len(), tokens, tokens)?;
+    fits(StagedInput::KeyLengths, seqlens_k.len(), tokens, tokens)?;
+    fits(StagedInput::SlotMapping, slot_mapping.len(), tokens, tokens)?;
+    fits(
+        StagedInput::BlockTable,
+        block_table.len(),
+        tokens,
+        tokens * width,
+    )?;
 
     token_ids[..tokens].copy_from_slice(&layout.tokens[..tokens]);
     slot_mapping[..tokens].copy_from_slice(&layout.slot_mapping[..tokens]);
     for (entry, &position) in layout.positions[..tokens].iter().enumerate() {
         let overflow = || StagingError::Overflow {
-            what: "a position",
+            input: StagedInput::Positions,
             value: position,
         };
         let index = usize::try_from(position).map_err(|_| overflow())?;
@@ -111,7 +140,7 @@ pub fn stage(
     }
     for (entry, sequence_len) in layout.sequence_lengths[..tokens].iter().enumerate() {
         seqlens_k[entry] = i32::try_from(*sequence_len).map_err(|_| StagingError::Overflow {
-            what: "a sequence length",
+            input: StagedInput::KeyLengths,
             value: i64::from(*sequence_len),
         })?;
     }
@@ -121,7 +150,7 @@ pub fn stage(
         let blocks = &layout.block_tables[entry * laid_out..(entry + 1) * laid_out];
         for (slot, block) in row.iter_mut().zip(blocks) {
             *slot = i32::try_from(*block).map_err(|_| StagingError::Overflow {
-                what: "a block id",
+                input: StagedInput::BlockTable,
                 value: i64::from(*block),
             })?;
         }
@@ -131,10 +160,10 @@ pub fn stage(
 }
 
 /// Holds an array of `len` values to the `needed` a bucket of `tokens` stages.
-fn fits(array: &'static str, len: usize, tokens: usize, needed: usize) -> Result<(), StagingError> {
+fn fits(input: StagedInput, len: usize, tokens: usize, needed: usize) -> Result<(), StagingError> {
     if len < needed {
         return Err(StagingError::ArrayTooShort {
-            array,
+            input,
             len,
             tokens,
             needed,
@@ -276,7 +305,7 @@ mod tests {
         assert_eq!(
             stage(&layout, &batch, shape(), arrays).unwrap_err(),
             StagingError::ArrayTooShort {
-                array: "key lengths",
+                input: StagedInput::KeyLengths,
                 len: 1,
                 tokens: 2,
                 needed: 2
@@ -311,7 +340,7 @@ mod tests {
         assert_eq!(
             stage(&layout, &batch, shape(), owned.arrays()).unwrap_err(),
             StagingError::Overflow {
-                what: "a block id",
+                input: StagedInput::BlockTable,
                 value: i64::from(u32::MAX)
             }
         );
