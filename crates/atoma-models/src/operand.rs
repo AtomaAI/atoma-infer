@@ -52,14 +52,24 @@ pub struct Shape {
 }
 
 impl Shape {
-    /// The shape `dims`; dimensions past the rank a layout holds are dropped.
+    /// The shape `dims`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `dims` has more than [`MAX_RANK`] dimensions: no layout holds such a shape, so
+    /// an expected shape that long is a mistake at the call site, not a mismatch to report.
     #[must_use]
     pub fn new(dims: &[usize]) -> Self {
+        let rank = dims.len();
+        assert!(
+            rank <= MAX_RANK,
+            "an expected shape of rank {rank} exceeds the {MAX_RANK} dimensions a layout holds"
+        );
         let mut shape = Self {
             dims: [0; MAX_RANK],
-            rank: dims.len().min(MAX_RANK),
+            rank,
         };
-        shape.dims[..shape.rank].copy_from_slice(&dims[..shape.rank]);
+        shape.dims[..rank].copy_from_slice(dims);
         shape
     }
 
@@ -285,6 +295,12 @@ mod tests {
 
     fn bf16(dims: &[usize]) -> Layout {
         Layout::contiguous(dims, Dtype::Bf16).unwrap()
+    }
+
+    #[test]
+    #[should_panic(expected = "rank 5 exceeds the 4 dimensions")]
+    fn an_expected_shape_longer_than_a_layout_holds_is_a_mistake_not_a_mismatch() {
+        let _ = Shape::new(&[1, 2, 3, 4, 5]);
     }
 
     #[test]
