@@ -37,7 +37,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::api::chat_completions::{
-    ChatCompletionResponse, CompletionIdentity, EngineRequest, Refused, RequestBody,
+    ChatCompletionResponse, CompletionIdentity, EngineRequest, Refused, RequestBody, ServedModel,
 };
 use crate::completion::{Completion, ErrorKind, Failed, Progress};
 use crate::detokenize::Detokenizer;
@@ -72,6 +72,8 @@ const EXECUTOR_JOIN_POLL: Duration = Duration::from_millis(50);
 pub struct AppState {
     pub engine: EngineHandle,
     pub tokenizer: Arc<Tokenizer>,
+    /// The checkpoint the engine loaded, and the template its prompts are rendered through.
+    pub served: ServedModel,
     /// The longest sequence the model serves: the bound on prompt plus completion.
     pub max_model_len: TokenCount,
     /// How often a keep-alive comment is written to a stream with nothing to say.
@@ -429,7 +431,7 @@ pub async fn completion_handler(
     Span::current().record("request_id", request_id.as_str());
     let model = request.model().to_string();
     let engine_request = request
-        .to_engine_request(rand::random())
+        .to_engine_request(&state.served, rand::random())
         .map_err(|refused| ApiError::refused(&refused, &request_id))?;
     let stream = engine_request.stream;
     let (receiver, completion) = submit(&state, &request_id, model, engine_request).await?;
@@ -577,6 +579,7 @@ mod tests {
     use atoma_core::scheduler::{AdmissionPolicy, SchedulerConfig};
     use atoma_core::types::{RequestCount, TokenCount};
     use atoma_engine::batch::BatchLayout;
+    use atoma_engine::config::PromptTemplate;
     use atoma_engine::executor::{Executor, ExecutorError, ExecutorLoop};
     use atoma_engine::forward::Forward;
     use atoma_engine::logits::Logits;
@@ -701,6 +704,7 @@ mod tests {
         let state = AppState {
             engine: handle,
             tokenizer: Arc::clone(&tokenizer),
+            served: served_model(),
             max_model_len: MAX_MODEL_LEN,
             keep_alive: Duration::from_millis(100),
             heartbeat_stale_after,
@@ -770,9 +774,17 @@ mod tests {
         (status, String::from_utf8(body.to_vec()).unwrap())
     }
 
+    /// The checkpoint the test server serves, named by every body `completion_body` builds.
+    const SERVED_ID: &str = "meta-llama/Llama-3.2-1B-Instruct";
+
+    /// The test server's model: `SERVED_ID` under the template its checkpoint is written for.
+    fn served_model() -> ServedModel {
+        ServedModel::new(SERVED_ID, PromptTemplate::Llama3)
+    }
+
     fn completion_body(fields: Value) -> Value {
         let mut body = json!({
-            "model": "meta-llama/Llama-3.2-1B-Instruct",
+            "model": SERVED_ID,
             "messages": [{ "role": "user", "content": "Hi" }],
             "max_completion_tokens": 4,
             "temperature": 0.0
@@ -783,11 +795,11 @@ mod tests {
         body
     }
 
-    /// The prompt a body renders to, through the same path the handler takes.
-    fn rendered_prompt(body: Value) -> String {
+    /// The prompt a body renders to under `served`, through the same path the handler takes.
+    fn rendered_prompt(served: &ServedModel, body: Value) -> String {
         serde_json::from_value::<RequestBody>(body)
             .unwrap()
-            .to_engine_request(0)
+            .to_engine_request(served, 0)
             .unwrap()
             .prompt
     }
@@ -797,9 +809,10 @@ mod tests {
     fn a_templated_prompt_tokenizes_to_exactly_one_bos() {
         let tokenizer = tokenizer();
         let bos = tokenizer.token_to_id(BOS).unwrap();
-        let hermes = json!({ "model": "NousResearch/Hermes-3-Llama-3.1-8B" });
-        for body in [completion_body(json!({})), completion_body(hermes)] {
-            let ids = tokenize_prompt(&tokenizer, rendered_prompt(body)).unwrap();
+        for template in [PromptTemplate::Llama3, PromptTemplate::Hermes3] {
+            let served = ServedModel::new(SERVED_ID, template);
+            let prompt = rendered_prompt(&served, completion_body(json!({})));
+            let ids = tokenize_prompt(&tokenizer, prompt).unwrap();
             assert_eq!(ids.first(), Some(&bos), "{ids:?}");
             assert_eq!(ids.iter().filter(|&&id| id == bos).count(), 1, "{ids:?}");
         }
@@ -812,12 +825,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let body: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["object"], "chat.completion");
-        assert_eq!(body["model"], "meta-llama/Llama-3.2-1B-Instruct");
+        assert_eq!(body["model"], SERVED_ID);
         assert_eq!(body["choices"][0]["message"]["role"], "assistant");
         assert_eq!(body["choices"][0]["message"]["content"], "aaaa");
         assert_eq!(body["choices"][0]["finish_reason"], "length");
         assert_eq!(body["usage"]["completion_tokens"], 4);
-        let prompt = rendered_prompt(completion_body(json!({})));
+        let prompt = rendered_prompt(&served_model(), completion_body(json!({})));
         let prompt_tokens = tokenize_prompt(&served.tokenizer, prompt).unwrap().len();
         assert_eq!(
             body["usage"]["prompt_tokens"].as_u64().unwrap(),
@@ -941,7 +954,7 @@ mod tests {
         let cases = [
             ("{ not json".to_owned(), Some(JSON), "parse"),
             (
-                json!({ "model": "meta-llama/Llama-3.2-1B-Instruct", "messages": 3 }).to_string(),
+                json!({ "model": SERVED_ID, "messages": 3 }).to_string(),
                 Some(JSON),
                 "messages",
             ),
@@ -969,13 +982,29 @@ mod tests {
         let (status, body) = post(
             served.router(),
             json!({
-                "model": "meta-llama/Llama-3.2-1B-Instruct",
+                "model": SERVED_ID,
                 "messages": [{ "role": "user", "content": long }]
             }),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("max model length"), "{body}");
+        served.shutdown();
+    }
+
+    /// The engine serves one checkpoint and the request path accepts exactly that one, so a
+    /// caller cannot be refused for naming what is being served, nor served something else.
+    #[tokio::test]
+    async fn a_request_naming_another_model_is_a_400_naming_both() {
+        let served = serve("a", Duration::from_secs(30));
+        let (status, body) = post(
+            served.router(),
+            completion_body(json!({ "model": "meta-llama/Llama-3.1-70B" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("meta-llama/Llama-3.1-70B"), "{body}");
+        assert!(body.contains(SERVED_ID), "{body}");
         served.shutdown();
     }
 
@@ -1011,6 +1040,7 @@ mod tests {
                 heartbeat: reader,
             },
             tokenizer: tokenizer(),
+            served: served_model(),
             max_model_len: MAX_MODEL_LEN,
             keep_alive: Duration::from_millis(100),
             heartbeat_stale_after: Duration::from_millis(5),

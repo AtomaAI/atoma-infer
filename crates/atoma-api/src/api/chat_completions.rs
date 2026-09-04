@@ -2,6 +2,7 @@
 
 use atoma_core::request::{SamplingParams, Usage as EngineUsage};
 use atoma_core::types::TokenCount;
+use atoma_engine::config::PromptTemplate;
 use std::collections::HashMap;
 use std::io;
 use thiserror::Error;
@@ -18,172 +19,35 @@ use serde_json::Value;
 // type. For now a naive version of this is OK, but may want to do this
 // before stabilizing the API to avoid misuse.
 
-/// ID of the model to use.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename(serialize = "model", deserialize = "model"))]
-pub enum Model {
-    #[serde(rename(
-        serialize = "meta-llama/Meta-Llama-2-7b",
-        deserialize = "meta-llama/Meta-Llama-2-7b"
-    ))]
-    Llama27b,
-    #[serde(rename(
-        serialize = "meta-llama/Llama-2-7b-chat-hf",
-        deserialize = "meta-llama/Llama-2-7b-chat-hf"
-    ))]
-    Llama27bChatHf,
-    #[serde(rename(
-        serialize = "meta-llama/Llama-2-70b-hf",
-        deserialize = "meta-llama/Llama-2-70b-hf"
-    ))]
-    Llama270b,
-    #[serde(rename(
-        serialize = "meta-llama/Meta-Llama-3-8B",
-        deserialize = "meta-llama/Meta-Llama-3-8B"
-    ))]
-    Llama38b,
-    #[serde(rename(
-        serialize = "meta-llama/Meta-Llama-3-8B-Instruct",
-        deserialize = "meta-llama/Meta-Llama-3-8B-Instruct"
-    ))]
-    Llama38bInstruct,
-    #[serde(rename(
-        serialize = "meta-llama/Meta-Llama-3-70B",
-        deserialize = "meta-llama/Meta-Llama-3-70B"
-    ))]
-    Llama370b,
-    #[serde(rename(
-        serialize = "meta-llama/Meta-Llama-3-70B-Instruct",
-        deserialize = "meta-llama/Meta-Llama-3-70B-Instruct"
-    ))]
-    Llama370bInstruct,
-    #[serde(rename(
-        serialize = "meta-llama/Llama-3.1-8B",
-        deserialize = "meta-llama/Llama-3.1-8B"
-    ))]
-    Llama318b,
-    #[serde(rename(
-        serialize = "meta-llama/Llama-3.1-8B-Instruct",
-        deserialize = "meta-llama/Llama-3.1-8B-Instruct"
-    ))]
-    Llama318bInstruct,
-    #[serde(rename(
-        serialize = "meta-llama/Llama-3.1-70B",
-        deserialize = "meta-llama/Llama-3.1-70B"
-    ))]
-    Llama3170b,
-    #[serde(rename(
-        serialize = "meta-llama/Llama-3.1-70B-Instruct",
-        deserialize = "meta-llama/Llama-3.1-70B-Instruct"
-    ))]
-    Llama3170bInstruct,
-    #[serde(rename(
-        serialize = "meta-llama/Llama-3.1-405B",
-        deserialize = "meta-llama/Llama-3.1-405B"
-    ))]
-    Llama31405b,
-    #[serde(rename(
-        serialize = "meta-llama/Llama-3.1-405B-Instruct",
-        deserialize = "meta-llama/Llama-3.1-405B-Instruct"
-    ))]
-    Llama31405bInstruct,
-    #[serde(rename(
-        serialize = "meta-llama/Llama-3.2-1B",
-        deserialize = "meta-llama/Llama-3.2-1B"
-    ))]
-    Llama321b,
-    #[serde(rename(
-        serialize = "meta-llama/Llama-3.2-1B-Instruct",
-        deserialize = "meta-llama/Llama-3.2-1B-Instruct"
-    ))]
-    Llama321bInstruct,
-    #[serde(rename(
-        serialize = "meta-llama/Llama-3.2-3B",
-        deserialize = "meta-llama/Llama-3.2-3B"
-    ))]
-    Llama323b,
-    #[serde(rename(
-        serialize = "meta-llama/Llama-3.2-3B-Instruct",
-        deserialize = "meta-llama/Llama-3.2-3B-Instruct"
-    ))]
-    Llama323bInstruct,
-    /// The ungated mirror of `meta-llama/Llama-3.1-8B-Instruct`: the same weights, reachable
-    /// without a Hugging Face token, and served with the same prompt template.
-    #[serde(rename(
-        serialize = "NousResearch/Meta-Llama-3.1-8B-Instruct",
-        deserialize = "NousResearch/Meta-Llama-3.1-8B-Instruct"
-    ))]
-    NousLlama318bInstruct,
-    #[serde(rename(
-        serialize = "NousResearch/Hermes-3-Llama-3.1-8B",
-        deserialize = "NousResearch/Hermes-3-Llama-3.1-8B"
-    ))]
-    HermesLlama318b,
-    #[serde(rename(
-        serialize = "NousResearch/Hermes-3-Llama-3.1-70B",
-        deserialize = "NousResearch/Hermes-3-Llama-3.1-70B"
-    ))]
-    HermesLlama3170b,
-    #[serde(rename(
-        serialize = "NousResearch/Hermes-3-Llama-3.1-405B",
-        deserialize = "NousResearch/Hermes-3-Llama-3.1-405B"
-    ))]
-    HermesLlama31405b,
+/// The one checkpoint this server serves, and the chat template its conversations are rendered
+/// through.
+///
+/// Both come from the configuration the server started under, so what may be asked for and what
+/// the prompt is built with are the same thing. A request naming anything else is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedModel {
+    /// The Hugging Face Hub repository the engine loaded.
+    pub id: String,
+    /// The template the conversation is rendered through.
+    pub template: PromptTemplate,
 }
 
-impl std::fmt::Display for Model {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Model::Llama27b => write!(f, "meta-llama/Meta-Llama-2-7b"),
-            Model::Llama27bChatHf => write!(f, "meta-llama/Llama-2-7b-chat-hf"),
-            Model::Llama270b => write!(f, "meta-llama/Llama-2-70b-hf"),
-            Model::Llama38b => write!(f, "meta-llama/Meta-Llama-3-8B"),
-            Model::Llama38bInstruct => write!(f, "meta-llama/Meta-Llama-3-8B-Instruct"),
-            Model::Llama370b => write!(f, "meta-llama/Meta-Llama-3-70B"),
-            Model::Llama370bInstruct => write!(f, "meta-llama/Meta-Llama-3-70B-Instruct"),
-            Model::Llama318b => write!(f, "meta-llama/Llama-3.1-8B"),
-            Model::Llama318bInstruct => write!(f, "meta-llama/Llama-3.1-8B-Instruct"),
-            Model::Llama3170b => write!(f, "meta-llama/Llama-3.1-70B"),
-            Model::Llama3170bInstruct => write!(f, "meta-llama/Llama-3.1-70B-Instruct"),
-            Model::Llama31405b => write!(f, "meta-llama/Llama-3.1-405B"),
-            Model::Llama31405bInstruct => write!(f, "meta-llama/Llama-3.1-405B-Instruct"),
-            Model::Llama321b => write!(f, "meta-llama/Llama-3.2-1B"),
-            Model::Llama321bInstruct => write!(f, "meta-llama/Llama-3.2-1B-Instruct"),
-            Model::Llama323b => write!(f, "meta-llama/Llama-3.2-3B"),
-            Model::Llama323bInstruct => write!(f, "meta-llama/Llama-3.2-3B-Instruct"),
-            Model::NousLlama318bInstruct => {
-                write!(f, "NousResearch/Meta-Llama-3.1-8B-Instruct")
-            }
-            Model::HermesLlama318b => write!(f, "NousResearch/Hermes-3-Llama-3.1-8B"),
-            Model::HermesLlama3170b => write!(f, "NousResearch/Hermes-3-Llama-3.1-70B"),
-            Model::HermesLlama31405b => write!(f, "NousResearch/Hermes-3-Llama-3.1-405B"),
+impl ServedModel {
+    /// The served checkpoint under `template`.
+    #[must_use]
+    pub fn new(id: impl Into<String>, template: PromptTemplate) -> Self {
+        Self {
+            id: id.into(),
+            template,
         }
     }
-}
 
-impl Model {
-    pub fn messages_to_prompt(&self, messages: &[Message]) -> String {
-        use Model::*;
-        match self {
-            Llama27b | Llama27bChatHf | Llama270b => messages::messages_to_llama2_prompt(messages),
-            Llama38b
-            | Llama38bInstruct
-            | Llama370b
-            | Llama370bInstruct
-            | Llama318b
-            | Llama318bInstruct
-            | Llama3170b
-            | Llama3170bInstruct
-            | Llama31405b
-            | Llama31405bInstruct
-            | Llama321b
-            | Llama321bInstruct
-            | Llama323b
-            | Llama323bInstruct
-            | NousLlama318bInstruct => messages::messages_to_llama3_prompt(messages),
-            HermesLlama318b | HermesLlama3170b | HermesLlama31405b => {
-                messages::messages_to_hermes3_prompt(messages)
-            }
+    /// Renders `messages` through this model's template.
+    fn messages_to_prompt(&self, messages: &[Message]) -> String {
+        match self.template {
+            PromptTemplate::Llama2 => messages::messages_to_llama2_prompt(messages),
+            PromptTemplate::Llama3 => messages::messages_to_llama3_prompt(messages),
+            PromptTemplate::Hermes3 => messages::messages_to_hermes3_prompt(messages),
         }
     }
 }
@@ -279,7 +143,7 @@ impl Message {
 }
 
 pub(crate) mod messages {
-    use super::{Message, MessageContent, Model, ToolCall};
+    use super::{Message, MessageContent, PromptTemplate, ToolCall};
     use tracing::warn;
 
     /// Function to convert a list of messages to a prompt string in Llama2 format.
@@ -395,7 +259,7 @@ pub(crate) mod messages {
                         // stands for the family.
                         let tool_calls_str = tool_calls
                             .iter()
-                            .map(|tc| tc.function_call_string(Model::Llama318bInstruct))
+                            .map(|tc| tc.function_call_string(PromptTemplate::Llama3))
                             .collect::<Vec<_>>()
                             .join(", ");
                         prompt.push_str("<|python_tag|>[");
@@ -458,7 +322,7 @@ pub(crate) mod messages {
         prompt.push_str("\n<tool_call>\n");
         // Every Hermes 3 model renders a tool call the same way, so one variant stands for the
         // family.
-        prompt.push_str(&tool_call.function_call_string(Model::HermesLlama318b));
+        prompt.push_str(&tool_call.function_call_string(PromptTemplate::Hermes3));
         prompt.push_str("\n</tool_call>");
     }
 
@@ -829,9 +693,9 @@ fn json_dumps(value: &Value) -> String {
 }
 
 impl ToolCall {
-    pub fn function_call_string(&self, model: Model) -> String {
-        match model {
-            Model::HermesLlama318b | Model::HermesLlama3170b | Model::HermesLlama31405b => {
+    pub fn function_call_string(&self, template: PromptTemplate) -> String {
+        match template {
+            PromptTemplate::Hermes3 => {
                 // The template writes the name before the arguments.
                 format!(
                     "{{\"name\": \"{}\", \"arguments\": {}}}",
@@ -839,21 +703,7 @@ impl ToolCall {
                     json_dumps(&self.function.arguments)
                 )
             }
-            Model::Llama38b
-            | Model::Llama38bInstruct
-            | Model::Llama370b
-            | Model::Llama370bInstruct
-            | Model::Llama31405b
-            | Model::Llama31405bInstruct
-            | Model::Llama318b
-            | Model::Llama318bInstruct
-            | Model::Llama3170b
-            | Model::Llama3170bInstruct
-            | Model::Llama321b
-            | Model::Llama321bInstruct
-            | Model::Llama323b
-            | Model::Llama323bInstruct
-            | Model::NousLlama318bInstruct => {
+            PromptTemplate::Llama3 => {
                 // Check if arguments is a JSON object
                 if let Some(args) = self.function.arguments.as_object() {
                     let params_str = args
@@ -894,9 +744,7 @@ impl ToolCall {
                     format!("{}()", self.function.name)
                 }
             }
-            Model::Llama27b | Model::Llama27bChatHf | Model::Llama270b => {
-                self.function.name.to_string()
-            }
+            PromptTemplate::Llama2 => self.function.name.to_string(),
         }
     }
 }
@@ -948,8 +796,8 @@ pub enum StopCondition {
 pub struct RequestBody {
     /// A list of messages comprising the conversation so far.
     messages: Vec<Message>,
-    /// ID of the model to use.
-    model: Model,
+    /// ID of the model to use. It must name the checkpoint this server was started on.
+    model: String,
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing
     /// frequency in the text so far, decreasing the model's likelihood to repeat the same line
     /// verbatim.
@@ -1015,7 +863,7 @@ pub struct RequestBody {
 }
 
 impl RequestBody {
-    pub fn model(&self) -> &Model {
+    pub fn model(&self) -> &str {
         &self.model
     }
 }
@@ -1060,10 +908,15 @@ pub enum Refused {
     ZeroCompletionTokens,
     #[error("max_tokens must be at least 1")]
     ZeroMaxTokens,
+    #[error("model {requested} is not served; this server serves {served}")]
+    Model { requested: String, served: String },
 }
 
 impl RequestBody {
     /// The engine request this body asks for, or why it cannot be served.
+    ///
+    /// The prompt is rendered through `served`'s template, since the template belongs to the
+    /// checkpoint the engine loaded rather than to the request.
     ///
     /// Sampling is on, as the API's default is the model's own distribution; a temperature of
     /// zero is the request for greedy decoding, honoured by the sampler. `seed` is used when
@@ -1074,14 +927,25 @@ impl RequestBody {
     ///
     /// # Errors
     ///
-    /// Returns [`Refused`] for what the engine does not serve — `logprobs`, `top_logprobs`,
-    /// more than one choice, `logit_bias`, `tools`, a non-zero `frequency_penalty` or
-    /// `presence_penalty` — and for a temperature outside 0 to 2, a `top_p` outside 0 to 1, or
-    /// a completion budget of zero under either of its names.
-    pub fn to_engine_request(&self, fresh_seed: u64) -> Result<EngineRequest, Refused> {
+    /// Returns [`Refused::Model`] when `model` names anything but the served checkpoint, and
+    /// [`Refused`] for what the engine does not serve — `logprobs`, `top_logprobs`, more than
+    /// one choice, `logit_bias`, `tools`, a non-zero `frequency_penalty` or `presence_penalty`
+    /// — and for a temperature outside 0 to 2, a `top_p` outside 0 to 1, or a completion budget
+    /// of zero under either of its names.
+    pub fn to_engine_request(
+        &self,
+        served: &ServedModel,
+        fresh_seed: u64,
+    ) -> Result<EngineRequest, Refused> {
+        if self.model != served.id {
+            return Err(Refused::Model {
+                requested: self.model.clone(),
+                served: served.id.clone(),
+            });
+        }
         self.refuse_unserved()?;
         Ok(EngineRequest {
-            prompt: self.model.messages_to_prompt(&self.messages),
+            prompt: served.messages_to_prompt(&self.messages),
             sampling: self.sampling(fresh_seed)?,
             max_new_tokens: self.max_new_tokens()?,
             stop: self.stop_strings(),
@@ -1370,8 +1234,8 @@ pub mod tests {
     use super::{
         json_dumps, messages, ChatCompletionChunk, ChatCompletionResponse, Choice,
         CompletionIdentity, Delta, FinishReason, JsonDumpsFormatter, Message, MessageContent,
-        MessageContentPart, MessageContentPartImageUrl, Model, Refused, RequestBody, StreamChoice,
-        ToolCall, ToolCallFunction, Usage,
+        MessageContentPart, MessageContentPartImageUrl, PromptTemplate, Refused, RequestBody,
+        ServedModel, StreamChoice, ToolCall, ToolCallFunction, Usage,
     };
 
     fn identity(created: u64) -> CompletionIdentity {
@@ -1420,7 +1284,11 @@ pub mod tests {
 
         let request_body: RequestBody =
             serde_json::from_str(json_request_body).expect("Harness body must deserialize");
-        let request = request_body.to_engine_request(7).unwrap();
+        let served = ServedModel::new(
+            "meta-llama/Meta-Llama-3-8B-Instruct",
+            PromptTemplate::Llama3,
+        );
+        let request = request_body.to_engine_request(&served, 7).unwrap();
 
         assert_eq!(request.sampling.temperature, 0.0);
         assert!(request.sampling.do_sample);
@@ -1449,9 +1317,17 @@ pub mod tests {
         );
     }
 
+    /// The checkpoint every body the `body` helper builds names.
+    const SERVED_ID: &str = "meta-llama/Llama-3.2-1B-Instruct";
+
+    /// The server those bodies are sent to: it serves `SERVED_ID` under the Llama 3 template.
+    fn served() -> ServedModel {
+        ServedModel::new(SERVED_ID, PromptTemplate::Llama3)
+    }
+
     fn body(fields: serde_json::Value) -> RequestBody {
         let mut body = json!({
-            "model": "meta-llama/Llama-3.2-1B-Instruct",
+            "model": SERVED_ID,
             "messages": [{ "role": "user", "content": "Hi" }]
         });
         body.as_object_mut()
@@ -1462,7 +1338,7 @@ pub mod tests {
 
     #[test]
     fn a_body_that_asks_for_nothing_samples_from_the_models_own_distribution() {
-        let request = body(json!({})).to_engine_request(42).unwrap();
+        let request = body(json!({})).to_engine_request(&served(), 42).unwrap();
         assert_eq!(
             request.sampling,
             SamplingParams {
@@ -1485,14 +1361,18 @@ pub mod tests {
     fn a_seed_given_is_kept_and_one_absent_is_the_fresh_one() {
         assert_eq!(
             body(json!({ "seed": 9 }))
-                .to_engine_request(42)
+                .to_engine_request(&served(), 42)
                 .unwrap()
                 .sampling
                 .seed,
             9
         );
         assert_eq!(
-            body(json!({})).to_engine_request(42).unwrap().sampling.seed,
+            body(json!({}))
+                .to_engine_request(&served(), 42)
+                .unwrap()
+                .sampling
+                .seed,
             42
         );
     }
@@ -1502,7 +1382,7 @@ pub mod tests {
     #[test]
     fn a_budget_sent_as_max_tokens_is_applied() {
         let request = body(json!({ "max_tokens": 8 }))
-            .to_engine_request(1)
+            .to_engine_request(&served(), 1)
             .unwrap();
         assert_eq!(request.max_new_tokens, Some(TokenCount::new(8).unwrap()));
     }
@@ -1510,7 +1390,7 @@ pub mod tests {
     #[test]
     fn max_completion_tokens_wins_when_both_budgets_are_sent() {
         let request = body(json!({ "max_completion_tokens": 3, "max_tokens": 8 }))
-            .to_engine_request(1)
+            .to_engine_request(&served(), 1)
             .unwrap();
         assert_eq!(request.max_new_tokens, Some(TokenCount::new(3).unwrap()));
     }
@@ -1519,23 +1399,83 @@ pub mod tests {
     fn stop_strings_arrive_as_one_or_several() {
         assert_eq!(
             body(json!({ "stop": "\n" }))
-                .to_engine_request(1)
+                .to_engine_request(&served(), 1)
                 .unwrap()
                 .stop,
             ["\n"]
         );
         assert_eq!(
             body(json!({ "stop": ["a", "b"] }))
-                .to_engine_request(1)
+                .to_engine_request(&served(), 1)
                 .unwrap()
                 .stop,
             ["a", "b"]
         );
     }
 
+    /// The server serves one checkpoint, so a request that names another is asking for something
+    /// this process cannot answer, and both names go back to the caller.
+    #[test]
+    fn a_model_this_server_does_not_serve_is_refused_naming_both() {
+        let refused = body(json!({ "model": "meta-llama/Llama-3.1-70B" }))
+            .to_engine_request(&served(), 1)
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            Refused::Model {
+                requested: "meta-llama/Llama-3.1-70B".to_owned(),
+                served: SERVED_ID.to_owned(),
+            }
+        );
+        let message = refused.to_string();
+        assert!(message.contains("meta-llama/Llama-3.1-70B"), "{message}");
+        assert!(message.contains(SERVED_ID), "{message}");
+    }
+
+    /// The ungated mirrors are the case a fixed list of repositories refuses: the same weights
+    /// under another owner, and what a host without a Hub token can serve. Whatever the engine
+    /// was started on is what a request may name.
+    #[test]
+    fn a_checkpoint_outside_any_list_is_served_when_it_is_what_the_engine_loaded() {
+        let mirror = "unsloth/Llama-3.2-1B-Instruct";
+        let request = body(json!({ "model": mirror }))
+            .to_engine_request(&ServedModel::new(mirror, PromptTemplate::Llama3), 1)
+            .expect("the checkpoint the engine loaded is servable");
+        assert!(request.prompt.contains("<|begin_of_text|>"), "{request:?}");
+    }
+
+    /// The prompt is built with the template the server was configured for, not with one the
+    /// request chose: the same body renders differently under a different template.
+    #[test]
+    fn the_prompt_is_built_with_the_servers_template() {
+        let llama3 = body(json!({}))
+            .to_engine_request(&served(), 1)
+            .unwrap()
+            .prompt;
+        let hermes3 = body(json!({}))
+            .to_engine_request(&ServedModel::new(SERVED_ID, PromptTemplate::Hermes3), 1)
+            .unwrap()
+            .prompt;
+        assert_ne!(llama3, hermes3);
+        assert_eq!(llama3, messages::messages_to_llama3_prompt(&messages_of()));
+        assert_eq!(
+            hermes3,
+            messages::messages_to_hermes3_prompt(&messages_of())
+        );
+    }
+
+    /// The one user message every `body` carries.
+    fn messages_of() -> Vec<Message> {
+        vec![Message::User {
+            content: Some(MessageContent::Text("Hi".to_owned())),
+            name: None,
+        }]
+    }
+
     #[test]
     fn what_the_engine_cannot_honour_is_refused_by_name() {
-        let refused = |fields: serde_json::Value| body(fields).to_engine_request(1).unwrap_err();
+        let refused =
+            |fields: serde_json::Value| body(fields).to_engine_request(&served(), 1).unwrap_err();
         assert_eq!(refused(json!({ "logprobs": true })), Refused::Logprobs);
         assert_eq!(refused(json!({ "top_logprobs": 2 })), Refused::TopLogprobs);
         assert_eq!(refused(json!({ "n": 2 })), Refused::Choices { n: 2 });
@@ -1582,7 +1522,7 @@ pub mod tests {
     fn the_unset_values_of_refusable_fields_are_accepted() {
         assert!(
             body(json!({ "logprobs": false, "n": 1, "logit_bias": {}, "tools": [] }))
-                .to_engine_request(1)
+                .to_engine_request(&served(), 1)
                 .is_ok()
         );
         assert!(body(json!({
@@ -1592,7 +1532,7 @@ pub mod tests {
             "presence_penalty": 0.0,
             "user": "someone"
         }))
-        .to_engine_request(1)
+        .to_engine_request(&served(), 1)
         .is_ok());
     }
 
@@ -2264,7 +2204,7 @@ pub mod tests {
                     arguments,
                 },
             }
-            .function_call_string(Model::HermesLlama318b)
+            .function_call_string(PromptTemplate::Hermes3)
         };
 
         assert_eq!(
@@ -2302,7 +2242,7 @@ pub mod tests {
                     arguments,
                 },
             };
-            call.function_call_string(Model::HermesLlama318b)
+            call.function_call_string(PromptTemplate::Hermes3)
         };
 
         assert_eq!(
@@ -2359,7 +2299,7 @@ pub mod tests {
             },
         };
         assert_eq!(
-            call.function_call_string(Model::Llama318bInstruct),
+            call.function_call_string(PromptTemplate::Llama3),
             "get_weather(city='Lisbon', at='noon')"
         );
     }
@@ -2689,9 +2629,7 @@ pub mod tests {
             },
         ];
 
-        let model = Model::Llama27b;
-
-        let prompt = model.messages_to_prompt(&messages);
+        let prompt = messages::messages_to_llama2_prompt(&messages);
 
         let expected_prompt = "<s>[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\n\nHello, how are you? [/INST]\nI'm doing well, thank you! How can I assist you today?\n[INST] Can you tell me a joke? [/INST]\nSure! Why did the computer show up at work late? Because it had a hard drive!\n";
 
@@ -2717,9 +2655,7 @@ pub mod tests {
             },
         ];
 
-        let model = Model::Llama27b;
-
-        let prompt = model.messages_to_prompt(&messages);
+        let prompt = messages::messages_to_llama2_prompt(&messages);
 
         let expected_prompt = "<s>[INST] <<SYS>>\n\n<</SYS>>\n\n [/INST]\n\n";
 
@@ -2745,9 +2681,7 @@ pub mod tests {
             },
         ];
 
-        let model = Model::Llama27b;
-
-        let prompt = model.messages_to_prompt(&messages);
+        let prompt = messages::messages_to_llama2_prompt(&messages);
 
         let expected_prompt =
             "<s>[INST] What is the weather like? [/INST]\nThe weather is sunny today.\n";
@@ -2772,9 +2706,7 @@ pub mod tests {
             },
         ];
 
-        let model = Model::Llama27b;
-
-        let prompt = model.messages_to_prompt(&messages);
+        let prompt = messages::messages_to_llama2_prompt(&messages);
 
         let expected_prompt = "<s>[INST] <<SYS>>\nYou are an AI assistant.\n<</SYS>>\n\n[/INST]\nHello, how can I assist you today?\n";
 
@@ -2788,9 +2720,7 @@ pub mod tests {
             name: None,
         }];
 
-        let model = Model::Llama27b;
-
-        let prompt = model.messages_to_prompt(&messages);
+        let prompt = messages::messages_to_llama2_prompt(&messages);
 
         let expected_prompt = "<s>[INST] Is the sky blue? [/INST]\n";
 
@@ -2806,9 +2736,7 @@ pub mod tests {
             name: None,
         }];
 
-        let model = Model::Llama27b;
-
-        let prompt = model.messages_to_prompt(&messages);
+        let prompt = messages::messages_to_llama2_prompt(&messages);
 
         let expected_prompt =
             "<s>[INST] <<SYS>>\nYou are a helpful AI assistant.\n<</SYS>>\n\n[/INST]\n";
@@ -2827,9 +2755,7 @@ pub mod tests {
             tool_calls: Vec::new(),
         }];
 
-        let model = Model::Llama27b;
-
-        let prompt = model.messages_to_prompt(&messages);
+        let prompt = messages::messages_to_llama2_prompt(&messages);
 
         let expected_prompt = "<s>You are a helpful AI assistant.\n";
 

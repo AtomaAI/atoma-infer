@@ -92,8 +92,8 @@ on one H100 PCIe against vLLM `v0.26.0` are
 ## Configuration and running
 
 The example configuration at the repository root holds everything the server is built from: the
-engine, the executor's ranks, the model and the server itself. Copy it and set the model, the
-device and core of each rank, and where to listen:
+engine, the executor's ranks, the model and the server itself. Copy it and set the model and the
+chat template it is served under, the device and core of each rank, and where to listen:
 
 ```shell
 cp config.example.toml config.toml
