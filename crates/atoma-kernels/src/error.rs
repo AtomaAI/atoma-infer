@@ -2,6 +2,8 @@ use candle_core::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use thiserror::Error as ThisError;
 
+use crate::splits::MAX_SPLITS;
+
 /// An attention feature the vendored flash-attention kernels are not compiled for.
 ///
 /// `kernels/static_switch.h` compiles the corresponding template parameter out, so the kernels
@@ -57,6 +59,36 @@ pub enum KernelError {
         /// `cudaGetErrorString` for `code`.
         message: String,
     },
+
+    /// A kernel argument does not fit the width the FFI declares for it.
+    #[error("{argument} of {value} does not fit the kernel's argument width")]
+    ArgumentOverflow {
+        /// The FFI parameter the value was meant for.
+        argument: &'static str,
+        value: usize,
+    },
+
+    /// The split count is past the partitions the combine kernel is dispatched for: the split
+    /// kernel would run, and nothing would combine its partitions into the output.
+    #[error(
+        "a split count of {num_splits} is past the {} partitions the combine kernel is \
+         dispatched for; the output would never be written",
+        MAX_SPLITS
+    )]
+    SplitCount {
+        /// The count the call carried.
+        num_splits: u32,
+    },
+
+    /// The kernel was asked for from a build that carries none.
+    #[error(
+        "{kernel} is not in this build: the kernels are compiled by nvcc under the cuda feature, \
+         so rebuild with --features cuda on a machine with the CUDA toolkit"
+    )]
+    NotCompiled {
+        /// The FFI entry point that would have been called.
+        kernel: &'static str,
+    },
 }
 
 impl KernelError {
@@ -64,6 +96,27 @@ impl KernelError {
     pub const fn unsupported(capability: Capability) -> Self {
         Self::UnsupportedCapability { capability }
     }
+}
+
+/// A kernel argument that must fit the FFI's 32-bit parameter.
+#[cfg(feature = "cuda")]
+pub(crate) fn arg32(argument: &'static str, value: usize) -> Result<u32, KernelError> {
+    u32::try_from(value).map_err(|_| KernelError::ArgumentOverflow { argument, value })
+}
+
+/// A kernel argument that must fit the FFI's signed 32-bit parameter.
+#[cfg(feature = "cuda")]
+pub(crate) fn arg_int(
+    argument: &'static str,
+    value: usize,
+) -> Result<core::ffi::c_int, KernelError> {
+    core::ffi::c_int::try_from(value).map_err(|_| KernelError::ArgumentOverflow { argument, value })
+}
+
+/// A kernel argument that must fit the FFI's signed 64-bit parameter.
+#[cfg(feature = "cuda")]
+pub(crate) fn arg_i64(argument: &'static str, value: usize) -> Result<i64, KernelError> {
+    i64::try_from(value).map_err(|_| KernelError::ArgumentOverflow { argument, value })
 }
 
 impl From<KernelError> for Error {
@@ -141,6 +194,13 @@ mod tests {
             check_supported_capabilities(Some(30.0), Some(1024), None),
             Err(KernelError::unsupported(Capability::Softcap))
         );
+    }
+
+    #[test]
+    fn a_missing_build_names_the_kernel_and_the_feature() {
+        let error = KernelError::NotCompiled { kernel: "run_mha" }.to_string();
+        assert!(error.contains("run_mha"), "{error}");
+        assert!(error.contains("--features cuda"), "{error}");
     }
 
     #[test]

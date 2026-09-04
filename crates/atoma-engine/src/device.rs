@@ -3,10 +3,13 @@
 //!
 //! Every constructor here takes the [`Allocation`] phase as a witness: the session fixes device
 //! addresses before anything is captured, and taking the phase by reference is what makes an
-//! allocation after that point unwritable. In this crate the forward runs eagerly on candle's own
-//! stream, so nothing is enqueued through the session's descriptor seam; the session orders
-//! startup and nothing else.
+//! allocation after that point unwritable. A keyed decode batch runs through the session's
+//! descriptor seam on the step over runtime-owned tensors, built here from the addresses candle
+//! loaded the weights and cache at; every other batch runs eagerly on candle's own stream. Under
+//! NCCL the decode step stays on candle and no such step is built.
 
+#[cfg(not(feature = "nccl"))]
+pub mod decode;
 pub mod forward;
 
 use std::sync::Arc;
@@ -186,6 +189,12 @@ impl KvCache {
     pub fn layers_mut(&mut self) -> Vec<&mut Tensor> {
         self.layers.iter_mut().collect()
     }
+
+    /// Every layer's cache, in layer order, as allocated.
+    #[must_use]
+    pub fn layers(&self) -> &[Tensor] {
+        &self.layers
+    }
 }
 
 /// The Llama the forward runs: over all its heads alone, or over this rank's share of them
@@ -328,5 +337,10 @@ impl Weights {
 
     pub fn llama_mut(&mut self) -> &mut Llama {
         &mut self.llama
+    }
+
+    #[must_use]
+    pub fn llama(&self) -> &Llama {
+        &self.llama
     }
 }

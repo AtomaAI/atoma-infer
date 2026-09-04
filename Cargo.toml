@@ -4,6 +4,7 @@ members = [
     "crates/atoma-core",
     "crates/atoma-engine",
     "crates/atoma-kernels",
+    "crates/atoma-models",
     "crates/atoma-runtime",
     "crates/bench",
     "crates/graph-harness",
@@ -21,6 +22,7 @@ atoma-bench = { path = "crates/bench" }
 atoma-core = { path = "crates/atoma-core" }
 atoma-engine = { path = "crates/atoma-engine" }
 atoma-kernels = { path = "crates/atoma-kernels" }
+atoma-models = { path = "crates/atoma-models" }
 atoma-runtime = { path = "crates/atoma-runtime" }
 axum = "0.8"
 bindgen_cuda = "0.1.5"

@@ -37,7 +37,7 @@ Install [prek](https://prek.j178.dev/), then install and run the repository hook
 
 ## CUDA builds
 
-The `cuda` feature compiles the flash-attention and cache-manager kernels in `crates/atoma-kernels`, which include CUTLASS headers. CUTLASS is a Git submodule at `crates/atoma-kernels/cutlass` and is not part of a plain `git clone`. Step 5 of the contributor setup checks it out; in an existing checkout, or in CI that clones without submodules, fetch it with:
+The `cuda` feature compiles the flash-attention and cache-manager kernels in `crates/atoma-kernels`, which include CUTLASS headers, and the decode step's own kernels beside them. CUTLASS is a Git submodule at `crates/atoma-kernels/cutlass` and is not part of a plain `git clone`. Step 5 of the contributor setup checks it out; in an existing checkout, or in CI that clones without submodules, fetch it with:
 
 ```shell
 git submodule update --init --depth 1 crates/atoma-kernels/cutlass
@@ -69,6 +69,11 @@ checkout on a CUDA rig. It preflights the machine (driver, CUDA toolkit, NCCL, O
 dependencies, CUTLASS submodule), builds the `cuda` feature, runs the `cuda` and `cuda,nccl` test
 suites without fail-fast, runs clippy over all features, and prints an evidence block to paste
 into the tracking ticket.
+
+`scripts/decode-parity.sh` runs the decode step over runtime-owned tensors beside the candle
+forward on the same weights and KV cache, records the step under capture, and compares the two
+forwards' logits over decode steps of varying ids, lengths and block tables. It needs a device, the
+toolkit and a Llama checkpoint loadable in bf16, and prints its own evidence block.
 
 ## Benchmarks
 

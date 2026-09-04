@@ -10,7 +10,8 @@ thiserror = { workspace = true }
 tracing   = { workspace = true }
 
 [features]
-nccl = [ "cudarc/nccl" ]
+nccl         = [ "cudarc/nccl" ]
+test-support = [  ]
 
 [dev-dependencies]
 proptest = { workspace = true }

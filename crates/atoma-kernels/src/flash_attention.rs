@@ -1878,38 +1878,13 @@ impl FlashAttentionKvCache {
             )
         }
 
-        let mut window_size_left = self.window_size_left.map(|i| i as i32);
-        let mut window_size_right = self.window_size_right.map(|i| i as i32);
-
-        if let Some(w) = window_size_left {
-            if w >= seqlen_k as i32 {
-                window_size_left = Some(-1);
-            }
-        }
-        if let Some(w) = window_size_right {
-            if w >= seqlen_k as i32 {
-                window_size_right = Some(-1);
-            }
-        }
-
-        let mut window_size_left = window_size_left.unwrap_or(-1);
-        let mut window_size_right = window_size_right.unwrap_or(-1);
-
-        let mut is_causal = attention_window::is_causal(window_size_left, window_size_right);
-        // causal=true is the same as causal=false in this case
-        if seqlen_q == 1 && self.alibi_slopes.is_none() {
-            is_causal = false;
-        }
-        if is_causal {
-            window_size_right = 0;
-        }
-
-        if window_size_left < 0 && window_size_right >= 0 {
-            window_size_left = seqlen_k as i32;
-        }
-        if window_size_right < 0 && window_size_left >= 0 {
-            window_size_right = seqlen_k as i32;
-        }
+        let window = attention_window::resolve(
+            self.window_size_left,
+            self.window_size_right,
+            seqlen_k as i32,
+            seqlen_q,
+            self.alibi_slopes.is_some(),
+        );
 
         let out_shape = q_l.shape().clone();
         let out_l = Layout::contiguous(&out_shape);
@@ -2138,9 +2113,9 @@ impl FlashAttentionKvCache {
                 /* seqlen_q_rounded */ seqlen_q_rounded as u32,
                 /* seqlen_k_rounded */ seqlen_k_rounded as u32,
                 /* is_bf16 */ is_bf16,
-                /* is_causal */ is_causal as i32,
-                /* window_size_left */ window_size_left,
-                /* window_size_right */ window_size_right,
+                /* is_causal */ i32::from(window.is_causal),
+                /* window_size_left */ window.window_size_left,
+                /* window_size_right */ window.window_size_right,
                 /* softcap */ 0.0,
                 /* unpadded_lse */ false,
                 /* force_split_kernel */ self.block_table.is_some(),
@@ -2419,6 +2394,7 @@ pub(crate) mod utils {
     };
 
     use super::*;
+    use crate::splits::{num_splits, SplitShape};
     pub(crate) fn round_multiple(x: usize, m: usize) -> usize {
         x.div_ceil(m) * m
     }
@@ -2483,59 +2459,8 @@ pub(crate) mod utils {
         }
     }
 
-    /// Find the number of splits that maximizes the occupancy. For example, if we have
-    /// batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
-    /// better than having 3 splits (efficiency = 0.67). However, we also don't want too many
-    /// splits as that would incur more HBM reads/writes.
-    /// So we find the best efficiency, then find the smallest number of splits that gets 85%
-    /// of the best efficiency.
-    pub(crate) fn num_splits_heuristic(
-        batch_nheads_mblocks: usize,
-        num_sms: usize,
-        num_n_blocks: usize,
-        max_splits: usize,
-    ) -> usize {
-        // If we have enough to almost fill the SMs, then just use 1 split
-        if (batch_nheads_mblocks as f32) >= 0.8 * (num_sms as f32) {
-            return 1;
-        }
-
-        let max_splits = max_splits.min(num_sms).min(num_n_blocks);
-        let mut max_efficiency = 0.0;
-        let mut efficiency = Vec::with_capacity(max_splits);
-
-        let ceil_div = |a: usize, b: usize| -> usize { a.div_ceil(b) };
-
-        let is_split_eligible = |num_splits: usize| -> bool {
-            num_splits == 1
-                || ceil_div(num_n_blocks, num_splits) != ceil_div(num_n_blocks, num_splits - 1)
-        };
-
-        for num_splits in 1..=max_splits {
-            if !is_split_eligible(num_splits) {
-                efficiency.push(0.0);
-            } else {
-                let n_waves = (batch_nheads_mblocks * num_splits) as f32 / num_sms as f32;
-                let eff = n_waves / n_waves.ceil();
-                if eff > max_efficiency {
-                    max_efficiency = eff;
-                }
-                efficiency.push(eff);
-            }
-        }
-
-        for num_splits in 1..=max_splits {
-            if !is_split_eligible(num_splits) {
-                continue;
-            }
-            if efficiency[num_splits - 1] >= 0.85 * max_efficiency {
-                return num_splits;
-            }
-        }
-
-        1
-    }
-
+    /// The split count the kernel would choose for this call on `device`, computed here so the
+    /// split accumulators can be allocated before the launch.
     pub(crate) fn compute_num_splits(
         batch_size: usize,
         num_heads: usize,
@@ -2544,28 +2469,16 @@ pub(crate) mod utils {
         max_seqlen_q: usize,
         device: &candle_core::CudaDevice,
     ) -> Result<u32> {
-        let block_n = if head_size <= 64 {
-            256
-        } else if head_size <= 128 {
-            128
-        } else {
-            64
+        let shape = SplitShape {
+            batch_size,
+            num_heads,
+            head_dim: head_size,
+            max_seqlen_k,
+            max_seqlen_q,
         };
-        let num_n_blocks = max_seqlen_k.div_ceil(block_n);
-        // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
-        // In any case we don't expect seqlen_q to be larger than 64 for inference.
-        let num_m_blocks = max_seqlen_q.div_ceil(64);
-        let cuda_multiprocessor_count = get_multiprocessor_count(device)?;
-        let num_splits = num_splits_heuristic(
-            batch_size * num_heads * num_m_blocks,
-            cuda_multiprocessor_count * 2,
-            num_n_blocks,
-            128,
-        );
-        if num_splits > 128 {
-            candle_core::bail!("num_splits > 128 not supported")
-        }
-        Ok(num_splits as u32)
+        let sm_count = get_multiprocessor_count(device)?;
+        u32::try_from(num_splits(shape, sm_count))
+            .map_err(|_| candle_core::Error::Msg("the split count does not fit u32".into()))
     }
 
     /// Returns the number of streaming multiprocessors on `device`.

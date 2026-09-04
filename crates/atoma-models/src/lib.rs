@@ -1,0 +1,27 @@
+//! The Llama decode step over engine-owned device memory, addressed through
+//! [`atoma_runtime::tensor::Tensor`] views.
+//!
+//! Candle is not a dependency. Weights and the KV cache are loaded and allocated elsewhere; this
+//! crate receives their device addresses at Allocation and describes the step over them. What a
+//! model states is host-visible data: its dimensions, and per layer class the linear op order and
+//! the roles each op reads and writes, from which the arena's role table follows.
+//!
+//! | Module | Responsibility |
+//! |---|---|
+//! | [`dims`] | The dimensions a Llama decode step is shaped by, checked once |
+//! | [`layer`] | A layer class: the op order and the roles each op reads and writes; Llama's one class |
+//! | [`llama`] | The Llama decode step: its slot tables, resolved through the arena once |
+//! | [`attention`] | Paged decode attention: the per-bucket plan and the calls it assembles |
+//! | [`gemm`] | The step's multiplications, through a cuBLAS handle bound to the capture stream |
+//! | [`kernels`] | The step's own kernels, each call assembled from checked tensor views |
+//! | [`operand`] | Holding an operand to the dtype, rank, contiguity and shape it must have |
+//! | [`rope`] | The rotary embedding's cosine and sine tables, computed on the host once |
+
+pub mod attention;
+pub mod dims;
+pub mod gemm;
+pub mod kernels;
+pub mod layer;
+pub mod llama;
+pub mod operand;
+pub mod rope;
