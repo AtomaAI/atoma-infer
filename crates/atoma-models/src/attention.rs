@@ -17,7 +17,7 @@ use core::ffi::c_void;
 use atoma_kernels::paged_decode::{
     DecodeAttentionCall, DecodeShape, KvWriteCall, OperandStrides, Precision,
 };
-use atoma_kernels::splits::{num_splits, SplitShape};
+use atoma_kernels::splits::{kv_block_n, num_splits, SplitShape};
 use atoma_runtime::tensor::{Dtype, Tensor};
 use thiserror::Error;
 
@@ -46,6 +46,26 @@ pub enum AttentionError {
     BatchNotBucket { batch: usize, bucket: usize },
     #[error("the split heuristic chose {splits} partitions, more than the kernel's count holds")]
     SplitCount { splits: usize },
+    #[error(
+        "a block table of {max_blocks_per_seq} columns of {page_block} slots stops inside a key \
+         tile of {tile}; the kernel reads a block index for every row of a sequence's last tile"
+    )]
+    TableNotWholeTiles {
+        max_blocks_per_seq: usize,
+        page_block: usize,
+        tile: usize,
+    },
+}
+
+/// The block-table columns a sequence of `max_model_len` tokens needs over `page_block`-slot
+/// pages: enough to cover whole key tiles of the kernel. The kernel forms a block index for every
+/// row of a sequence's last tile, past the sequence's length, so a table that stopped at the last
+/// page a sequence fills would have that read run past the row.
+#[must_use]
+pub fn block_table_columns(max_model_len: usize, page_block: usize, head_dim: usize) -> usize {
+    max_model_len
+        .next_multiple_of(kv_block_n(head_dim))
+        .div_ceil(page_block)
 }
 
 /// What one bucket's attention needs before anything runs.
@@ -71,8 +91,9 @@ impl AttentionPlan {
     ///
     /// # Errors
     ///
-    /// Returns [`AttentionError::SplitCount`] when the heuristic's split count does not fit the
-    /// kernel's argument.
+    /// Returns [`AttentionError::TableNotWholeTiles`] when the block table stops inside a key
+    /// tile of the kernel, or [`AttentionError::SplitCount`] when the heuristic's split count
+    /// does not fit the kernel's argument.
     pub fn new(
         dims: &LlamaDims,
         bucket: usize,
@@ -80,6 +101,14 @@ impl AttentionPlan {
         max_blocks_per_seq: usize,
         sm_count: usize,
     ) -> Result<Self, AttentionError> {
+        let tile = kv_block_n(dims.head_dim);
+        if !(max_blocks_per_seq * page_block).is_multiple_of(tile) {
+            return Err(AttentionError::TableNotWholeTiles {
+                max_blocks_per_seq,
+                page_block,
+                tile,
+            });
+        }
         let shape = DecodeShape {
             batch_size: bucket,
             num_heads: dims.num_heads,
@@ -385,6 +414,31 @@ mod tests {
             Dtype::Bf16,
         );
         cache_halves(&cache, dims).unwrap()
+    }
+
+    #[test]
+    fn the_block_table_covers_whole_key_tiles_of_the_kernel() {
+        // Llama 3's 128-wide heads run a 128-key tile: eight pages of 16, whatever the length.
+        assert_eq!(block_table_columns(4096, 16, 128), 256);
+        assert_eq!(block_table_columns(4000, 16, 128), 256);
+        assert_eq!(block_table_columns(100, 16, 128), 8);
+        assert_eq!(block_table_columns(1, 16, 128), 8);
+        // A page larger than the tile holds whole tiles on its own.
+        assert_eq!(block_table_columns(100, 256, 128), 1);
+        // 64-wide heads run a 256-key tile.
+        assert_eq!(block_table_columns(1, 16, 64), 16);
+    }
+
+    #[test]
+    fn a_block_table_that_stops_inside_a_key_tile_is_refused() {
+        assert_eq!(
+            AttentionPlan::new(&llama_8b(2), BUCKET, PAGE_BLOCK, 3, H100_SMS).unwrap_err(),
+            AttentionError::TableNotWholeTiles {
+                max_blocks_per_seq: 3,
+                page_block: PAGE_BLOCK,
+                tile: 128
+            }
+        );
     }
 
     #[test]

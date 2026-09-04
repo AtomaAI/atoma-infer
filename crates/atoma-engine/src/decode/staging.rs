@@ -62,18 +62,11 @@ pub enum StagingError {
 pub struct StagingShape {
     /// Rows the arrays hold: the largest bucket.
     pub max_tokens: usize,
-    /// Columns of the block table: the blocks a sequence of the model's maximum length holds.
+    /// Columns of the block table: the blocks a sequence of the model's maximum length holds,
+    /// covering whole key tiles of the attention kernel.
     pub block_table_width: usize,
     /// Positions the rotary tables cover.
     pub max_position: usize,
-}
-
-impl StagingShape {
-    /// The block-table width `max_model_len` tokens need over `block_size`-token blocks.
-    #[must_use]
-    pub fn block_table_width(max_model_len: usize, block_size: usize) -> usize {
-        max_model_len.div_ceil(block_size)
-    }
 }
 
 /// The staged arrays, one per input the step reads; each holds at least
@@ -234,13 +227,6 @@ mod tests {
             panic!("served by the decode step");
         };
         (layout, batch)
-    }
-
-    #[test]
-    fn the_block_table_width_is_the_blocks_the_longest_sequence_holds() {
-        assert_eq!(StagingShape::block_table_width(32, 4), 8);
-        assert_eq!(StagingShape::block_table_width(33, 4), 9);
-        assert_eq!(StagingShape::block_table_width(1, 16), 1);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use atoma_core::dispatch::{DispatchConfig, GraphKey};
 use atoma_core::types::TokenCount;
-use atoma_models::attention::{AttentionError, AttentionPlan};
+use atoma_models::attention::{block_table_columns, AttentionError, AttentionPlan};
 use atoma_models::dims::{DimsError, Llama3RopeScaling, LlamaDims, RopeParams};
 use atoma_models::gemm::{GemmError, StepBlas, WORKSPACE_BYTES};
 use atoma_models::kernels::RotaryTensors;
@@ -161,9 +161,10 @@ impl DecodeStep {
         let stream = device.stream();
         let shape = StagingShape {
             max_tokens: buckets.largest(),
-            block_table_width: StagingShape::block_table_width(
+            block_table_width: block_table_columns(
                 plan.max_model_len.get(),
                 plan.block_size.get(),
+                dims.head_dim,
             ),
             max_position: dims.rope.max_position,
         };
