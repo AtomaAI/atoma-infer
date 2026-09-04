@@ -13,8 +13,8 @@ use validator::{Validate, ValidationError};
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// The Hugging Face Hub repository the model is fetched from.
-    #[validate(length(min = 1, message = "model.id names no repository"))]
-    pub id: String,
+    #[validate(custom(function = "names_a_repository"))]
+    pub id: ModelId,
     /// The revision of the repository to fetch.
     #[serde(default = "main_revision")]
     #[validate(length(min = 1, message = "model.revision is empty"))]
@@ -30,6 +30,45 @@ pub struct ModelConfig {
 
 fn main_revision() -> String {
     "main".to_owned()
+}
+
+/// A Hugging Face Hub repository the engine is served from.
+///
+/// Its own type because the strings it sits beside mean other things — the revision in this
+/// configuration, the completion's own id in a response — and a swap between two `String` fields
+/// is silent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ModelId(String);
+
+impl ModelId {
+    /// The repository `id` names.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The repository as the Hub and the API spell it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ModelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn names_a_repository(id: &ModelId) -> Result<(), ValidationError> {
+    if id.as_str().is_empty() {
+        return Err(validation_error(
+            "model_names_no_repository",
+            "model.id names no repository".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// The chat template a conversation is rendered through.
@@ -182,7 +221,8 @@ mod tests {
     use validator::Validate;
 
     use super::{
-        CoreId, DeviceOrdinal, Dtype, ExecutorConfig, ModelConfig, PromptTemplate, RankConfig,
+        CoreId, DeviceOrdinal, Dtype, ExecutorConfig, ModelConfig, ModelId, PromptTemplate,
+        RankConfig,
     };
 
     fn from_toml<T: DeserializeOwned>(source: &str) -> Result<T, Box<figment::Error>> {
@@ -212,7 +252,7 @@ mod tests {
         assert_eq!(
             config,
             ModelConfig {
-                id: "meta-llama/Llama-3.2-1B-Instruct".to_owned(),
+                id: ModelId::new("meta-llama/Llama-3.2-1B-Instruct"),
                 revision: "main".to_owned(),
                 cache_dir: None,
                 dtype: Dtype::Bf16,
@@ -247,7 +287,7 @@ mod tests {
     #[test]
     fn both_configurations_round_trip_through_serde() {
         let model = ModelConfig {
-            id: "org/model".to_owned(),
+            id: ModelId::new("org/model"),
             revision: "v1".to_owned(),
             cache_dir: Some(PathBuf::from("/cache")),
             dtype: Dtype::F32,
@@ -305,7 +345,7 @@ dtype = "int8""#
     #[test]
     fn a_model_with_no_repository_or_no_revision_is_refused() {
         let no_id = ModelConfig {
-            id: String::new(),
+            id: ModelId::new(""),
             revision: "main".to_owned(),
             cache_dir: None,
             dtype: Dtype::Bf16,
@@ -315,7 +355,7 @@ dtype = "int8""#
         assert!(error.contains("names no repository"), "{error}");
 
         let no_revision = ModelConfig {
-            id: "org/model".to_owned(),
+            id: ModelId::new("org/model"),
             revision: String::new(),
             cache_dir: None,
             dtype: Dtype::Bf16,

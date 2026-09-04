@@ -89,7 +89,7 @@ mod startup {
         let state = AppState {
             engine: handle,
             tokenizer: Arc::new(tokenizer),
-            served: ServedModel::new(&config.model.id, config.model.prompt_template),
+            served: ServedModel::new(config.model.id.clone(), config.model.prompt_template),
             max_model_len: config.engine.scheduler.max_model_len,
             keep_alive: config.server.keep_alive,
             heartbeat_stale_after: config.server.heartbeat_stale_after,

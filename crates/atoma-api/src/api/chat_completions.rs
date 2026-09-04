@@ -2,7 +2,7 @@
 
 use atoma_core::request::{SamplingParams, Usage as EngineUsage};
 use atoma_core::types::TokenCount;
-use atoma_engine::config::PromptTemplate;
+use atoma_engine::config::{ModelId, PromptTemplate};
 use std::collections::HashMap;
 use std::io;
 use thiserror::Error;
@@ -27,19 +27,19 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServedModel {
     /// The Hugging Face Hub repository the engine loaded.
-    pub id: String,
+    pub id: ModelId,
     /// The template the conversation is rendered through.
     pub template: PromptTemplate,
 }
 
 impl ServedModel {
     /// The served checkpoint under `template`.
+    ///
+    /// Takes the id by value rather than anything convertible into one, so that the revision
+    /// beside it in the configuration cannot be passed here by mistake.
     #[must_use]
-    pub fn new(id: impl Into<String>, template: PromptTemplate) -> Self {
-        Self {
-            id: id.into(),
-            template,
-        }
+    pub fn new(id: ModelId, template: PromptTemplate) -> Self {
+        Self { id, template }
     }
 
     /// Renders `messages` through this model's template.
@@ -797,7 +797,8 @@ pub struct RequestBody {
     /// A list of messages comprising the conversation so far.
     messages: Vec<Message>,
     /// ID of the model to use. It must name the checkpoint this server was started on.
-    model: String,
+    #[schema(value_type = String)]
+    model: ModelId,
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing
     /// frequency in the text so far, decreasing the model's likelihood to repeat the same line
     /// verbatim.
@@ -863,7 +864,7 @@ pub struct RequestBody {
 }
 
 impl RequestBody {
-    pub fn model(&self) -> &str {
+    pub fn model(&self) -> &ModelId {
         &self.model
     }
 }
@@ -909,7 +910,7 @@ pub enum Refused {
     #[error("max_tokens must be at least 1")]
     ZeroMaxTokens,
     #[error("model {requested} is not served; this server serves {served}")]
-    Model { requested: String, served: String },
+    Model { requested: ModelId, served: ModelId },
 }
 
 impl RequestBody {
@@ -1028,7 +1029,8 @@ pub struct ChatCompletionResponse {
     pub id: String,
     pub object: String,
     pub created: u64,
-    pub model: String,
+    #[schema(value_type = String)]
+    pub model: ModelId,
     pub system_fingerprint: String,
     pub choices: Vec<Choice>,
     pub usage: Usage,
@@ -1088,7 +1090,7 @@ pub const SYSTEM_FINGERPRINT: &str = concat!("atoma-infer/", env!("CARGO_PKG_VER
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionIdentity {
     pub id: String,
-    pub model: String,
+    pub model: ModelId,
     /// Seconds since the Unix epoch when the request arrived.
     pub created: u64,
 }
@@ -1135,7 +1137,8 @@ pub struct ChatCompletionChunk {
     /// The Unix timestamp (in seconds) of when the chat completion was created.
     pub created: u64,
     /// The model used for this chat completion.
-    pub model: String,
+    #[schema(value_type = String)]
+    pub model: ModelId,
     /// A unique identifier for the model's configuration and version.
     pub system_fingerprint: String,
     /// An array of chat completion choices. Each choice represents a possible completion for the
@@ -1234,14 +1237,14 @@ pub mod tests {
     use super::{
         json_dumps, messages, ChatCompletionChunk, ChatCompletionResponse, Choice,
         CompletionIdentity, Delta, FinishReason, JsonDumpsFormatter, Message, MessageContent,
-        MessageContentPart, MessageContentPartImageUrl, PromptTemplate, Refused, RequestBody,
-        ServedModel, StreamChoice, ToolCall, ToolCallFunction, Usage,
+        MessageContentPart, MessageContentPartImageUrl, ModelId, PromptTemplate, Refused,
+        RequestBody, ServedModel, StreamChoice, ToolCall, ToolCallFunction, Usage,
     };
 
     fn identity(created: u64) -> CompletionIdentity {
         CompletionIdentity {
             id: "chatcmpl-1".into(),
-            model: "llama".into(),
+            model: ModelId::new("llama"),
             created,
         }
     }
@@ -1285,7 +1288,7 @@ pub mod tests {
         let request_body: RequestBody =
             serde_json::from_str(json_request_body).expect("Harness body must deserialize");
         let served = ServedModel::new(
-            "meta-llama/Meta-Llama-3-8B-Instruct",
+            ModelId::new("meta-llama/Meta-Llama-3-8B-Instruct"),
             PromptTemplate::Llama3,
         );
         let request = request_body.to_engine_request(&served, 7).unwrap();
@@ -1322,7 +1325,7 @@ pub mod tests {
 
     /// The server those bodies are sent to: it serves `SERVED_ID` under the Llama 3 template.
     fn served() -> ServedModel {
-        ServedModel::new(SERVED_ID, PromptTemplate::Llama3)
+        ServedModel::new(ModelId::new(SERVED_ID), PromptTemplate::Llama3)
     }
 
     fn body(fields: serde_json::Value) -> RequestBody {
@@ -1423,8 +1426,8 @@ pub mod tests {
         assert_eq!(
             refused,
             Refused::Model {
-                requested: "meta-llama/Llama-3.1-70B".to_owned(),
-                served: SERVED_ID.to_owned(),
+                requested: ModelId::new("meta-llama/Llama-3.1-70B"),
+                served: ModelId::new(SERVED_ID),
             }
         );
         let message = refused.to_string();
@@ -1439,7 +1442,10 @@ pub mod tests {
     fn a_checkpoint_outside_any_list_is_served_when_it_is_what_the_engine_loaded() {
         let mirror = "unsloth/Llama-3.2-1B-Instruct";
         let request = body(json!({ "model": mirror }))
-            .to_engine_request(&ServedModel::new(mirror, PromptTemplate::Llama3), 1)
+            .to_engine_request(
+                &ServedModel::new(ModelId::new(mirror), PromptTemplate::Llama3),
+                1,
+            )
             .expect("the checkpoint the engine loaded is servable");
         assert!(request.prompt.contains("<|begin_of_text|>"), "{request:?}");
     }
@@ -1453,7 +1459,10 @@ pub mod tests {
             .unwrap()
             .prompt;
         let hermes3 = body(json!({}))
-            .to_engine_request(&ServedModel::new(SERVED_ID, PromptTemplate::Hermes3), 1)
+            .to_engine_request(
+                &ServedModel::new(ModelId::new(SERVED_ID), PromptTemplate::Hermes3),
+                1,
+            )
             .unwrap()
             .prompt;
         assert_ne!(llama3, hermes3);
@@ -2790,7 +2799,7 @@ pub mod tests {
         assert_eq!(response.id, "chatcmpl-123");
         assert_eq!(response.object, "chat.completion");
         assert_eq!(response.created, 1677652288);
-        assert_eq!(response.model, "llama");
+        assert_eq!(response.model.as_str(), "llama");
         assert_eq!(response.system_fingerprint, "fp_44709d6fcb");
         assert_eq!(response.choices.len(), 1);
         assert_eq!(response.choices[0].index, 0);
@@ -3003,7 +3012,7 @@ pub mod tests {
         assert_eq!(chunk.id, "chatcmpl-123");
         assert_eq!(chunk.object, "chat.completion");
         assert_eq!(chunk.created, 1677652288);
-        assert_eq!(chunk.model, "llama");
+        assert_eq!(chunk.model.as_str(), "llama");
         assert_eq!(chunk.system_fingerprint, "fp_44709d6fcb");
         assert_eq!(chunk.choices.len(), 1);
         assert_eq!(chunk.choices[0].index, 0);

@@ -42,6 +42,7 @@ use crate::api::chat_completions::{
 use crate::completion::{Completion, ErrorKind, Failed, Progress};
 use crate::detokenize::Detokenizer;
 use crate::stream::Streamer;
+use atoma_engine::config::ModelId;
 
 /// The URL path to POST JSON for model chat completions.
 pub const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
@@ -429,7 +430,7 @@ pub async fn completion_handler(
 ) -> Result<Response, ApiError> {
     let request_id = next_request_id().to_string();
     Span::current().record("request_id", request_id.as_str());
-    let model = request.model().to_string();
+    let model = request.model().clone();
     let engine_request = request
         .to_engine_request(&state.served, rand::random())
         .map_err(|refused| ApiError::refused(&refused, &request_id))?;
@@ -451,7 +452,7 @@ pub async fn completion_handler(
 async fn submit(
     state: &AppState,
     request_id: &str,
-    model: String,
+    model: ModelId,
     request: EngineRequest,
 ) -> Result<(EgressReceiver, Completion), ApiError> {
     let EngineRequest {
@@ -779,7 +780,7 @@ mod tests {
 
     /// The test server's model: `SERVED_ID` under the template its checkpoint is written for.
     fn served_model() -> ServedModel {
-        ServedModel::new(SERVED_ID, PromptTemplate::Llama3)
+        ServedModel::new(ModelId::new(SERVED_ID), PromptTemplate::Llama3)
     }
 
     fn completion_body(fields: Value) -> Value {
@@ -810,7 +811,7 @@ mod tests {
         let tokenizer = tokenizer();
         let bos = tokenizer.token_to_id(BOS).unwrap();
         for template in [PromptTemplate::Llama3, PromptTemplate::Hermes3] {
-            let served = ServedModel::new(SERVED_ID, template);
+            let served = ServedModel::new(ModelId::new(SERVED_ID), template);
             let prompt = rendered_prompt(&served, completion_body(json!({})));
             let ids = tokenize_prompt(&tokenizer, prompt).unwrap();
             assert_eq!(ids.first(), Some(&bos), "{ids:?}");

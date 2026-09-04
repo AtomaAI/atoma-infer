@@ -13,7 +13,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::info;
 
-use crate::config::ModelConfig;
+use crate::config::{ModelConfig, ModelId};
 
 #[cfg(feature = "cuda")]
 use models::llama::{Config, LlamaConfig};
@@ -39,7 +39,7 @@ pub struct ModelFiles {
 pub enum ModelError {
     #[error("{id} at revision {revision} could not be fetched from the Hub: {source}")]
     Hub {
-        id: String,
+        id: ModelId,
         revision: String,
         #[source]
         source: ApiError,
@@ -48,7 +48,7 @@ pub enum ModelError {
         "{id} at revision {revision} holds neither {WEIGHTS_FILE} nor {WEIGHTS_INDEX_FILE}; \
          only safetensors weights are loaded"
     )]
-    NoWeights { id: String, revision: String },
+    NoWeights { id: ModelId, revision: String },
     #[error("{} could not be read: {source}", path.display())]
     Unreadable {
         path: PathBuf,
@@ -91,7 +91,7 @@ pub fn fetch(model: &ModelConfig) -> Result<ModelFiles, ModelError> {
     }
     let api = builder.build().map_err(&hub)?;
     let repo = api.repo(Repo::with_revision(
-        model.id.clone(),
+        model.id.as_str().to_owned(),
         RepoType::Model,
         model.revision.clone(),
     ));
