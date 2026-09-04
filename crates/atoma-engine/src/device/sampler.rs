@@ -32,8 +32,8 @@ use tracing::{info, warn};
 use crate::batch::BatchLayout;
 use crate::decode::inputs::Pinned;
 use crate::readback::{Readback, ReadbackCopy, ReadbackError};
+use crate::sampling::inputs::{SamplerInputs, SamplerInputsError};
 use crate::sampling::owners::SlotOwners;
-use crate::sampling::plan::{plan_step, PlanError, StepPlan};
 use crate::sampling::record::{SlotRecord, RECORD_BYTES};
 
 /// Why the sampler could not be built or run.
@@ -52,7 +52,7 @@ pub enum SamplerError {
     #[error("no step is staged; stage the layout before running its sampling")]
     NoStepStaged,
     #[error(transparent)]
-    Plan(#[from] PlanError),
+    Inputs(#[from] SamplerInputsError),
     #[error(transparent)]
     Readback(#[from] ReadbackError),
     #[error(transparent)]
@@ -63,14 +63,17 @@ pub enum SamplerError {
 
 /// A device array: the memory, owned here so the address stays allocated for as long as it is
 /// named, and the address itself.
-struct Device {
+struct DeviceArray {
     _memory: CudaSlice<u8>,
     address: u64,
 }
 
-impl Device {
-    fn new(stream: &Arc<CudaStream>, bytes: usize) -> Result<Self, SamplerError> {
-        let memory = zeroed(stream, bytes)?;
+impl DeviceArray {
+    /// `bytes` zeroed bytes on `stream`'s device.
+    fn zeroed(stream: &Arc<CudaStream>, bytes: usize) -> Result<Self, SamplerError> {
+        let memory = stream
+            .alloc_zeros::<u8>(bytes)
+            .map_err(RuntimeError::from)?;
         let address = address(&memory, stream);
         Ok(Self {
             _memory: memory,
@@ -79,17 +82,17 @@ impl Device {
     }
 }
 
-/// A device array with the pinned host staging a step writes it from.
-struct Mirror<T> {
+/// A device array of `len` values with the pinned host staging a step writes it from.
+struct StagedArray<T> {
     host: Pinned<T>,
-    device: Device,
+    device: DeviceArray,
 }
 
-impl<T> Mirror<T> {
+impl<T> StagedArray<T> {
     fn new(stream: &Arc<CudaStream>, len: usize) -> Result<Self, SamplerError> {
         Ok(Self {
             host: Pinned::new(len)?,
-            device: Device::new(stream, len * size_of::<T>())?,
+            device: DeviceArray::zeroed(stream, len * size_of::<T>())?,
         })
     }
 
@@ -100,7 +103,7 @@ impl<T> Mirror<T> {
 
 /// The step staged and not yet waited on.
 #[derive(Debug, Clone, Copy)]
-struct Staged {
+struct StagedStep {
     /// Selected rows sampling this step.
     rows: usize,
     /// Token rows the gather covers: the batch's tokens for a uniform decode, none otherwise.
@@ -113,22 +116,22 @@ pub struct DeviceSampler {
     vocab: usize,
     /// One record per request slot, as the kernel reads and advances it; the host copy holds
     /// what was last written for the slot.
-    records: Mirror<SlotRecord>,
+    records: StagedArray<SlotRecord>,
     /// The slots whose record changed since the last upload.
     pending_records: Vec<usize>,
     /// u32 per slot: the token last sampled there.
-    sampled: Device,
+    sampled: DeviceArray,
     /// i32 per row: the slot each selected row samples under, as the kernel indexes it.
-    row_slots: Mirror<i32>,
+    row_slots: StagedArray<i32>,
     /// i32 per token row: the slot the row takes its token from, or negative to keep the host's.
-    gather_slots: Mirror<i32>,
+    gather_slots: StagedArray<i32>,
     /// u32 per row: the token sampled for each selected row this step.
-    out: Device,
+    out: DeviceArray,
     readback: Readback<u32>,
     /// Recorded behind every upload; waited on before the staging is freed.
     uploaded: CudaEvent,
     owners: SlotOwners,
-    staged: Option<Staged>,
+    staged: Option<StagedStep>,
 }
 
 impl DeviceSampler {
@@ -157,12 +160,12 @@ impl DeviceSampler {
         let sampler = Self {
             max_rows,
             vocab,
-            records: Mirror::new(stream, slots)?,
+            records: StagedArray::new(stream, slots)?,
             pending_records: Vec::new(),
-            sampled: Device::new(stream, slots * size_of::<u32>())?,
-            row_slots: Mirror::new(stream, max_rows)?,
-            gather_slots: Mirror::new(stream, max_rows)?,
-            out: Device::new(stream, max_rows * size_of::<u32>())?,
+            sampled: DeviceArray::zeroed(stream, slots * size_of::<u32>())?,
+            row_slots: StagedArray::new(stream, max_rows)?,
+            gather_slots: StagedArray::new(stream, max_rows)?,
+            out: DeviceArray::zeroed(stream, max_rows * size_of::<u32>())?,
             readback: Readback::new(allocation, context, max_rows, 1)?,
             uploaded,
             owners: SlotOwners::new(slots),
@@ -181,8 +184,8 @@ impl DeviceSampler {
     ///
     /// # Errors
     ///
-    /// Returns [`SamplerError`] when the layout has more rows than the sampler holds, or the
-    /// step cannot be planned.
+    /// Returns [`SamplerError`] when the layout has more rows than the sampler holds, or its
+    /// inputs cannot be decided.
     pub fn stage(
         &mut self,
         layout: &BatchLayout,
@@ -196,11 +199,11 @@ impl DeviceSampler {
                 max_rows: self.max_rows,
             });
         }
-        let StepPlan {
+        let SamplerInputs {
             records,
             row_slots,
             gather,
-        } = plan_step(layout, &mut self.owners, gather_rows)?;
+        } = SamplerInputs::for_step(layout, &mut self.owners, gather_rows)?;
         if gather.len() > self.max_rows {
             return Err(SamplerError::TooManyGatherRows {
                 rows: gather.len(),
@@ -222,7 +225,7 @@ impl DeviceSampler {
         for (row, slot) in gather.iter().enumerate() {
             gather_host[row] = slot.map_or(-1, slot_i32);
         }
-        self.staged = Some(Staged {
+        self.staged = Some(StagedStep {
             rows,
             gather_rows: gather.len(),
         });
@@ -297,7 +300,7 @@ impl DeviceSampler {
         Ok(self.readback.wait()?)
     }
 
-    /// Runs the staged step's sampling on `stream` — the upload, the sample and the copy back —
+    /// Runs the staged step's sampling on `stream` — the upload, the sample and the readback —
     /// over the f32 logits `logits` holds, and waits for its tokens: the candle path, which has
     /// no descriptor seam.
     ///
@@ -338,7 +341,7 @@ impl Drop for DeviceSampler {
 /// slots.
 pub struct Upload<'a> {
     sampler: &'a DeviceSampler,
-    staged: Staged,
+    staged: StagedStep,
 }
 
 impl Descriptor for Upload<'_> {
@@ -394,7 +397,7 @@ impl Descriptor for Gather {
     }
 }
 
-/// The sample of every selected row and the copy of its tokens back to the host.
+/// The sample of every selected row and the readback of its tokens.
 pub struct Sample<'a> {
     call: SampleCall,
     copy: ReadbackCopy<'a, u32>,
@@ -425,13 +428,6 @@ fn slot_index(slot: RequestSlot) -> usize {
 /// A staged slot as the kernel indexes it; the mirror refused any past the count that fits.
 fn slot_i32(slot: RequestSlot) -> i32 {
     i32::try_from(slot.get()).expect("the mirror holds only slots that fit the kernel's index")
-}
-
-/// `bytes` zeroed bytes on `stream`'s device.
-fn zeroed(stream: &Arc<CudaStream>, bytes: usize) -> Result<CudaSlice<u8>, SamplerError> {
-    Ok(stream
-        .alloc_zeros::<u8>(bytes)
-        .map_err(RuntimeError::from)?)
 }
 
 /// The device address of a buffer; event tracking is disabled at context creation, so the read

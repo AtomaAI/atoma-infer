@@ -18,8 +18,9 @@ use std::sync::Arc;
 use atoma_core::dispatch::{DispatchDecision, EagerReason};
 use atoma_core::request::SamplingParams;
 use atoma_core::step::{CommandEntry, StepCommand};
-use atoma_core::types::RequestCount;
-use atoma_core::types::{BlockId, RequestId, RequestSlot, SequenceIndex, StepId, TokenCount};
+use atoma_core::types::{
+    BlockId, RequestCount, RequestId, RequestSlot, SequenceIndex, StepId, TokenCount,
+};
 use atoma_engine::batch::BatchLayout;
 use atoma_engine::device::sampler::DeviceSampler;
 use atoma_engine::sampling::record::SlotRecord;

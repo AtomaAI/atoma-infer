@@ -13,7 +13,7 @@ use atoma_core::request::SamplingParams;
 /// divide by. A `top_k` of zero and a `top_p` at or above one are the unset values, as in the
 /// parameters. The draw counter starts at zero with the record and is advanced by the kernel
 /// alone, once per draw, so where the request's draws have got to lives on the device with the
-/// rest of its sampling state.
+/// rest of its record.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SlotRecord {

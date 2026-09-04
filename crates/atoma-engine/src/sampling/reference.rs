@@ -266,16 +266,16 @@ mod tests {
     fn weights_are_the_softmax_numerators_in_fixed_point_with_the_largest_at_one() {
         let logits = [0.0, -1.0, f32::NAN, 5.0];
         let admitted = [true, true, true, false];
-        let weights = weights(&logits, &admitted, 0.0, 1.0);
-        assert_eq!(weights[0], UNIT_WEIGHT);
+        let warm = weights(&logits, &admitted, 0.0, 1.0);
+        assert_eq!(warm[0], UNIT_WEIGHT);
         assert_eq!(
-            weights[1],
+            warm[1],
             (f64::from((-1.0f32).exp()) * UNIT_WEIGHT as f64) as u64
         );
-        assert_eq!(weights[2], 0, "a nan weighs nothing");
-        assert_eq!(weights[3], 0, "not admitted");
-        let cold = super::weights(&logits, &admitted, 0.0, 0.1);
-        assert!(cold[1] < weights[1], "a lower temperature sharpens");
+        assert_eq!(warm[2], 0, "a nan weighs nothing");
+        assert_eq!(warm[3], 0, "not admitted");
+        let cold = weights(&logits, &admitted, 0.0, 0.1);
+        assert!(cold[1] < warm[1], "a lower temperature sharpens");
     }
 
     #[test]
