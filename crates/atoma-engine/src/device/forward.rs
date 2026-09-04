@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use atoma_runtime::session::Replay;
-use candle_core::{Storage, Tensor};
-use cudarc::driver::CudaStream;
+use candle_core::{Layout, Storage, Tensor};
+use cudarc::driver::{CudaStream, CudaView};
 use models::FlashAttentionMetadata;
 use thiserror::Error;
 
@@ -292,13 +292,7 @@ fn sample_logits<'a>(
     logits: &Tensor,
 ) -> Result<&'a [u32], CudaForwardError> {
     let (storage, layout) = logits.storage_and_layout();
-    let Storage::Cuda(storage) = &*storage else {
-        return Err(CudaForwardError::LogitsNotOnDevice);
-    };
-    let start = layout.start_offset();
-    let device_logits = storage
-        .as_cuda_slice::<f32>()?
-        .slice(start..start + layout.shape().elem_count());
+    let device_logits = device_logits(&storage, layout)?;
     Ok(sampler.run_on(stream, &device_logits)?)
 }
 
@@ -312,15 +306,24 @@ fn read_back<'a>(
     vocab: usize,
 ) -> Result<Logits<'a>, CudaForwardError> {
     let (storage, layout) = logits.storage_and_layout();
-    let Storage::Cuda(storage) = &*storage else {
-        return Err(CudaForwardError::LogitsNotOnDevice);
-    };
-    let start = layout.start_offset();
-    let device_logits = storage
-        .as_cuda_slice::<f32>()?
-        .slice(start..start + layout.shape().elem_count());
+    let device_logits = device_logits(&storage, layout)?;
     Ok(Logits::new(
         readback.read(stream, &device_logits, rows)?,
         vocab,
     ))
+}
+
+/// The f32 logits a tensor's `storage` holds on the device, as the view `layout` places over
+/// it; the caller holds the guard `storage` came out of for as long as the view lives.
+fn device_logits<'a>(
+    storage: &'a Storage,
+    layout: &Layout,
+) -> Result<CudaView<'a, f32>, CudaForwardError> {
+    let Storage::Cuda(storage) = storage else {
+        return Err(CudaForwardError::LogitsNotOnDevice);
+    };
+    let start = layout.start_offset();
+    Ok(storage
+        .as_cuda_slice::<f32>()?
+        .slice(start..start + layout.shape().elem_count()))
 }
