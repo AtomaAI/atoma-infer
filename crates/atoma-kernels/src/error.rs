@@ -2,6 +2,8 @@ use candle_core::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use thiserror::Error as ThisError;
 
+use crate::splits::MAX_SPLITS;
+
 /// An attention feature the vendored flash-attention kernels are not compiled for.
 ///
 /// `kernels/static_switch.h` compiles the corresponding template parameter out, so the kernels
@@ -64,6 +66,18 @@ pub enum KernelError {
         /// The FFI parameter the value was meant for.
         argument: &'static str,
         value: usize,
+    },
+
+    /// The split count is past the partitions the combine kernel is dispatched for: the split
+    /// kernel would run, and nothing would combine its partitions into the output.
+    #[error(
+        "a split count of {num_splits} is past the {} partitions the combine kernel is \
+         dispatched for; the output would never be written",
+        MAX_SPLITS
+    )]
+    SplitCount {
+        /// The count the call carried.
+        num_splits: u32,
     },
 
     /// The kernel was asked for from a build that carries none.

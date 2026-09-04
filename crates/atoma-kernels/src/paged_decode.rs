@@ -14,8 +14,8 @@
 
 use core::ffi::c_void;
 
-#[cfg(not(feature = "cuda"))]
 use crate::error::KernelError;
+use crate::splits::MAX_SPLITS;
 
 /// The element type the attention operands and the cache hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,13 +172,24 @@ impl KvWriteCall {
     }
 }
 
+/// The split count as the launch takes it, held to [`MAX_SPLITS`]. The vendored template
+/// dispatches no combine kernel past that, so a larger count would run the split kernel and leave
+/// the output unwritten; it is refused here, before any address reaches the device.
+fn split_count(call: &DecodeAttentionCall) -> Result<u32, KernelError> {
+    let num_splits = call.num_splits;
+    if num_splits as usize > MAX_SPLITS {
+        return Err(KernelError::SplitCount { num_splits });
+    }
+    Ok(num_splits)
+}
+
 #[cfg(feature = "cuda")]
 mod compiled {
     use core::ffi::{c_int, c_void};
     use std::f32::consts::LOG2_E;
     use std::ptr;
 
-    use super::{DecodeAttentionCall, KvWriteCall, SEQLEN_Q_ROUNDED};
+    use super::{split_count, DecodeAttentionCall, KvWriteCall, SEQLEN_Q_ROUNDED};
     use crate::error::{arg32, arg_i64, arg_int, KernelError};
     use crate::ffi;
 
@@ -186,8 +197,8 @@ mod compiled {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError`] when an argument does not fit the kernel's parameter or the
-    /// launch fails.
+    /// Returns [`KernelError`] when the split count is past what the combine kernel is
+    /// dispatched for, an argument does not fit the kernel's parameter, or the launch fails.
     ///
     /// # Safety
     /// Every address in `call` must be live on the stream's device and match its documented
@@ -195,7 +206,8 @@ mod compiled {
     pub unsafe fn decode_attention(call: &DecodeAttentionCall) -> Result<(), KernelError> {
         let shape = call.shape;
         let seqlen_k = shape.seqlen_k();
-        let split = call.num_splits > 1;
+        let num_splits = split_count(call)?;
+        let split = num_splits > 1;
         let accumulator = |address: u64| -> *const c_void {
             if split {
                 address as *const c_void
@@ -232,7 +244,7 @@ mod compiled {
                 arg32("k_head_stride", call.cache_strides.head)?,
                 arg32("v_head_stride", call.cache_strides.head)?,
                 arg32("o_head_stride", call.out_strides.head)?,
-                call.num_splits,
+                num_splits,
                 arg32("b", shape.batch_size)?,
                 arg32("h", shape.num_heads)?,
                 arg32("h_k", shape.num_kv_heads)?,
@@ -308,16 +320,19 @@ mod compiled {
 #[cfg(feature = "cuda")]
 pub use compiled::{decode_attention, write_kv};
 
-/// Named refusal: this build carries no kernels.
+/// Named refusal: this build carries no kernels. The split count is still held to the cap, so a
+/// call no build could combine is refused the same way on every build.
 ///
 /// # Errors
 ///
-/// Always returns [`KernelError::NotCompiled`].
+/// Returns [`KernelError::SplitCount`] for a count past [`MAX_SPLITS`], and
+/// [`KernelError::NotCompiled`] otherwise.
 ///
 /// # Safety
 /// Dereferences nothing; the signature matches the real launch.
 #[cfg(not(feature = "cuda"))]
-pub unsafe fn decode_attention(_call: &DecodeAttentionCall) -> Result<(), KernelError> {
+pub unsafe fn decode_attention(call: &DecodeAttentionCall) -> Result<(), KernelError> {
+    split_count(call)?;
     Err(KernelError::NotCompiled { kernel: "run_mha" })
 }
 
@@ -412,11 +427,11 @@ mod tests {
         assert_eq!(Precision::Bf16.is_bf16(), 1);
     }
 
-    #[cfg(not(feature = "cuda"))]
-    #[test]
-    fn a_build_without_kernels_refuses_by_name() {
+    /// A call of `llama_8b(1)` at `num_splits`, every address null: the checks under test read
+    /// the count alone.
+    fn decode_call(num_splits: u32) -> DecodeAttentionCall {
         let shape = llama_8b(1);
-        let call = DecodeAttentionCall {
+        DecodeAttentionCall {
             q: 0,
             q_strides: OperandStrides {
                 batch: 6144,
@@ -442,13 +457,44 @@ mod tests {
             seqlens_k: 0,
             block_table: 0,
             shape,
-            num_splits: 1,
+            num_splits,
             softmax_scale: 1.0,
             precision: Precision::Bf16,
             stream: core::ptr::null_mut(),
-        };
+        }
+    }
+
+    #[test]
+    fn the_split_count_is_held_to_the_combine_kernels_cap() {
+        let cap = u32::try_from(MAX_SPLITS).unwrap();
+        assert_eq!(split_count(&decode_call(1)), Ok(1));
+        assert_eq!(split_count(&decode_call(cap)), Ok(cap));
+
+        let refused = split_count(&decode_call(cap + 1)).unwrap_err();
+
+        assert_eq!(
+            refused,
+            KernelError::SplitCount {
+                num_splits: cap + 1
+            }
+        );
+        assert!(refused.to_string().contains("129"), "{refused}");
+        assert!(refused.to_string().contains("128"), "{refused}");
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn a_count_past_the_cap_is_refused_on_a_build_without_kernels_too() {
         // SAFETY: the stub dereferences nothing.
-        let refused = unsafe { decode_attention(&call) }.unwrap_err();
+        let refused = unsafe { decode_attention(&decode_call(129)) }.unwrap_err();
+        assert_eq!(refused, KernelError::SplitCount { num_splits: 129 });
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn a_build_without_kernels_refuses_by_name() {
+        // SAFETY: the stub dereferences nothing.
+        let refused = unsafe { decode_attention(&decode_call(1)) }.unwrap_err();
         assert_eq!(refused, KernelError::NotCompiled { kernel: "run_mha" });
         assert!(refused.to_string().contains("--features cuda"), "{refused}");
     }

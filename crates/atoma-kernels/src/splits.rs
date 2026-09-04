@@ -22,8 +22,10 @@ pub struct SplitShape {
 /// Rows of the query tile the split kernels cover per block.
 const BLOCK_M: usize = 64;
 
-/// The hard cap on split partitions the kernel supports.
-const MAX_SPLITS: usize = 128;
+/// The most split partitions one call may run: the largest count the vendored launch template
+/// dispatches a combine kernel for. Past it the split kernel still runs, nothing combines its
+/// partitions, and the output is never written.
+pub const MAX_SPLITS: usize = 128;
 
 /// Key positions one kernel block covers, by head dimension: wider heads take smaller blocks.
 pub fn kv_block_n(head_dim: usize) -> usize {
