@@ -190,6 +190,7 @@ mod compiled {
     use std::ptr;
 
     use super::{split_count, DecodeAttentionCall, KvWriteCall, SEQLEN_Q_ROUNDED};
+    use crate::attention_window;
     use crate::error::{arg32, arg_i64, arg_int, KernelError};
     use crate::ffi;
 
@@ -215,10 +216,7 @@ mod compiled {
                 ptr::null()
             }
         };
-        // Causality is moot for one query row, and the candle wrapper resolves the causal window
-        // it is asked for to exactly these values for this case; passing the same keeps the two
-        // paths on the same kernel instantiation.
-        let window_size_left = arg_int("window_size_left", seqlen_k)?;
+        let window = attention_window::decode(arg_int("seqlen_k", seqlen_k)?);
         // SAFETY: the caller's contract; the FFI records its status for the check below.
         unsafe {
             ffi::run_mha(
@@ -262,9 +260,9 @@ mod compiled {
                 arg32("seqlen_q_rounded", SEQLEN_Q_ROUNDED)?,
                 arg32("seqlen_k_rounded", shape.seqlen_k_rounded())?,
                 call.precision.is_bf16(),
-                /* is_causal */ 0,
-                window_size_left,
-                /* window_size_right */ 0,
+                i32::from(window.is_causal),
+                window.window_size_left,
+                window.window_size_right,
                 /* softcap */ 0.0,
                 /* unpadded_lse */ false,
                 /* force_split_kernel */ true,

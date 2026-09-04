@@ -1878,38 +1878,13 @@ impl FlashAttentionKvCache {
             )
         }
 
-        let mut window_size_left = self.window_size_left.map(|i| i as i32);
-        let mut window_size_right = self.window_size_right.map(|i| i as i32);
-
-        if let Some(w) = window_size_left {
-            if w >= seqlen_k as i32 {
-                window_size_left = Some(-1);
-            }
-        }
-        if let Some(w) = window_size_right {
-            if w >= seqlen_k as i32 {
-                window_size_right = Some(-1);
-            }
-        }
-
-        let mut window_size_left = window_size_left.unwrap_or(-1);
-        let mut window_size_right = window_size_right.unwrap_or(-1);
-
-        let mut is_causal = attention_window::is_causal(window_size_left, window_size_right);
-        // causal=true is the same as causal=false in this case
-        if seqlen_q == 1 && self.alibi_slopes.is_none() {
-            is_causal = false;
-        }
-        if is_causal {
-            window_size_right = 0;
-        }
-
-        if window_size_left < 0 && window_size_right >= 0 {
-            window_size_left = seqlen_k as i32;
-        }
-        if window_size_right < 0 && window_size_left >= 0 {
-            window_size_right = seqlen_k as i32;
-        }
+        let window = attention_window::resolve(
+            self.window_size_left,
+            self.window_size_right,
+            seqlen_k as i32,
+            seqlen_q,
+            self.alibi_slopes.is_some(),
+        );
 
         let out_shape = q_l.shape().clone();
         let out_l = Layout::contiguous(&out_shape);
@@ -2138,9 +2113,9 @@ impl FlashAttentionKvCache {
                 /* seqlen_q_rounded */ seqlen_q_rounded as u32,
                 /* seqlen_k_rounded */ seqlen_k_rounded as u32,
                 /* is_bf16 */ is_bf16,
-                /* is_causal */ is_causal as i32,
-                /* window_size_left */ window_size_left,
-                /* window_size_right */ window_size_right,
+                /* is_causal */ i32::from(window.is_causal),
+                /* window_size_left */ window.window_size_left,
+                /* window_size_right */ window.window_size_right,
                 /* softcap */ 0.0,
                 /* unpadded_lse */ false,
                 /* force_split_kernel */ self.block_table.is_some(),
