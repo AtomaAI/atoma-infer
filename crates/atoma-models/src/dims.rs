@@ -4,6 +4,8 @@
 //! the step derives — the fused qkv row, the per-head scale, the rotary pairs — follows from these
 //! numbers, so a set that does not hang together is refused before any buffer is sized from it.
 
+use std::fmt;
+
 use thiserror::Error;
 
 /// Llama 3's rotary frequency scaling: frequencies below the low-frequency wavelength are
@@ -44,8 +46,30 @@ pub enum DimsError {
     },
     #[error("head dimension {head_dim} has no rotary pairs; it must be even and nonzero")]
     HeadDimNotPaired { head_dim: usize },
-    #[error("{what} is zero")]
-    Zero { what: &'static str },
+    #[error("{dimension} is zero")]
+    Zero { dimension: LlamaDimension },
+}
+
+/// A dimension the step needs nonzero, as a refusal names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlamaDimension {
+    Layers,
+    Ffn,
+    Vocab,
+    NumKvHeads,
+    MaxPosition,
+}
+
+impl fmt::Display for LlamaDimension {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            LlamaDimension::Layers => "the layer count",
+            LlamaDimension::Ffn => "the feed-forward width",
+            LlamaDimension::Vocab => "the vocabulary",
+            LlamaDimension::NumKvHeads => "the key-value head count",
+            LlamaDimension::MaxPosition => "the rotary position range",
+        })
+    }
 }
 
 /// The dimensions of one Llama, as the decode step reads them.
@@ -72,15 +96,15 @@ impl LlamaDims {
     /// the hidden size is not the query heads, or the heads do not group over the key-value
     /// heads.
     pub fn check(&self) -> Result<(), DimsError> {
-        for (what, value) in [
-            ("the layer count", self.layers),
-            ("the feed-forward width", self.ffn),
-            ("the vocabulary", self.vocab),
-            ("the key-value head count", self.num_kv_heads),
-            ("the rotary position range", self.rope.max_position),
+        for (dimension, value) in [
+            (LlamaDimension::Layers, self.layers),
+            (LlamaDimension::Ffn, self.ffn),
+            (LlamaDimension::Vocab, self.vocab),
+            (LlamaDimension::NumKvHeads, self.num_kv_heads),
+            (LlamaDimension::MaxPosition, self.rope.max_position),
         ] {
             if value == 0 {
-                return Err(DimsError::Zero { what });
+                return Err(DimsError::Zero { dimension });
             }
         }
         if self.head_dim == 0 || !self.head_dim.is_multiple_of(2) {
@@ -233,7 +257,7 @@ mod tests {
         assert_eq!(
             refused,
             DimsError::Zero {
-                what: "the layer count"
+                dimension: LlamaDimension::Layers
             }
         );
         assert!(refused.to_string().contains("layer count"));
