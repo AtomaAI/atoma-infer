@@ -12,6 +12,7 @@
 //! checked when the tables were built; what remains inside a recording is the launches.
 
 use core::ffi::c_void;
+use core::fmt;
 
 use atoma_kernels::decode_ops;
 use atoma_kernels::error::KernelError;
@@ -157,16 +158,55 @@ impl ResolvedOp<'_> {
     }
 }
 
+/// One launch of the step, as logs and recording launchers identify it: an op of one layer's
+/// table, or one of the three the step runs outside the layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOp {
+    /// The embedding gather into the first row's residual stream.
+    EmbeddingGather,
+    /// `op` of `layer`'s op table.
+    Layer { layer: LayerIdx, op: LayerOp },
+    /// The final norm over the last row.
+    FinalNorm,
+    /// The head projection into the logits.
+    LmHead,
+}
+
+impl StepOp {
+    /// What the launch computes, as logs name it; a layer's op is named as its table names it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            StepOp::EmbeddingGather => "embedding_gather",
+            StepOp::Layer { op, .. } => op.name(),
+            StepOp::FinalNorm => "final_norm",
+            StepOp::LmHead => "lm_head",
+        }
+    }
+}
+
+impl fmt::Display for StepOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StepOp::Layer { layer, op } => write!(f, "layer {}'s {}", layer.0, op.name()),
+            StepOp::EmbeddingGather | StepOp::FinalNorm | StepOp::LmHead => {
+                f.write_str(self.name())
+            }
+        }
+    }
+}
+
 /// Where a resolved op goes: onto a stream, or into a recording launcher's list.
 pub trait OpLauncher {
     type Error;
 
-    /// Launches `op`, named `name` for logs and recording launchers.
+    /// Launches `resolved`, which is `op` of the step; the op identifies the launch for logs and
+    /// recording launchers.
     ///
     /// # Errors
     ///
     /// Returns the launcher's error when the op cannot be launched; the walk stops there.
-    fn launch(&mut self, name: &'static str, op: &ResolvedOp<'_>) -> Result<(), Self::Error>;
+    fn launch(&mut self, op: StepOp, resolved: &ResolvedOp<'_>) -> Result<(), Self::Error>;
 }
 
 /// The Llama decode step over runtime-owned tensors: the tables every bucket's walk reads.
@@ -267,7 +307,7 @@ impl LlamaDecode {
         let activations = &slots.activations;
         let statics = &slots.statics;
         launcher.launch(
-            "embedding_gather",
+            StepOp::EmbeddingGather,
             &ResolvedOp::EmbeddingGather {
                 table: &self.weights.embedding,
                 token_ids: &statics.token_ids,
@@ -277,12 +317,15 @@ impl LlamaDecode {
         for layer in 0..self.dims.layers {
             let layer = LayerIdx(layer);
             for op in LLAMA_LAYER.ops() {
-                launcher.launch(op.name(), &self.resolve(slots, layer, *op))?;
+                launcher.launch(
+                    StepOp::Layer { layer, op: *op },
+                    &self.resolve(slots, layer, *op),
+                )?;
             }
         }
         let last = activations.final_row();
         launcher.launch(
-            "final_norm",
+            StepOp::FinalNorm,
             &ResolvedOp::RmsNorm {
                 input: last.role(Role::Hidden),
                 gain: &self.weights.final_norm,
@@ -290,7 +333,7 @@ impl LlamaDecode {
             },
         )?;
         launcher.launch(
-            "lm_head",
+            StepOp::LmHead,
             &ResolvedOp::Projection {
                 input: last.role(Role::Normed),
                 weight: &self.weights.lm_head,
@@ -407,9 +450,9 @@ pub struct CudaLauncher<'a> {
 impl OpLauncher for CudaLauncher<'_> {
     type Error = StepError;
 
-    fn launch(&mut self, _name: &'static str, op: &ResolvedOp<'_>) -> Result<(), StepError> {
+    fn launch(&mut self, _op: StepOp, resolved: &ResolvedOp<'_>) -> Result<(), StepError> {
         let stream = self.stream;
-        match *op {
+        match *resolved {
             ResolvedOp::EmbeddingGather {
                 table,
                 token_ids,
@@ -614,7 +657,7 @@ mod tests {
     /// One launch as the recorder saw it.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Launch {
-        name: &'static str,
+        op: StepOp,
         reads: Vec<u64>,
         writes: Vec<u64>,
     }
@@ -632,14 +675,14 @@ mod tests {
     impl OpLauncher for Recorder {
         type Error = Refused;
 
-        fn launch(&mut self, name: &'static str, op: &ResolvedOp<'_>) -> Result<(), Refused> {
+        fn launch(&mut self, op: StepOp, resolved: &ResolvedOp<'_>) -> Result<(), Refused> {
             if self.refuse_at == Some(self.launches.len()) {
                 return Err(Refused(self.launches.len()));
             }
             self.launches.push(Launch {
-                name,
-                reads: op.reads(),
-                writes: op.writes(),
+                op,
+                reads: resolved.reads(),
+                writes: resolved.writes(),
             });
             Ok(())
         }
@@ -651,7 +694,7 @@ mod tests {
     impl OpLauncher for Counter {
         type Error = Infallible;
 
-        fn launch(&mut self, _: &'static str, _: &ResolvedOp<'_>) -> Result<(), Infallible> {
+        fn launch(&mut self, _: StepOp, _: &ResolvedOp<'_>) -> Result<(), Infallible> {
             self.0 += 1;
             Ok(())
         }
@@ -677,18 +720,28 @@ mod tests {
     #[test]
     fn the_walk_is_the_gather_the_op_table_per_layer_the_final_norm_and_the_head() {
         let (decode, _) = decode();
-        let names: Vec<&str> = record(&decode, 1)
-            .iter()
-            .map(|launch| launch.name)
-            .collect();
+        let ops: Vec<StepOp> = record(&decode, 1).iter().map(|launch| launch.op).collect();
 
-        let mut expected = vec!["embedding_gather"];
-        for _ in 0..LAYERS {
-            expected.extend(LLAMA_OPS.iter().map(LayerOp::name));
+        let mut expected = vec![StepOp::EmbeddingGather];
+        for layer in 0..LAYERS {
+            let layer = LayerIdx(layer);
+            expected.extend(LLAMA_OPS.iter().map(|&op| StepOp::Layer { layer, op }));
         }
-        expected.extend(["final_norm", "lm_head"]);
-        assert_eq!(names, expected);
-        assert_eq!(names.len(), 1 + LAYERS * LLAMA_OPS.len() + 2);
+        expected.extend([StepOp::FinalNorm, StepOp::LmHead]);
+        assert_eq!(ops, expected);
+        assert_eq!(ops.len(), 1 + LAYERS * LLAMA_OPS.len() + 2);
+    }
+
+    #[test]
+    fn a_launch_names_itself_with_its_layer_when_it_has_one() {
+        let rope = StepOp::Layer {
+            layer: LayerIdx(3),
+            op: LLAMA_OPS[4],
+        };
+        assert_eq!(rope.name(), "rope");
+        assert_eq!(rope.to_string(), "layer 3's rope");
+        assert_eq!(StepOp::LmHead.to_string(), "lm_head");
+        assert_eq!(StepOp::EmbeddingGather.name(), "embedding_gather");
     }
 
     #[test]
@@ -765,10 +818,10 @@ mod tests {
             let base = 1 + layer * LLAMA_OPS.len();
             let k_cache = 0x6000_0000 + layer as u64 * 0x100_0000;
             let kv_write = &launches[base + 5];
-            assert_eq!(kv_write.name, "kv_write");
+            assert_eq!(kv_write.op.name(), "kv_write");
             assert_eq!(kv_write.writes[0], k_cache);
             let attention = &launches[base + 6];
-            assert_eq!(attention.name, "attention");
+            assert_eq!(attention.op.name(), "attention");
             assert!(attention.reads.contains(&k_cache));
         }
     }
