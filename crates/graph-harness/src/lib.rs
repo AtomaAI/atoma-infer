@@ -16,7 +16,7 @@
 //! | [`matrix`] | The capture matrix: buckets × step contents, largest bucket first |
 //! | [`variation`] | Deterministic per-step inputs: token ids, seq lens, block tables, slots |
 //! | [`layout`] | Arena roles, static buffer sizes, device memory budget |
-//! | [`splits`] | The FA2 split-KV heuristic, precomputed so accumulators allocate pre-capture |
+//! | [`splits`] | The shared FA2 split-KV heuristic over a decode bucket, fixed pre-capture |
 //! | [`compare`] | Bit-identity comparison and bf16 divergence reporting |
 //! | [`report`] | Findings note: capture matrix table, timings, memory measurements |
 //! | [`gpu`] | Device runner: NVRTC kernels, cuBLAS, the step function, capture and replay |

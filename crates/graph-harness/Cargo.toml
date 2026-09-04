@@ -7,7 +7,7 @@ version     = { workspace = true }
 
 [dependencies]
 anyhow        = { workspace = true }
-atoma-kernels = { workspace = true, optional = true }
+atoma-kernels = { workspace = true }
 atoma-runtime = { workspace = true }
 clap          = { workspace = true, features = [ "derive" ] }
 cudarc        = { workspace = true }
@@ -16,5 +16,5 @@ serde         = { workspace = true, features = [ "derive" ] }
 serde_json    = { workspace = true }
 
 [features]
-cuda = [ "atoma-kernels/cuda", "dep:atoma-kernels" ]
+cuda = [ "atoma-kernels/cuda" ]
 nccl = [ "atoma-runtime/nccl", "cudarc/nccl" ]
