@@ -60,9 +60,9 @@ pub enum Checked {
     Eager(Unservable),
 }
 
-/// The buckets the decode step serves: the configured bucket ladder's entries at or below the
-/// captured maximum, in configured order. The arena and every slot table are built over exactly
-/// these, so an entry's position here is its bucket index everywhere.
+/// The buckets the decode step serves: the configured bucket ladder's distinct entries at or
+/// below the captured maximum, in configured order. The arena and every slot table are built
+/// over exactly these, so an entry's position here is its bucket index everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeBuckets {
     tokens: Vec<usize>,
@@ -71,19 +71,18 @@ pub struct DecodeBuckets {
 impl DecodeBuckets {
     /// The entries of `config`'s bucket ladder a captured decode graph can serve: a uniform-decode
     /// batch has as many tokens as entries, so a bucket above the captured request maximum never
-    /// fills.
+    /// fills. A size the ladder repeats is served by its first entry, so the repeats are dropped
+    /// rather than given tables and a graph nothing routes to.
     #[must_use]
     pub fn usable(config: &DispatchConfig) -> Self {
         let captured_max = config.captured_max_requests.get();
-        Self {
-            tokens: config
-                .bucket_ladder
-                .buckets()
-                .iter()
-                .copied()
-                .filter(|&tokens| tokens <= captured_max)
-                .collect(),
+        let mut tokens: Vec<usize> = Vec::new();
+        for &bucket in config.bucket_ladder.buckets() {
+            if bucket <= captured_max && !tokens.contains(&bucket) {
+                tokens.push(bucket);
+            }
         }
+        Self { tokens }
     }
 
     /// The buckets, in index order.
@@ -205,20 +204,20 @@ mod tests {
     }
 
     #[test]
-    fn the_usable_buckets_are_the_bucket_ladders_entries_up_to_the_captured_maximum_in_order() {
+    fn the_usable_buckets_are_the_ladders_distinct_entries_up_to_the_captured_maximum_in_order() {
         let mut config = engine_config().dispatch;
         config.bucket_ladder = BucketLadder::new(vec![8, 1, 4, 2, 16, 4]).unwrap();
         config.captured_max_requests = RequestCount::new(4).unwrap();
 
         let buckets = DecodeBuckets::usable(&config);
 
-        assert_eq!(buckets.tokens(), [1, 4, 2, 4]);
-        assert_eq!(buckets.largest(), 4);
         assert_eq!(
-            buckets.index_of(4),
-            Some(BucketIdx(1)),
-            "the first bucket of four"
+            buckets.tokens(),
+            [1, 4, 2],
+            "the repeated four is served by its first entry and gets no second table"
         );
+        assert_eq!(buckets.largest(), 4);
+        assert_eq!(buckets.index_of(4), Some(BucketIdx(1)));
         assert_eq!(buckets.index_of(2), Some(BucketIdx(2)));
         assert_eq!(buckets.index_of(8), None);
         assert_eq!(buckets.index_of(3), None);
