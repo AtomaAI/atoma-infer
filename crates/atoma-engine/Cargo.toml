@@ -7,6 +7,7 @@ version     = { workspace = true }
 
 [dependencies]
 atoma-core      = { workspace = true }
+atoma-kernels   = { workspace = true }
 atoma-models    = { workspace = true }
 atoma-runtime   = { workspace = true }
 candle-core     = { workspace = true }
@@ -26,6 +27,7 @@ validator       = { workspace = true, features = [ "derive" ] }
 
 [features]
 cuda = [
+    "atoma-kernels/cuda",
     "atoma-models/cuda",
     "candle-core/cuda",
     "candle-nn/cuda",

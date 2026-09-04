@@ -12,6 +12,7 @@
 // The evidence block is this test's product; it goes to stdout on purpose.
 #![allow(clippy::print_stdout)]
 
+use std::slice;
 use std::sync::Arc;
 
 use atoma_core::dispatch::{DispatchDecision, EagerReason};
@@ -50,8 +51,8 @@ impl Lcg {
 
     /// A logit in [-8, 8).
     fn logit(&mut self) -> f32 {
-        let scaled = (self.next() % 16_000) as f32 / 1000.0;
-        scaled - 8.0
+        let thousandths = u16::try_from(self.next() % 16_000).expect("below sixteen thousand");
+        f32::from(thousandths) / 1000.0 - 8.0
     }
 }
 
@@ -90,7 +91,7 @@ impl Rig {
         self.stream
             .memcpy_htod(&flat, &mut self.logits)
             .expect("the logits upload");
-        self.sampler.stage(layout).expect("the layout stages");
+        self.sampler.stage(layout, None).expect("the layout stages");
         let view = self.logits.slice(0..rows.len() * VOCAB);
         self.sampler
             .run_on(&self.stream, &view)
@@ -141,6 +142,13 @@ fn random_row(random: &mut Lcg) -> Vec<f32> {
     (0..VOCAB).map(|_| random.logit()).collect()
 }
 
+/// `count` out of `total`, as a fraction.
+fn ratio(count: usize, total: usize) -> f32 {
+    let count = u16::try_from(count).expect("a draw count fits u16");
+    let total = u16::try_from(total).expect("a draw count fits u16");
+    f32::from(count) / f32::from(total)
+}
+
 /// What the reference samples for the `draw`-th draw of `params` over `row`.
 fn expected(row: &[f32], params: &SamplingParams, draw: u32) -> u32 {
     let mut record = SlotRecord::new(params);
@@ -160,8 +168,8 @@ fn the_device_sampler_matches_its_host_reference() {
     // Greedy rows, exactly: the largest logit, ties to the first index.
     for step in 0..16 {
         let rows: Vec<Vec<f32>> = (0..4).map(|_| random_row(&mut random)).collect();
-        let entries = (0..4)
-            .map(|index| entry(100 + index, index as u32, SamplingParams::default()))
+        let entries = (0..4u32)
+            .map(|index| entry(100 + u64::from(index), index, SamplingParams::default()))
             .collect();
         let sampled = rig.sample(&layout(entries), &rows);
         for (row, token) in rows.iter().zip(&sampled) {
@@ -195,17 +203,15 @@ fn the_device_sampler_matches_its_host_reference() {
     ] {
         let row = random_row(&mut random);
         let params = drawn(temperature, top_k, top_p, 0x5EED);
-        let mut slot_free = 0;
-        for draw in 0..32 {
+        for draw in 0..32u32 {
             // A new request each time, so its slot is claimed afresh and the seed under test
             // reaches the record; its counter is then zero, which is the draw compared.
-            let slot = slot_free % SLOTS as u32;
-            slot_free += 1;
+            let slot = draw % u32::try_from(SLOTS).expect("the slot count fits u32");
             let mut params = params;
             params.seed = 0x5EED + u64::from(draw);
             let sampled = rig.sample(
                 &layout(vec![entry(u64::from(draw) + 1, slot, params)]),
-                &[row.clone()],
+                slice::from_ref(&row),
             );
             let want = expected(&row, &params, 0);
             drawn_rows += 1;
@@ -242,7 +248,7 @@ fn a_seeded_request_draws_the_same_tokens_in_any_batch_and_any_slot() {
 
     // Alone, in slot zero.
     let alone: Vec<u32> = (0..steps)
-        .map(|_| rig.sample(&layout(vec![entry(1, 0, params)]), &[row.clone()])[0])
+        .map(|_| rig.sample(&layout(vec![entry(1, 0, params)]), slice::from_ref(&row))[0])
         .collect();
 
     // The same request in a different slot, sharing every batch with other requests whose rows
@@ -250,14 +256,14 @@ fn a_seeded_request_draws_the_same_tokens_in_any_batch_and_any_slot() {
     let slot = 11;
     let mut together = Vec::with_capacity(steps);
     for step in 0..steps {
-        let others = step % 3;
+        let others = u32::try_from(step % 3).expect("below three");
         let mut entries = vec![entry(1, slot, params)];
         let mut rows = vec![row.clone()];
         for other in 0..others {
             entries.push(entry(
-                200 + other as u64,
-                (other + 1) as u32,
-                drawn(1.0, 0, 1.0, 7 + other as u64),
+                200 + u64::from(other),
+                other + 1,
+                drawn(1.0, 0, 1.0, 7 + u64::from(other)),
             ));
             rows.push(random_row(&mut random));
         }
@@ -293,7 +299,7 @@ fn drawn_tokens_follow_the_distribution_the_filters_leave() {
     // gets.
     let mut counts = [0usize; 4];
     for draw in 0..DRAWS {
-        let token = rig.sample(&layout(vec![entry(1, 0, params)]), &[row.clone()])[0];
+        let token = rig.sample(&layout(vec![entry(1, 0, params)]), slice::from_ref(&row))[0];
         let index = heavy
             .iter()
             .position(|&heavy| heavy == token as usize)
@@ -306,7 +312,7 @@ fn drawn_tokens_follow_the_distribution_the_filters_leave() {
     println!("=============== draw frequencies ===============");
     println!("draws:                {DRAWS}");
     for (index, (&count, &probability)) in counts.iter().zip(&probabilities).enumerate() {
-        let frequency = count as f32 / DRAWS as f32;
+        let frequency = ratio(count, DRAWS);
         println!(
             "token {}: {frequency:.4} against {probability:.4}",
             heavy[index]

@@ -32,7 +32,7 @@ use tracing::{info, warn};
 use crate::batch::BatchLayout;
 use crate::decode::inputs::Pinned;
 use crate::readback::{Readback, ReadbackCopy, ReadbackError};
-use crate::sampling::owners::SlotOwners;
+use crate::sampling::owners::{OwnersError, SlotOwners};
 use crate::sampling::plan::{plan_step, PlanError, StepPlan};
 use crate::sampling::record::{SlotRecord, RECORD_BYTES};
 
@@ -53,6 +53,8 @@ pub enum SamplerError {
     NoStepStaged,
     #[error(transparent)]
     Plan(#[from] PlanError),
+    #[error(transparent)]
+    Owners(#[from] OwnersError),
     #[error(transparent)]
     Readback(#[from] ReadbackError),
     #[error(transparent)]
