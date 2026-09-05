@@ -1,16 +1,22 @@
 //! The forward on the device: a keyed decode batch on the step over runtime-owned tensors, every
-//! other batch through the Llama forward on candle's stream, and the selected logits read back
-//! to the host either way.
+//! other batch through the Llama forward on candle's stream, and the selected rows sampled on the
+//! device either way, so what comes back to the host is one copy of the sampled tokens and never
+//! the logits.
+//!
+//! The logits path stays reachable as [`CudaForward::forward_logits`], which reads them back into
+//! a readback the caller owns: what the decode parity harness compares the two forwards through,
+//! and the only way logits reach the host.
 
 use std::sync::Arc;
 
 use atoma_runtime::session::Replay;
-use candle_core::{Storage, Tensor};
-use cudarc::driver::CudaStream;
+use candle_core::{Layout, Storage, Tensor};
+use cudarc::driver::{CudaStream, CudaView};
 use models::FlashAttentionMetadata;
 use thiserror::Error;
 
 use crate::batch::BatchLayout;
+use crate::device::sampler::{DeviceSampler, SamplerError};
 use crate::device::{KvCache, RankDevice, Weights};
 use crate::forward::Forward;
 use crate::logits::Logits;
@@ -33,6 +39,8 @@ pub enum CudaForwardError {
     Candle(#[from] candle_core::Error),
     #[error(transparent)]
     Readback(#[from] ReadbackError),
+    #[error(transparent)]
+    Sampler(#[from] SamplerError),
     #[cfg(not(feature = "nccl"))]
     #[error(transparent)]
     DecodeStep(Box<DecodeStepError>),
@@ -55,9 +63,9 @@ pub struct Allocated {
     pub device: RankDevice,
     pub weights: Weights,
     pub kv_cache: KvCache,
-    /// Rank zero reads its logits back; a follower's are read by nobody, so it holds no readback
-    /// and its forward returns no rows.
-    pub readback: Option<Readback>,
+    /// Rank zero samples its logits; a follower's are read by nobody, so it holds no sampler and
+    /// its forward returns no tokens.
+    pub sampler: Option<DeviceSampler>,
     pub vocab: usize,
 }
 
@@ -91,6 +99,43 @@ impl CudaForward {
         }
     }
 
+    /// Runs `layout` and reads the logits of the rows it selected into `readback`: one row per
+    /// selected row, in batch order, a vocabulary wide. Nothing is sampled, and no slot's record
+    /// or draw counter moves, so a harness can read a step's logits without disturbing what the
+    /// device sampler holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CudaForwardError`] when the step could not be run or read back.
+    pub fn forward_logits<'a>(
+        &mut self,
+        layout: &BatchLayout,
+        readback: &'a mut Readback<f32>,
+    ) -> Result<Logits<'a>, CudaForwardError> {
+        #[cfg(not(feature = "nccl"))]
+        if let Some(batch) = self.keyed_batch(layout)? {
+            let Self {
+                allocated: _,
+                decode_step,
+                session,
+            } = self;
+            return Ok(decode_step.run_for_logits(session, layout, batch, readback)?);
+        }
+        let rows = layout.selected.len();
+        let logits = self.candle_logits(layout)?;
+        let Allocated {
+            device,
+            weights: _,
+            kv_cache: _,
+            sampler: _,
+            vocab,
+        } = &self.allocated;
+        if rows == 0 {
+            return Ok(Logits::new(&[], *vocab));
+        }
+        read_back(readback, device.stream(), &logits, rows, *vocab)
+    }
+
     /// The batch as the decode step serves it, when the layout is keyed and the shape its graphs
     /// bake; a keyed batch it does not serve is logged and runs on candle.
     #[cfg(not(feature = "nccl"))]
@@ -108,24 +153,52 @@ impl CudaForward {
         }
     }
 
-    /// Runs `batch` on the decode step and reads its live rows back, when this rank reads any.
+    /// Runs `batch` on the decode step and samples its live rows, when this rank samples. The
+    /// batch states that every entry computes one token, so its rows are the token rows the
+    /// gather covers.
     #[cfg(not(feature = "nccl"))]
     fn run_decode_step(
         &mut self,
         layout: &BatchLayout,
         batch: DecodeBatch,
-    ) -> Result<Logits<'_>, CudaForwardError> {
+    ) -> Result<&[u32], CudaForwardError> {
         let Self {
             allocated,
             decode_step,
             session,
         } = self;
-        Ok(decode_step.run(session, layout, batch, allocated.readback.as_mut())?)
+        if let Some(sampler) = allocated.sampler.as_mut() {
+            sampler.stage(layout, Some(batch.tokens))?;
+        }
+        Ok(decode_step.run(session, layout, batch, allocated.sampler.as_mut())?)
     }
 
-    /// Runs `layout` through the Llama forward on candle's stream and reads the selected rows
-    /// back.
-    fn candle_forward(&mut self, layout: &BatchLayout) -> Result<Logits<'_>, CudaForwardError> {
+    /// Runs `layout` through the Llama forward on candle's stream and samples the selected rows
+    /// there, where the forward left its logits. No row gathers: candle takes its token ids from
+    /// the host, and the batch it serves is not the shape the gather is for.
+    fn candle_forward(&mut self, layout: &BatchLayout) -> Result<&[u32], CudaForwardError> {
+        if let Some(sampler) = self.allocated.sampler.as_mut() {
+            sampler.stage(layout, None)?;
+        }
+        let logits = self.candle_logits(layout)?;
+        let Allocated {
+            device,
+            weights: _,
+            kv_cache: _,
+            sampler,
+            vocab: _,
+        } = &mut self.allocated;
+        let Some(sampler) = sampler else {
+            return Ok(&[]);
+        };
+        if layout.selected.is_empty() {
+            return Ok(&[]);
+        }
+        sample_logits(sampler, device.stream(), &logits)
+    }
+
+    /// Runs `layout` through the Llama forward on candle's stream, leaving its logits there.
+    fn candle_logits(&mut self, layout: &BatchLayout) -> Result<Tensor, CudaForwardError> {
         let Uploaded {
             tokens,
             positions,
@@ -133,26 +206,20 @@ impl CudaForward {
             metadata,
         } = self.upload(layout)?;
         let Allocated {
-            device,
+            device: _,
             weights,
             kv_cache,
-            readback,
-            vocab,
+            sampler: _,
+            vocab: _,
         } = &mut self.allocated;
         let kv_caches = kv_cache.layers_mut();
         let logits = weights
             .llama_mut()
             .forward(&tokens, &positions, &selected, &kv_caches, metadata)?;
         #[cfg(not(feature = "nccl"))]
-        self.decode_step.after_candle(device.stream())?;
-        let rows = layout.selected.len();
-        let Some(readback) = readback else {
-            return Ok(Logits::new(&[], *vocab));
-        };
-        if rows == 0 {
-            return Ok(Logits::new(&[], *vocab));
-        }
-        read_back(readback, device.stream(), &logits, rows)
+        self.decode_step
+            .after_candle(self.allocated.device.stream())?;
+        Ok(logits)
     }
 
     /// The forward's inputs and attention metadata, uploaded from `layout`.
@@ -205,7 +272,9 @@ struct Uploaded {
 impl Forward for CudaForward {
     type Error = CudaForwardError;
 
-    fn forward(&mut self, layout: &BatchLayout) -> Result<Logits<'_>, CudaForwardError> {
+    /// A rank with no sampler samples nothing: it ran the step for its share of the model, and
+    /// the leader's tokens are the step's.
+    fn forward(&mut self, layout: &BatchLayout) -> Result<&[u32], CudaForwardError> {
         #[cfg(not(feature = "nccl"))]
         if let Some(batch) = self.keyed_batch(layout)? {
             return self.run_decode_step(layout, batch);
@@ -214,20 +283,48 @@ impl Forward for CudaForward {
     }
 }
 
-/// Copies the `rows` rows of `logits` back through `readback` on `stream`.
+/// Samples `sampler`'s staged rows from the `logits` candle left on `stream`.
+///
+/// Candle hands its storage out behind a read guard, so the view over it lives for as long as
+/// that guard does: the guard is held here, and what the call returns borrows the sampler.
+fn sample_logits<'a>(
+    sampler: &'a mut DeviceSampler,
+    stream: &Arc<CudaStream>,
+    logits: &Tensor,
+) -> Result<&'a [u32], CudaForwardError> {
+    let (storage, layout) = logits.storage_and_layout();
+    let device_logits = device_logits(&storage, layout)?;
+    Ok(sampler.run_on(stream, &device_logits)?)
+}
+
+/// Copies the `rows` rows of `logits` back through `readback` on `stream`. The storage guard is
+/// held here for the same reason it is in [`sample_logits`].
 fn read_back<'a>(
-    readback: &'a mut Readback,
+    readback: &'a mut Readback<f32>,
     stream: &Arc<CudaStream>,
     logits: &Tensor,
     rows: usize,
+    vocab: usize,
 ) -> Result<Logits<'a>, CudaForwardError> {
     let (storage, layout) = logits.storage_and_layout();
-    let Storage::Cuda(storage) = &*storage else {
+    let device_logits = device_logits(&storage, layout)?;
+    Ok(Logits::new(
+        readback.read(stream, &device_logits, rows)?,
+        vocab,
+    ))
+}
+
+/// The f32 logits a tensor's `storage` holds on the device, as the view `layout` places over
+/// it; the caller holds the guard `storage` came out of for as long as the view lives.
+fn device_logits<'a>(
+    storage: &'a Storage,
+    layout: &Layout,
+) -> Result<CudaView<'a, f32>, CudaForwardError> {
+    let Storage::Cuda(storage) = storage else {
         return Err(CudaForwardError::LogitsNotOnDevice);
     };
     let start = layout.start_offset();
-    let device_logits = storage
+    Ok(storage
         .as_cuda_slice::<f32>()?
-        .slice(start..start + layout.shape().elem_count());
-    Ok(readback.read(stream, &device_logits, rows)?)
+        .slice(start..start + layout.shape().elem_count()))
 }

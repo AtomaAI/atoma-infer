@@ -37,19 +37,19 @@ impl RequestSlab {
     /// once, so a second removal is a bookkeeping bug.
     pub fn remove(&mut self, slot: RequestSlot) -> Request {
         assert!(
-            self.requests.contains(slot.get() as usize),
+            self.requests.contains(slot.index()),
             "remove of a vacant request slot {slot:?}"
         );
-        self.requests.remove(slot.get() as usize)
+        self.requests.remove(slot.index())
     }
 
     #[must_use]
     pub fn get(&self, slot: RequestSlot) -> Option<&Request> {
-        self.requests.get(slot.get() as usize)
+        self.requests.get(slot.index())
     }
 
     pub fn get_mut(&mut self, slot: RequestSlot) -> Option<&mut Request> {
-        self.requests.get_mut(slot.get() as usize)
+        self.requests.get_mut(slot.index())
     }
 
     /// Live requests.

@@ -31,7 +31,7 @@ mod prefix_cache;
 mod priority;
 mod stop_criteria;
 
-use crate::kv::{BlockPool, HashAlgorithm};
+use crate::kv::{BlockPool, HashAlgorithm, PaddingReservation};
 use crate::request::{
     egress, EgressReceiver, EgressSender, FinishReason, NewRequest, Priority, RequestEvent,
     SamplingParams, StopCriteria,
@@ -70,6 +70,43 @@ fn config(blocks: u32, token_budget: usize, max_batch: usize) -> SchedulerConfig
         eos_token_ids: vec![EOS],
         hash_algorithm: HashAlgorithm::Sha256V1,
     }
+}
+
+#[test]
+fn the_slot_count_covers_every_live_request_and_every_padding_dummy() {
+    // Sixty-four requests, and the three dummies a batch of four pads with.
+    assert_eq!(config(16, 100, 4).slot_count(), 67);
+    assert_eq!(
+        config(16, 100, 1).slot_count(),
+        64,
+        "a batch of one pads with none"
+    );
+
+    // Every slot the scheduler hands out is inside the count: the dummies take theirs at
+    // startup, and the slab hands the rest out until it is full.
+    let config = config(16, 100, 4);
+    let mut pool = BlockPool::new(16);
+    let reservation = PaddingReservation::reserve(&mut pool, config.max_batch).expect("reserves");
+    let dummy_count = reservation.dummy_count();
+    reservation.release(&mut pool);
+    assert_eq!(dummy_count, 3, "one dummy per slot a full batch pads");
+
+    let mut scheduler = scheduler(16, 100, 4);
+    let mut clients = Vec::new();
+    let mut highest = 0;
+    for _ in 0..MAX_REQUESTS {
+        let (egress, client) = egress();
+        clients.push(client);
+        let slot = scheduler
+            .intake(new_request(3, 4, egress))
+            .expect("the prompt fits the model");
+        highest = highest.max(slot.index());
+    }
+    assert_eq!(highest, MAX_REQUESTS - 1, "the slab filled from zero");
+    assert!(
+        highest + dummy_count < config.slot_count(),
+        "the dummies' slots fit above a full slab"
+    );
 }
 
 /// A scheduler that retires a client leaving more than `max_backlog` events unread.

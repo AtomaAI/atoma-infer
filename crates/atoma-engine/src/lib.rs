@@ -2,8 +2,9 @@
 //! step commands.
 //!
 //! The engine thread decides everything about a step on the host and hands the executor a step
-//! command over a ring; the executor runs the model forward for it, samples the tokens the command
-//! asks for, and hands a step result back. It re-derives nothing the command already settled.
+//! command over a ring; the executor runs the model forward for it, which samples the tokens the
+//! command asks for, and hands a step result back. It re-derives nothing the command already
+//! settled.
 
 pub mod batch;
 pub mod config;
@@ -15,7 +16,7 @@ pub mod forward;
 pub mod logits;
 pub mod model;
 pub mod readback;
-pub mod sampler;
+pub mod sampling;
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -43,13 +44,11 @@ pub(crate) mod test_support {
 
     use crate::batch::BatchLayout;
     use crate::forward::Forward;
-    use crate::logits::Logits;
 
     pub(crate) const BLOCK_SIZE: TokenCount = TokenCount::new(4).expect("nonzero");
     const MAX_BATCH: usize = 4;
     const BLOCKS: u32 = 16;
     const EOS: u32 = 99;
-    const VOCAB: usize = 128;
 
     /// How long a test waits on a thread before calling it wedged: generous, since a loaded
     /// machine is slow rather than broken.
@@ -131,8 +130,8 @@ pub(crate) mod test_support {
         pub(crate) command: usize,
     }
 
-    /// A forward whose every selected row peaks at one chosen token, so greedy sampling returns
-    /// it; it can be told to fail on its n-th command, and it keeps every layout it ran.
+    /// A forward that samples one chosen token for every selected row; it can be told to fail
+    /// on its n-th command, and it keeps every layout it ran.
     ///
     /// Commands are counted rather than matched by step id: the scheduler mints a step id on
     /// every pass, empty ones included, so the first served step's id depends on whether the
@@ -141,7 +140,7 @@ pub(crate) mod test_support {
         token: u32,
         fail_on_command: Option<usize>,
         seen: usize,
-        logits: Vec<f32>,
+        sampled: Vec<u32>,
         served: Arc<Mutex<Vec<BatchLayout>>>,
     }
 
@@ -151,7 +150,7 @@ pub(crate) mod test_support {
                 token,
                 fail_on_command: None,
                 seen: 0,
-                logits: Vec::new(),
+                sampled: Vec::new(),
                 served: Arc::default(),
             }
         }
@@ -171,19 +170,15 @@ pub(crate) mod test_support {
     impl Forward for FakeForward {
         type Error = FakeForwardError;
 
-        fn forward(&mut self, layout: &BatchLayout) -> Result<Logits<'_>, FakeForwardError> {
+        fn forward(&mut self, layout: &BatchLayout) -> Result<&[u32], FakeForwardError> {
             self.seen += 1;
             if self.fail_on_command == Some(self.seen) {
                 return Err(FakeForwardError { command: self.seen });
             }
             self.served.lock().push(layout.clone());
-            let rows = layout.selected.len();
-            self.logits.clear();
-            self.logits.resize(rows * VOCAB, 0.0);
-            for row in 0..rows {
-                self.logits[row * VOCAB + self.token as usize] = 1.0;
-            }
-            Ok(Logits::new(&self.logits, VOCAB))
+            self.sampled.clear();
+            self.sampled.resize(layout.selected.len(), self.token);
+            Ok(&self.sampled)
         }
     }
 

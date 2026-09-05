@@ -91,27 +91,27 @@ pub struct InputTensors {
 }
 
 /// A pinned host array, allocated once and freed on drop.
-struct Pinned<T> {
+pub(crate) struct Pinned<T> {
     ptr: *mut T,
     len: usize,
 }
 
 impl<T> Pinned<T> {
     /// `len` values of pinned, cacheable host memory in the current context.
-    fn new(len: usize) -> Result<Self, RuntimeError> {
+    pub(crate) fn new(len: usize) -> Result<Self, RuntimeError> {
         // SAFETY: a driver allocation of the size asked for, freed once, in `Drop`, after every
         // copy out of it has been waited on.
         let ptr = unsafe { malloc_host(len * size_of::<T>(), CACHEABLE_PINNED) }?.cast::<T>();
         Ok(Self { ptr, len })
     }
 
-    fn as_slice(&self) -> &[T] {
+    pub(crate) fn as_slice(&self) -> &[T] {
         // SAFETY: `len` values were allocated at `ptr` and nothing writes them while this borrow
         // is live: the writer takes `&mut self`.
         unsafe { slice::from_raw_parts(self.ptr, self.len) }
     }
 
-    fn as_mut_slice(&mut self) -> &mut [T] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
         // SAFETY: as above, exclusively through `&mut self`.
         unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
     }

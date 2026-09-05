@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use validator::{Validate, ValidationError};
 
-use crate::kv::HashAlgorithm;
+use crate::kv::{HashAlgorithm, PaddingReservation};
 use crate::scheduler::AdmissionPolicy;
 use crate::types::{RequestCount, TokenCount};
 
@@ -39,6 +39,16 @@ pub struct SchedulerConfig {
     pub eos_token_ids: Vec<u32>,
     /// The chain-hash algorithm block identity is minted under.
     pub hash_algorithm: HashAlgorithm,
+}
+
+impl SchedulerConfig {
+    /// The request slots the slab hands out: one per live request, plus the padding dummies,
+    /// which take theirs at startup and hold them for the process lifetime. Whatever is indexed
+    /// by request slot is sized by this.
+    #[must_use]
+    pub fn slot_count(&self) -> usize {
+        self.max_requests.get() + PaddingReservation::dummies_for(self.max_batch)
+    }
 }
 
 /// One step's batch is drawn from the requests the slab holds, so a `max_batch` above

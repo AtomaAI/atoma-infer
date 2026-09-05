@@ -11,8 +11,9 @@
 //! routes on the decision reads it from the one value it is handed.
 
 use atoma_core::dispatch::DispatchDecision;
+use atoma_core::request::SamplingParams;
 use atoma_core::step::{CommandEntry, StepCommand};
-use atoma_core::types::{RequestId, TokenCount};
+use atoma_core::types::{RequestId, RequestSlot, TokenCount};
 use thiserror::Error;
 
 /// A step command that cannot be laid out. Each is the engine breaking the step protocol, not a
@@ -36,6 +37,15 @@ pub enum LayoutError {
     },
 }
 
+/// What one selected row samples under: whose token it draws, the request slot that token is
+/// kept in, and the parameters it is drawn with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RowSampling {
+    pub request: RequestId,
+    pub slot: RequestSlot,
+    pub params: SamplingParams,
+}
+
 /// A step command laid out prefill-first, as the forward takes it.
 ///
 /// An entry computing more than one token is a prefill and leads the batch; one computing a
@@ -43,7 +53,7 @@ pub enum LayoutError {
 /// every entry's tokens flattened in that order, per-entry arrays hold one value per entry in
 /// that order, and the two cumulative starts hold one value more. The block tables are one row
 /// per entry, right-padded with zero to the widest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BatchLayout {
     pub tokens: Vec<u32>,
     /// Each token's position in its sequence: `context_len..sequence_len` per entry.
@@ -67,6 +77,8 @@ pub struct BatchLayout {
     /// The flattened index of each sampling entry's last token, in batch order: the rows the
     /// forward selects logits for. Entries that do not sample select nothing.
     pub selected: Vec<u32>,
+    /// What each selected row samples under, in the same order as `selected`.
+    pub sampling: Vec<RowSampling>,
     /// Which captured graph serves the batch, or why it runs eagerly, as the engine decided.
     pub dispatch: DispatchDecision,
     /// How many trailing entries of the command are padding dummies.
@@ -133,6 +145,7 @@ impl BatchLayout {
             max_prefill_sequence_len: 0,
             max_decode_sequence_len: 0,
             selected: Vec::with_capacity(command.sampling_count()),
+            sampling: Vec::with_capacity(command.sampling_count()),
             dispatch: command.dispatch,
             padding_count: command.padding_count,
             rows: Vec::with_capacity(command.sampling_count()),
@@ -140,11 +153,16 @@ impl BatchLayout {
         let mut row_by_index = vec![None; entries.len()];
         for index in prefills.into_iter().chain(decodes) {
             let entry = &entries[index];
-            if entry.samples() {
+            if let Some(params) = entry.sampling {
                 row_by_index[index] = Some(layout.selected.len());
                 layout
                     .selected
                     .push(fits_u32(layout.tokens.len() + entry.query_len() - 1));
+                layout.sampling.push(RowSampling {
+                    request: entry.request,
+                    slot: entry.slot,
+                    params,
+                });
             }
             layout.push_entry(entry, block_size);
         }
@@ -221,12 +239,12 @@ fn fits_i64(value: usize) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use atoma_core::request::PADDING_TOKEN;
+    use atoma_core::request::{SamplingParams, PADDING_TOKEN};
     use atoma_core::step::StepCommand;
-    use atoma_core::types::{RequestId, TokenCount};
+    use atoma_core::types::{RequestId, RequestSlot, TokenCount};
 
-    use super::{BatchLayout, LayoutError};
-    use crate::test_support::{command, dummy, entry};
+    use super::{BatchLayout, LayoutError, RowSampling};
+    use crate::test_support::{command, dummy, entry, sampling_entry};
 
     const BLOCK_SIZE: TokenCount = TokenCount::new(4).expect("nonzero");
 
@@ -296,6 +314,47 @@ mod tests {
             [1, 0, 2],
             "command order is decode 1, prefill 2, decode 4: rows 1, 0, 2"
         );
+    }
+
+    #[test]
+    fn each_selected_row_carries_the_request_slot_and_parameters_it_samples_under() {
+        let drawn = SamplingParams {
+            do_sample: true,
+            temperature: 0.5,
+            seed: 11,
+            ..SamplingParams::default()
+        };
+        let command = command(
+            vec![
+                sampling_entry(1, 6, drawn),
+                entry(2, 0, vec![1, 2, 3], &[20], true),
+                dummy(3, 30),
+            ],
+            1,
+        );
+        let layout = BatchLayout::lay_out(&command, BLOCK_SIZE).unwrap();
+        assert_eq!(
+            layout.selected,
+            [2, 3],
+            "the prefill leads, then the decode"
+        );
+        assert_eq!(
+            layout.sampling,
+            [
+                RowSampling {
+                    request: RequestId::new(2),
+                    slot: RequestSlot::new(2),
+                    params: SamplingParams::default(),
+                },
+                RowSampling {
+                    request: RequestId::new(1),
+                    slot: RequestSlot::new(6),
+                    params: drawn,
+                },
+            ],
+            "one per selected row, in batch order; the dummy has none"
+        );
+        assert_eq!(layout.sampling.len(), layout.selected.len());
     }
 
     #[test]

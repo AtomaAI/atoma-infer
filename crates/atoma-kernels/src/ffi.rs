@@ -1,6 +1,28 @@
 use crate::error::KernelError;
 use core::ffi::{c_char, c_int, c_void};
 use std::ffi::CStr;
+use std::mem::size_of;
+
+/// The sample launch's arguments, as `kernels/sampler.cu` lays them out.
+#[repr(C)]
+pub(crate) struct SampleArgs {
+    /// f32 `[n_rows, vocab]`, row-major.
+    pub(crate) logits: *const c_void,
+    /// i32 `[n_rows]`: the slot each row samples under.
+    pub(crate) row_slots: *const c_void,
+    /// The slot records, 24 bytes each, `[slots]`.
+    pub(crate) records: *mut c_void,
+    /// u32 `[slots]`: the token last sampled for each slot.
+    pub(crate) sampled: *mut c_void,
+    /// u32 `[n_rows]`: the token sampled for each row.
+    pub(crate) out: *mut c_void,
+    pub(crate) vocab: i64,
+    pub(crate) n_rows: i64,
+}
+
+/// The size the sources assert for the arguments.
+const SAMPLE_ARGS_BYTES: usize = 56;
+const _: () = assert!(size_of::<SampleArgs>() == SAMPLE_ARGS_BYTES);
 
 extern "C" {
     /// Records any failure for [`flash_last_error`] rather than returning it: the vendored dispatch
@@ -147,6 +169,18 @@ extern "C" {
         rhs: *const c_void,
         out: *mut c_void,
         len: i64,
+        stream: *mut c_void,
+    ) -> c_int;
+
+    /// Returns the `cudaError_t` of the launch.
+    pub(crate) fn sampler_sample_f32(args: *const SampleArgs, stream: *mut c_void) -> c_int;
+
+    /// Returns the `cudaError_t` of the launch.
+    pub(crate) fn sampler_gather_u32(
+        token_ids: *mut c_void,
+        gather_slots: *const c_void,
+        sampled: *const c_void,
+        n_rows: i64,
         stream: *mut c_void,
     ) -> c_int;
 

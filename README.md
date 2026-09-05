@@ -75,6 +75,12 @@ forward on the same weights and KV cache, records the step under capture, and co
 forwards' logits over decode steps of varying ids, lengths and block tables. It needs a device, the
 toolkit and a Llama checkpoint loadable in bf16, and prints its own evidence block.
 
+`scripts/sampler-parity.sh` runs the device sampler over synthetic logits against the host
+reference it is written to: every row's token, a seeded request's tokens across batches, rows and
+slots, the draw frequencies against the distribution the filters leave, and the gather of a
+decoding row's token from its slot. It needs a device and the toolkit, no checkpoint and no model,
+and prints its own evidence block.
+
 ## Benchmarks
 
 `crates/bench` holds the benchmark harness (`atoma-bench`). It offers an open-loop Poisson workload

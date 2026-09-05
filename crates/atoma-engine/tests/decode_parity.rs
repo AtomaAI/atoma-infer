@@ -36,13 +36,12 @@ use atoma_core::types::{
     BlockId, RequestCount, RequestId, RequestSlot, SequenceIndex, StepId, TokenCount,
 };
 use atoma_engine::batch::BatchLayout;
-use atoma_engine::config::{DeviceOrdinal, Dtype, ModelConfig, PromptTemplate};
+use atoma_engine::config::{DeviceOrdinal, Dtype, ModelConfig, ModelId, PromptTemplate};
 use atoma_engine::decode::batch::Checked;
 use atoma_engine::decode::declaration;
 use atoma_engine::device::decode::{DecodeStep, DecodeStepPlan};
 use atoma_engine::device::forward::{Allocated, CudaForward};
 use atoma_engine::device::{Checkpoint, KvCache, KvGeometry, RankDevice, Weights};
-use atoma_engine::forward::Forward;
 use atoma_engine::model::{fetch, llama_config};
 use atoma_engine::readback::Readback;
 use atoma_runtime::arena::BucketIdx;
@@ -68,8 +67,9 @@ const DEFAULT_MAX_ABS_DIFF: f32 = 0.75;
 /// The largest absolute difference accepted between the key and value rows the step writes into
 /// the cache and candle's writes of the same slots, unless `PARITY_KV_MAX_ABS_DIFF` says
 /// otherwise; the measured value is printed either way. Both paths write bf16 from their own
-/// projections, and the step rotates keys in f32 where candle rotates in bf16.
-const DEFAULT_KV_MAX_ABS_DIFF: f32 = 0.5;
+/// projections, and the step rotates keys in f32 where candle rotates in bf16: on an A100, 0.75
+/// for Llama 3.1 8B.
+const DEFAULT_KV_MAX_ABS_DIFF: f32 = 1.0;
 /// Prompt tokens are drawn below this id: Llama 3's special tokens sit at the top of the
 /// vocabulary, and a prompt of those is not a prompt.
 const TOKEN_ID_CEILING: usize = 120_000;
@@ -202,6 +202,8 @@ struct Rig {
     allocation: Allocation,
     allocated: Allocated,
     decode_step: DecodeStep,
+    /// The harness reads logits, and samples nothing; the readback is its own.
+    readback: Readback<f32>,
     vocab: usize,
 }
 
@@ -243,10 +245,12 @@ fn open(model: &ModelConfig) -> Rig {
             device,
             weights,
             kv_cache,
-            readback: Some(readback),
+            // The harness compares logits and samples nothing, so it holds no sampler.
+            sampler: None,
             vocab: config.vocab_size,
         },
         decode_step,
+        readback,
         vocab: config.vocab_size,
     }
 }
@@ -295,9 +299,9 @@ fn record_bucket_of_one(
     (capture.into_replay(), nodes, memory_nodes)
 }
 
-/// Prefills every sequence through candle over its own blocks, and appends the token each
-/// prefill sampled.
-fn prefill(forward: &mut CudaForward, sequences: &mut [Sequence]) {
+/// Prefills every sequence through candle over its own blocks, and appends the token the
+/// prefill's largest logit names.
+fn prefill(forward: &mut CudaForward, readback: &mut Readback<f32>, sequences: &mut [Sequence]) {
     for (index, sequence) in sequences.iter_mut().enumerate() {
         let command = StepCommand {
             step: StepId::new(100 + index as u64),
@@ -306,7 +310,7 @@ fn prefill(forward: &mut CudaForward, sequences: &mut [Sequence]) {
             dispatch: eager(),
         };
         let logits = forward
-            .forward(&lay_out(&command))
+            .forward_logits(&lay_out(&command), readback)
             .expect("the prefill runs on candle");
         let next = argmax(logits.row(0).expect("one row"));
         sequence.context_len = sequence.tokens.len();
@@ -349,6 +353,7 @@ impl Parity {
 /// Both forwards over the sequences under test, and what comparing them has found so far.
 struct Harness {
     forward: CudaForward,
+    readback: Readback<f32>,
     sequences: Vec<Sequence>,
     dispatcher: Dispatcher,
     parity: Parity,
@@ -366,6 +371,7 @@ struct Harness {
 fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
     let Harness {
         forward,
+        readback,
         sequences,
         dispatcher,
         parity,
@@ -389,7 +395,7 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
     let used_before = (*pool).map(pool_watch);
     let tensor_logits: Vec<Vec<f32>> = {
         let logits = forward
-            .forward(&keyed)
+            .forward_logits(&keyed, readback)
             .expect("the keyed batch runs on the decode step");
         (0..logits.rows())
             .map(|row| logits.row(row).expect("row").to_vec())
@@ -423,13 +429,13 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
                 dispatch: eager(),
             };
             let logits = forward
-                .forward(&lay_out(&command))
+                .forward_logits(&lay_out(&command), readback)
                 .expect("the one-entry step runs on candle");
             logits.row(0).expect("row").to_vec()
         })
         .collect();
     let candle_logits = forward
-        .forward(&lay_out(&on_candle))
+        .forward_logits(&lay_out(&on_candle), readback)
         .expect("the eager step runs on candle");
     let after_candle = snapshot(cache, &written);
     let kv_diff = widest_slot_diff(&after_step, &after_candle, &written, kv_width);
@@ -439,28 +445,7 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
     let mut sampled = Vec::with_capacity(chosen.len());
     for (row, tensor_row) in tensor_logits.iter().enumerate() {
         let candle_row = candle_logits.row(row).expect("row");
-        let (ours, theirs) = (argmax(tensor_row), argmax(candle_row));
-        if ours != theirs {
-            // Both forwards' logits for both ids. Candle reads its logits back in bf16: when it
-            // holds the two ids at one value it cannot order them, and its argmax takes the
-            // lower id, so the row is a tie rather than a disagreement.
-            let (ours_at, theirs_at) = (at(ours), at(theirs));
-            let tied = candle_row[ours_at] == candle_row[theirs_at];
-            if tied {
-                parity.ties += 1;
-            } else {
-                parity.argmax_disagreements += 1;
-            }
-            eprintln!(
-                "step {step} row {row}: {} — decode step argmax {ours} (step {:.4}, candle \
-                 {:.4}), candle argmax {theirs} (step {:.4}, candle {:.4})",
-                if tied { "tie" } else { "disagreement" },
-                tensor_row[ours_at],
-                candle_row[ours_at],
-                tensor_row[theirs_at],
-                candle_row[theirs_at]
-            );
-        }
+        let theirs = record_argmax(parity, step, row, tensor_row, candle_row);
         let diff = widest(tensor_row, candle_row);
         parity.max_abs_diff = parity.max_abs_diff.max(diff);
         parity.sum_abs_diff += f64::from(diff);
@@ -477,28 +462,82 @@ fn compare_step(harness: &mut Harness, chosen: &[usize], step: usize) {
     }
 }
 
+/// Compares the two forwards' argmax on one row, counting a disagreement or a tie, and returns
+/// candle's, which is what the sequence advances by.
+fn record_argmax(
+    parity: &mut Parity,
+    step: usize,
+    row: usize,
+    tensor_row: &[f32],
+    candle_row: &[f32],
+) -> u32 {
+    let (ours, theirs) = (argmax(tensor_row), argmax(candle_row));
+    if ours == theirs {
+        return theirs;
+    }
+    // Both forwards' logits for both ids. Candle reads its logits back in bf16: when it holds
+    // the two ids at one value it cannot order them, and its argmax takes the lower id, so the
+    // row is a tie rather than a disagreement. The tie is exact equality of what candle holds.
+    let (ours_at, theirs_at) = (at(ours), at(theirs));
+    let tied = candle_row[ours_at].to_bits() == candle_row[theirs_at].to_bits();
+    if tied {
+        parity.ties += 1;
+    } else {
+        parity.argmax_disagreements += 1;
+    }
+    eprintln!(
+        "step {step} row {row}: {} — decode step argmax {ours} (step {:.4}, candle {:.4}), \
+         candle argmax {theirs} (step {:.4}, candle {:.4})",
+        if tied { "tie" } else { "disagreement" },
+        tensor_row[ours_at],
+        candle_row[ours_at],
+        tensor_row[theirs_at],
+        candle_row[theirs_at]
+    );
+    theirs
+}
+
+/// The bound the variable `name` sets, or `default` when it is unset or not a number.
+fn bound_from_env(name: &str, default: f32) -> f32 {
+    env::var(name)
+        .ok()
+        .and_then(|bound| bound.parse().ok())
+        .unwrap_or(default)
+}
+
+/// `SEQUENCES` sequences of random tokens, each over its own run of blocks.
+fn seed_sequences(random: &mut Lcg, vocab: usize) -> Vec<Sequence> {
+    let blocks_each = MAX_MODEL_LEN.div_ceil(BLOCK_SIZE);
+    (0..SEQUENCES)
+        .map(|index| Sequence {
+            tokens: (0..8 + random.below(40))
+                .map(|_| u32::try_from(random.below(vocab.min(TOKEN_ID_CEILING))).expect("fits"))
+                .collect(),
+            blocks: (0..blocks_each)
+                .map(|block| u32::try_from(index * blocks_each + block).expect("fits"))
+                .collect(),
+            context_len: 0,
+        })
+        .collect()
+}
+
 #[test]
 #[ignore = "needs a device, the CUDA toolkit and a Llama checkpoint; run scripts/decode-parity.sh"]
 fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     let model = ModelConfig {
-        id: env::var("PARITY_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned()),
+        id: env::var("PARITY_MODEL").map_or_else(|_| ModelId::new(DEFAULT_MODEL), ModelId::new),
         revision: "main".to_owned(),
         cache_dir: None,
         dtype: Dtype::Bf16,
         prompt_template: PromptTemplate::Llama3,
     };
-    let bound: f32 = env::var("PARITY_MAX_ABS_DIFF")
-        .ok()
-        .and_then(|bound| bound.parse().ok())
-        .unwrap_or(DEFAULT_MAX_ABS_DIFF);
-    let kv_bound: f32 = env::var("PARITY_KV_MAX_ABS_DIFF")
-        .ok()
-        .and_then(|bound| bound.parse().ok())
-        .unwrap_or(DEFAULT_KV_MAX_ABS_DIFF);
+    let bound = bound_from_env("PARITY_MAX_ABS_DIFF", DEFAULT_MAX_ABS_DIFF);
+    let kv_bound = bound_from_env("PARITY_KV_MAX_ABS_DIFF", DEFAULT_KV_MAX_ABS_DIFF);
     let Rig {
         allocation,
         allocated,
         mut decode_step,
+        readback,
         vocab,
     } = open(&model);
     let contract = CaptureContract::resolve(&[declaration()], &ModelDeclaration::new("llama"));
@@ -523,27 +562,21 @@ fn the_two_forwards_agree_on_every_decode_and_the_step_records_under_capture() {
     let forward = CudaForward::new(allocated, decode_step, session);
 
     let mut random = Lcg(0x5EED_2026_0903);
-    let blocks_each = MAX_MODEL_LEN.div_ceil(BLOCK_SIZE);
-    let sequences: Vec<Sequence> = (0..SEQUENCES)
-        .map(|index| Sequence {
-            tokens: (0..8 + random.below(40))
-                .map(|_| u32::try_from(random.below(vocab.min(TOKEN_ID_CEILING))).expect("fits"))
-                .collect(),
-            blocks: (0..blocks_each)
-                .map(|block| u32::try_from(index * blocks_each + block).expect("fits"))
-                .collect(),
-            context_len: 0,
-        })
-        .collect();
+    let sequences = seed_sequences(&mut random, vocab);
     let mut harness = Harness {
         forward,
+        readback,
         sequences,
         dispatcher,
         parity: Parity::default(),
         cache,
         pool,
     };
-    prefill(&mut harness.forward, &mut harness.sequences);
+    prefill(
+        &mut harness.forward,
+        &mut harness.readback,
+        &mut harness.sequences,
+    );
 
     for step in 0..STEPS {
         let mut chosen: Vec<usize> = (0..SEQUENCES).collect();

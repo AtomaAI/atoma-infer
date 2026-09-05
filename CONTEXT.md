@@ -325,8 +325,8 @@ _Avoid_: worker, model thread, runner
 **Follower**:
 An executor rank other than zero. Rank zero, the leader, owns the engine's rings and feeds each
 step command to every follower over a ring of its own; a follower runs the forward for it and
-produces nothing, since the leader alone reads logits back and samples. A follower going ends
-the leader, and the leader going ends every follower.
+produces nothing, since the leader alone holds a sampler. A follower going ends the leader, and
+the leader going ends every follower.
 _Avoid_: worker rank, replica, secondary
 
 **Feed**:
@@ -376,10 +376,29 @@ needs to advance request state.
 _Avoid_: model output, step output, sampler output
 
 **Readback**:
-The one device-to-host copy per step that brings the selected logits to the host: into a pinned
+The one device-to-host copy per step that brings the sampled tokens to the host: into a pinned
 buffer sized for the largest batch, enqueued on the forward's stream, and waited on through the
-buffer's own event and nothing else.
+buffer's own event and nothing else. Logits never cross it in serving; a harness that compares
+them reads them through a readback of its own.
 _Avoid_: download, sync (for this copy), logits fetch
+
+**Sampling record**:
+What one request slot holds on the device for the request in it: its temperature, top-k, top-p,
+seed and draw counter. Written once when the slot changes hands, never per step, and read by the
+sampler every step the slot samples.
+_Avoid_: sampling params (which is what a request asks for), sampler state
+
+**Draw counter**:
+How many draws a slot's request has made, kept in its sampling record and advanced by the sampler
+alone. It is what a seeded request's next draw is numbered by, so its tokens follow from its seed
+and its own history and never from the batch it sits in or the slot it occupies.
+_Avoid_: offset, rng state, step count
+
+**Gather**:
+Taking a decoding row's input token from what the sampler last drew for its request slot, on the
+device, instead of from the host's upload. What removes the host from between a replay and the
+next step's input.
+_Avoid_: scatter, copy-back, token fetch
 
 **Drain**:
 The control message that stops admission and lets running requests finish. The engine is

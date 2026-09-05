@@ -583,7 +583,6 @@ mod tests {
     use atoma_engine::config::PromptTemplate;
     use atoma_engine::executor::{Executor, ExecutorError, ExecutorLoop};
     use atoma_engine::forward::Forward;
-    use atoma_engine::logits::Logits;
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Method, Request};
     use crossbeam_utils::sync::Parker;
@@ -601,24 +600,19 @@ mod tests {
     /// How long a test waits on the engine thread before calling it wedged.
     const WAIT: Duration = Duration::from_secs(30);
 
-    /// A forward whose every selected row peaks at one token, so greedy sampling returns it.
+    /// A forward that samples one token for every selected row.
     struct ConstantForward {
         token: u32,
-        vocab: usize,
-        logits: Vec<f32>,
+        sampled: Vec<u32>,
     }
 
     impl Forward for ConstantForward {
         type Error = Infallible;
 
-        fn forward(&mut self, layout: &BatchLayout) -> Result<Logits<'_>, Infallible> {
-            let rows = layout.selected.len();
-            self.logits.clear();
-            self.logits.resize(rows * self.vocab, 0.0);
-            for row in 0..rows {
-                self.logits[row * self.vocab + self.token as usize] = 1.0;
-            }
-            Ok(Logits::new(&self.logits, self.vocab))
+        fn forward(&mut self, layout: &BatchLayout) -> Result<&[u32], Infallible> {
+            self.sampled.clear();
+            self.sampled.resize(layout.selected.len(), self.token);
+            Ok(&self.sampled)
         }
     }
 
@@ -683,7 +677,6 @@ mod tests {
     fn serve(token: &str, heartbeat_stale_after: Duration) -> Served {
         let tokenizer = tokenizer();
         let token_id = tokenizer.token_to_id(token).expect("a vocabulary token");
-        let vocab = tokenizer.get_vocab_size(true);
         let contract = CaptureContract::resolve(
             &[BackendDeclaration::new("test", SupportLevel::Never)],
             &ModelDeclaration::new("test"),
@@ -691,8 +684,7 @@ mod tests {
         let (handle, rings, engine) = Engine::spawn(&engine_config(), &contract).unwrap();
         let forward = ConstantForward {
             token: token_id,
-            vocab,
-            logits: Vec::new(),
+            sampled: Vec::new(),
         };
         let executor = Executor::new(rings, forward, TokenCount::new(BLOCK_SIZE).unwrap());
         let executor = thread::spawn(move || executor.run());

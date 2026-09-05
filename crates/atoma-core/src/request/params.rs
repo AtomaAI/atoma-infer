@@ -16,33 +16,21 @@ pub struct SamplingParams {
     pub top_k: u32,
     /// Keeps the smallest set of tokens whose probabilities sum to at least `top_p`.
     pub top_p: f32,
-    /// Keeps tokens whose probability is close to a uniform distribution's expectation.
-    pub typical_p: f32,
     /// Whether to sample at all, or to take the most likely token.
     pub do_sample: bool,
     /// Seed for reproducible sampling.
     pub seed: u64,
-    /// Multiplies down the logits of tokens already generated; one is no penalty.
-    pub repetition_penalty: f32,
-    /// How many recent tokens the repetition penalty considers.
-    pub repeat_last_n: u32,
-    /// Subtracts from a token's logit in proportion to how often it appeared; zero is no penalty.
-    pub frequency_penalty: f32,
 }
 
 impl Default for SamplingParams {
-    /// Greedy: the most likely token every step, no filtering, no penalty.
+    /// Greedy: the most likely token every step, no filtering.
     fn default() -> Self {
         Self {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
-            typical_p: 1.0,
             do_sample: false,
             seed: 0,
-            repetition_penalty: 1.0,
-            repeat_last_n: 0,
-            frequency_penalty: 0.0,
         }
     }
 }
@@ -76,19 +64,15 @@ mod tests {
     use crate::test_support::tokens;
 
     #[test]
-    fn default_sampling_is_greedy_with_no_filter_and_no_penalty() {
+    fn default_sampling_is_greedy_with_no_filter() {
         assert_eq!(
             SamplingParams::default(),
             SamplingParams {
                 temperature: 1.0,
                 top_k: 0,
                 top_p: 1.0,
-                typical_p: 1.0,
                 do_sample: false,
                 seed: 0,
-                repetition_penalty: 1.0,
-                repeat_last_n: 0,
-                frequency_penalty: 0.0,
             }
         );
     }

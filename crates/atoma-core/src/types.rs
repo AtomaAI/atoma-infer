@@ -41,6 +41,12 @@ impl RequestSlot {
     pub const fn get(self) -> u32 {
         self.0
     }
+
+    /// The slot as an index into an array with one entry per slot.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 /// One sequence inside a request: its position in the request's sequence list.
